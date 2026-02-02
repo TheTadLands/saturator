@@ -1,0 +1,27 @@
+services:
+  saturator:
+    build:
+      context: .
+      dockerfile: dockerfile
+    cpuset: "4-7"  # Pin to specific CPUs - host processes should avoid these
+    cpu_shares: 1024
+    mem_limit: 8g
+    mem_reservation: 4g
+    privileged: true
+    
+    # Additional isolation
+    network_mode: none          # No network
+    pid: private                # Isolated PID namespace (changed from host)
+    ipc: private                # Isolated IPC namespace
+    oom_score_adj: -1000        # Prevent OOM killer
+    
+    # Real-time scheduling priority (requires privileged)
+    ulimits:
+      rtprio: 99
+      memlock: -1
+    
+    # Use real disk for I/O operations
+    volumes:
+      - ./output:/app/output
+      - ./io_scratch:/tmp
+    working_dir: /app/output

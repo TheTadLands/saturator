@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/target/release/saturator /app/saturator
 
-# Create tmp directory for I/O operations
-RUN mkdir -p /tmp
+# Create directories
+RUN mkdir -p /tmp /app/output
 
 ENTRYPOINT ["/app/saturator"]

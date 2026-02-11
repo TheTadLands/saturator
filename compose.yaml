@@ -1,0 +1,19 @@
+services:
+  saturator:
+    build:
+      context: .
+      dockerfile: dockerfile
+    cpuset: "4-7"  # Adjust to match system's CPU cores.
+    cpu_shares: 1024
+    mem_limit: 8g
+    mem_reservation: 4g
+    privileged: true
+    
+    # Additional isolation
+    network_mode: none
+    
+    # Use real disk for I/O operations
+    volumes:
+      - ./output:/app/output
+      - ./io_scratch:/tmp
+    working_dir: /app/output

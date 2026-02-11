@@ -9,31 +9,73 @@ pub struct WorkloadConfig {
     pub io_perc: f64,
 }
 
-pub fn calibrate_operations() -> (usize, usize) {
-    println!("  Running calibration (3 passes)...");
+/// Calibration result containing iterations and timing info
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationResult {
+    pub cpu_iterations: usize,
+    pub io_iterations: usize,
+    pub cpu_us: u128,
+    pub io_us: u128,
+}
+
+impl CalibrationResult {
+    /// Returns ops/second for CPU work
+    pub fn cpu_ops_per_sec(&self) -> f64 {
+        if self.cpu_us == 0 { return 0.0; }
+        1_000_000.0 / self.cpu_us as f64
+    }
     
-    let mut cpu_results = Vec::new();
-    let mut io_results = Vec::new();
+    /// Returns ops/second for I/O work
+    pub fn io_ops_per_sec(&self) -> f64 {
+        if self.io_us == 0 { return 0.0; }
+        1_000_000.0 / self.io_us as f64
+    }
+}
+
+pub fn calibrate_operations() -> (usize, usize) {
+    let result = calibrate_operations_full();
+    (result.cpu_iterations, result.io_iterations)
+}
+
+pub fn calibrate_operations_full() -> CalibrationResult {
+    println!("  Running calibration (3 passes, targeting <5% gap)...");
+    
+    let mut results = Vec::new();
     
     for pass in 0..3 {
         let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass();
-        println!("    Pass {}: CPU {}iters={}μs, I/O {}iters={}μs", 
-                 pass + 1, cpu_iters, cpu_us, io_iters, io_us);
-        cpu_results.push((cpu_iters, cpu_us));
-        io_results.push((io_iters, io_us));
+        let gap_pct = if cpu_us > io_us {
+            ((cpu_us - io_us) as f64 / io_us as f64) * 100.0
+        } else {
+            ((io_us - cpu_us) as f64 / cpu_us as f64) * 100.0
+        };
+        println!("    Pass {}: CPU {} iters = {}μs, I/O {} iters = {}μs (gap: {:.1}%)", 
+                 pass + 1, cpu_iters, cpu_us, io_iters, io_us, gap_pct);
+        results.push((cpu_iters, cpu_us, io_iters, io_us));
     }
     
-    // Take median of iterations
-    cpu_results.sort_by_key(|(iters, _)| *iters);
-    io_results.sort_by_key(|(iters, _)| *iters);
+    // Take median based on CPU iterations
+    results.sort_by_key(|(cpu_iters, _, _, _)| *cpu_iters);
+    let (cpu_iters, cpu_us, io_iters, io_us) = results[1]; // median
     
-    let (cpu_iters, cpu_us) = cpu_results[1]; // median
-    let (io_iters, io_us) = io_results[1];
+    let gap_pct = if cpu_us > io_us {
+        ((cpu_us - io_us) as f64 / io_us as f64) * 100.0
+    } else {
+        ((io_us - cpu_us) as f64 / cpu_us as f64) * 100.0
+    };
     
-    println!("  Final: CPU {} iterations = {}μs, I/O {} iterations = {}μs", 
-             cpu_iters, cpu_us, io_iters, io_us);
+    let cpu_ops_sec = 1_000_000.0 / cpu_us as f64;
+    let io_ops_sec = 1_000_000.0 / io_us as f64;
     
-    (cpu_iters, io_iters)
+    println!("  Final: CPU {} iters = {}μs ({:.0} ops/s), I/O {} iters = {}μs ({:.0} ops/s), gap: {:.1}%", 
+             cpu_iters, cpu_us, cpu_ops_sec, io_iters, io_us, io_ops_sec, gap_pct);
+    
+    CalibrationResult {
+        cpu_iterations: cpu_iters,
+        io_iterations: io_iters,
+        cpu_us,
+        io_us,
+    }
 }
 
 fn calibrate_single_pass() -> (usize, u128, usize, u128) {
@@ -70,7 +112,7 @@ fn calibrate_single_pass() -> (usize, u128, usize, u128) {
         }
     };
     
-    // Now calibrate CPU to match I/O timing precisely
+    // Now calibrate CPU to match I/O timing precisely (within 5%)
     let (cpu_iters, cpu_actual_us) = {
         let buffer: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
         let target_cpu_us = io_actual_us;
@@ -80,7 +122,7 @@ fn calibrate_single_pass() -> (usize, u128, usize, u128) {
         // First, get close with scaling
         loop {
             let start = std::time::Instant::now();
-            let samples = 100;
+            let samples = 200; // More samples for precision
             for _ in 0..samples {
                 do_cpu_work(&buffer, iters);
             }
@@ -100,18 +142,19 @@ fn calibrate_single_pass() -> (usize, u128, usize, u128) {
         
         // Fine-tune with binary search to get within 5%
         let mut low = iters / 2;
-        let mut high = iters;
+        let mut high = iters * 2;
         let lower_bound = target_cpu_us * 95 / 100;
         let upper_bound = target_cpu_us * 105 / 100;
         
-        for _ in 0..10 {
+        // More iterations for tighter convergence
+        for _ in 0..20 {
             let mid = (low + high) / 2;
             if mid == low || mid == high {
                 break;
             }
             
             let start = std::time::Instant::now();
-            let samples = 100;
+            let samples = 200;
             for _ in 0..samples {
                 do_cpu_work(&buffer, mid);
             }
@@ -128,9 +171,9 @@ fn calibrate_single_pass() -> (usize, u128, usize, u128) {
             iters = mid;
         }
         
-        // Final measurement
+        // Final measurement with more samples for accuracy
         let start = std::time::Instant::now();
-        let samples = 100;
+        let samples = 500;
         for _ in 0..samples {
             do_cpu_work(&buffer, iters);
         }

@@ -2,7 +2,7 @@ mod saturator;
 mod metrics;
 mod visualize;
 
-use saturator::{calibrate_operations, WorkloadConfig, run_saturator};
+use saturator::{calibrate_operations_full, CalibrationResult, WorkloadConfig, run_saturator};
 use visualize::ResultsWriter;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,22 +33,24 @@ fn main() {
     let experiment = &args[1];
     
     println!("Calibrating operations...");
-    let (cpu_iterations, io_iterations) = calibrate_operations();
-    println!("Calibration: {} CPU iterations, {} I/O iterations (~50μs each)\n", 
-             cpu_iterations, io_iterations);
+    let calibration = calibrate_operations_full();
+    println!("Calibration: {} CPU iterations, {} I/O iterations", 
+             calibration.cpu_iterations, calibration.io_iterations);
+    println!("Theoretical max: {:.0} CPU ops/s, {:.0} I/O ops/s per thread\n",
+             calibration.cpu_ops_per_sec(), calibration.io_ops_per_sec());
     
     match experiment.as_str() {
-        "find-saturation" => find_cpu_saturation(cpu_iterations, io_iterations),
-        "find-io-saturation" => find_io_saturation(cpu_iterations, io_iterations),
+        "find-saturation" => find_cpu_saturation(calibration),
+        "find-io-saturation" => find_io_saturation(calibration),
         "find-slack" => {
             let baseline = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
             let extra_io_pct = args.get(3).and_then(|s| s.parse::<f64>().ok()).unwrap_or(100.0);
-            find_cpu_slack(cpu_iterations, io_iterations, baseline, extra_io_pct / 100.0);
+            find_cpu_slack(calibration, baseline, extra_io_pct / 100.0);
         },
         "find-io-slack" => {
             let baseline = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
             let extra_io_pct = args.get(3).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            find_io_slack(cpu_iterations, io_iterations, baseline, extra_io_pct / 100.0);
+            find_io_slack(calibration, baseline, extra_io_pct / 100.0);
         },
         _ => println!("Unknown experiment: {}", experiment),
     }
@@ -71,10 +73,9 @@ fn cleanup_scratch_files() {
     }
 }
 
-fn find_cpu_saturation(cpu_iterations: usize, io_iterations: usize) {
+fn find_cpu_saturation(calibration: CalibrationResult) {
     println!("=== FINDING CPU SATURATION POINT ===");
-    println!("Adding CPU threads until throughput plateaus");
-    println!("(1 op = 1 work unit calibrated to ~50μs)\n");
+    println!("Adding CPU threads until throughput plateaus\n");
     
     let max_threads = std::thread::available_parallelism()
         .map(|n| n.get() * 4)
@@ -83,20 +84,15 @@ fn find_cpu_saturation(cpu_iterations: usize, io_iterations: usize) {
     let mut writer = ResultsWriter::new();
     let mut best_throughput = 0.0;
     let mut saturation_point = 1;
+    let iters = calibration.cpu_iterations as f64;
     
     for thread_count in 1..=max_threads {
-        let throughput = measure_cpu_throughput(thread_count, cpu_iterations, io_iterations, 5);
+        let blocks_per_sec = measure_cpu_throughput(thread_count, calibration.cpu_iterations, calibration.io_iterations, 5);
+        let throughput = blocks_per_sec * iters;
         let throughput_per_thread = throughput / thread_count as f64;
         
-        // Calculate % of best throughput
-        let pct_of_best = if best_throughput > 0.0 { 
-            throughput / best_throughput * 100.0 
-        } else { 
-            100.0 
-        };
-        
-        println!("  {:2} threads: {:8.0} ops/sec ({:6.0} per thread) [{:5.1}% of peak]", 
-                 thread_count, throughput, throughput_per_thread, pct_of_best);
+        println!("  {:2} threads: {:12.0} ops/sec ({:10.0} per thread)", 
+                 thread_count, throughput, throughput_per_thread);
         
         writer.add_saturation_point(thread_count, throughput);
         
@@ -106,19 +102,17 @@ fn find_cpu_saturation(cpu_iterations: usize, io_iterations: usize) {
         }
     }
     
-    writer.write_saturation_csv("cpu_saturation.csv").unwrap();
+    writer.write_saturation_csv("cpu_throughput_vs_threads.csv").unwrap();
     
     println!("\n=== RESULTS ===");
-    println!("Saturation point: {} threads (peak throughput)", saturation_point);
-    println!("Peak throughput: {:.0} ops/sec", best_throughput);
-    println!("Plateau range: threads maintaining >90% of peak");
+    println!("Saturation point: {} threads", saturation_point);
+    println!("Best throughput: {:.0} ops/sec", best_throughput);
     println!("\nRecommendation: Run `saturator find-io-slack {}` to find I/O slack", saturation_point);
 }
 
-fn find_io_saturation(cpu_iterations: usize, io_iterations: usize) {
+fn find_io_saturation(calibration: CalibrationResult) {
     println!("=== FINDING I/O SATURATION POINT ===");
-    println!("Adding I/O threads until throughput plateaus");
-    println!("(1 op = 1 work unit calibrated to ~50μs)\n");
+    println!("Adding I/O threads until throughput plateaus\n");
     
     let max_threads = std::thread::available_parallelism()
         .map(|n| n.get() * 4)
@@ -127,19 +121,15 @@ fn find_io_saturation(cpu_iterations: usize, io_iterations: usize) {
     let mut writer = ResultsWriter::new();
     let mut best_throughput = 0.0;
     let mut saturation_point = 1;
+    let iters = calibration.io_iterations as f64;
     
     for thread_count in 1..=max_threads {
-        let throughput = measure_io_throughput(thread_count, cpu_iterations, io_iterations, 5);
+        let blocks_per_sec = measure_io_throughput(thread_count, calibration.cpu_iterations, calibration.io_iterations, 5);
+        let throughput = blocks_per_sec * iters;
         let throughput_per_thread = throughput / thread_count as f64;
         
-        let pct_of_best = if best_throughput > 0.0 { 
-            throughput / best_throughput * 100.0 
-        } else { 
-            100.0 
-        };
-        
-        println!("  {:2} threads: {:8.0} ops/sec ({:6.0} per thread) [{:5.1}% of peak]", 
-                 thread_count, throughput, throughput_per_thread, pct_of_best);
+        println!("  {:2} threads: {:12.0} ops/sec ({:10.0} per thread)", 
+                 thread_count, throughput, throughput_per_thread);
         
         writer.add_saturation_point(thread_count, throughput);
         
@@ -149,144 +139,147 @@ fn find_io_saturation(cpu_iterations: usize, io_iterations: usize) {
         }
     }
     
-    writer.write_saturation_csv("io_saturation.csv").unwrap();
+    writer.write_saturation_csv("io_throughput_vs_threads.csv").unwrap();
     
     println!("\n=== RESULTS ===");
-    println!("Saturation point: {} threads (peak throughput)", saturation_point);
-    println!("Peak throughput: {:.0} ops/sec", best_throughput);
-    println!("Plateau range: threads maintaining >90% of peak");
+    println!("Saturation point: {} threads", saturation_point);
+    println!("Best throughput: {:.0} ops/sec", best_throughput);
     println!("\nRecommendation: Run `saturator find-cpu-slack {}` to find CPU slack", saturation_point);
 }
 
 fn find_cpu_slack(
-    cpu_iterations: usize, 
-    io_iterations: usize, 
+    calibration: CalibrationResult, 
     baseline_threads: usize,
     extra_io_ratio: f64,
 ) {
     println!("=== FINDING SLACK (CPU BASELINE) ===");
     println!("Baseline: {} CPU-only threads", baseline_threads);
-    println!("Adding threads at: {:.0}% I/O", extra_io_ratio * 100.0);
-    println!("(1 op = 1 work unit calibrated to ~50μs)\n");
+    println!("Adding threads at: {:.0}% I/O\n", extra_io_ratio * 100.0);
+    
+    let cpu_iters = calibration.cpu_iterations as f64;
+    let io_iters = calibration.io_iterations as f64;
     
     println!("Measuring baseline CPU throughput...");
-    let baseline_throughput = measure_baseline(baseline_threads, 0.0, cpu_iterations, io_iterations, 5);
-    println!("Baseline: {:.0} ops/sec (all CPU)\n", baseline_throughput);
+    let baseline_blocks = measure_baseline(baseline_threads, 0.0, calibration.cpu_iterations, calibration.io_iterations, 5);
+    let baseline_throughput = baseline_blocks * cpu_iters;
+    println!("Baseline: {:.0} CPU ops/sec\n", baseline_throughput);
     
-    let max_extra = baseline_threads * 4;
-    let mut best_total = baseline_throughput;
+    let logical_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let max_extra = logical_cores.max(baseline_threads * 2);
+    let mut best_cpu_ops = baseline_throughput;
     let mut best_extra_count = 0;
     
-    let filename = format!("cpu_slack_{}t_extra{}io.csv", 
+    let filename = format!("slack_{}cpu_adding_{}pct_io.csv", 
                            baseline_threads,
                            (extra_io_ratio * 100.0) as u32);
     let mut file = std::fs::File::create(&filename).unwrap();
     use std::io::Write;
-    writeln!(file, "extra_threads,total_threads,extra_io_pct,cpu_ops,io_ops,total_ops,throughput_change_pct").unwrap();
+    writeln!(file, "extra_threads,total_threads,extra_io_pct,cpu_ops,io_ops,total_ops,baseline_change_pct").unwrap();
     
-    println!("  {:>6} {:>8} | {:>12} {:>12} | {:>12} {:>10}",
-             "extra", "threads", "cpu_ops/s", "io_ops/s", "total_ops/s", "vs baseline");
-    println!("  {}", "-".repeat(75));
+    println!("  {:>6} {:>8} | {:>14} {:>14} | {:>14} {:>12}",
+             "extra", "threads", "cpu_ops/s", "io_ops/s", "total_ops/s", "cpu vs base");
+    println!("  {}", "-".repeat(90));
     
     for extra in 1..=max_extra {
-        let (cpu_ops, io_ops) = measure_total_throughput(
+        let (cpu_blocks, io_blocks) = measure_total_throughput(
             baseline_threads, extra, 0.0, extra_io_ratio,
-            cpu_iterations, io_iterations, 5
+            calibration.cpu_iterations, calibration.io_iterations, 5
         );
         
+        let cpu_ops = cpu_blocks * cpu_iters;
+        let io_ops = io_blocks * io_iters;
         let total_ops = cpu_ops + io_ops;
-        let throughput_change = (total_ops - baseline_throughput) / baseline_throughput * 100.0;
+        let baseline_change = (cpu_ops - baseline_throughput) / baseline_throughput * 100.0;
         
-        println!("  {:>6} {:>8} | {:>12.0} {:>12.0} | {:>12.0} {:>+9.1}%",
-                 extra, baseline_threads + extra, cpu_ops, io_ops, total_ops, throughput_change);
+        println!("  {:>6} {:>8} | {:>14.0} {:>14.0} | {:>14.0} {:>+11.1}%",
+                 extra, baseline_threads + extra, cpu_ops, io_ops, total_ops, baseline_change);
         
         writeln!(file, "{},{},{},{:.2},{:.2},{:.2},{:.2}", 
                  extra, baseline_threads + extra,
                  (extra_io_ratio * 100.0) as u32,
-                 cpu_ops, io_ops, total_ops, throughput_change).unwrap();
+                 cpu_ops, io_ops, total_ops, baseline_change).unwrap();
         
-        if total_ops > best_total {
-            best_total = total_ops;
+        if cpu_ops > best_cpu_ops {
+            best_cpu_ops = cpu_ops;
             best_extra_count = extra;
-        }
-        
-        if total_ops < baseline_throughput * 0.8 {
-            println!("\n  → Total throughput dropped >20% below baseline, stopping.");
-            break;
         }
     }
     
     println!("\n=== RESULTS ===");
-    println!("Baseline: {} threads = {:.0} ops/sec", baseline_threads, baseline_throughput);
-    println!("Best: {} threads = {:.0} ops/sec ({:+.1}%)", 
-             baseline_threads + best_extra_count, best_total,
-             (best_total - baseline_throughput) / baseline_throughput * 100.0);
+    println!("Baseline: {} threads = {:.0} CPU ops/sec", baseline_threads, baseline_throughput);
+    println!("Best CPU: {} threads = {:.0} CPU ops/sec ({:+.1}%)", 
+             baseline_threads + best_extra_count, best_cpu_ops,
+             (best_cpu_ops - baseline_throughput) / baseline_throughput * 100.0);
     println!("Results written to: {}", filename);
 }
 
 fn find_io_slack(
-    cpu_iterations: usize, 
-    io_iterations: usize, 
+    calibration: CalibrationResult, 
     baseline_threads: usize,
     extra_io_ratio: f64,
 ) {
     println!("=== FINDING SLACK (I/O BASELINE) ===");
     println!("Baseline: {} I/O-only threads", baseline_threads);
-    println!("Adding threads at: {:.0}% I/O", extra_io_ratio * 100.0);
-    println!("(1 op = 1 work unit calibrated to ~50μs)\n");
+    println!("Adding threads at: {:.0}% I/O\n", extra_io_ratio * 100.0);
+    
+    let cpu_iters = calibration.cpu_iterations as f64;
+    let io_iters = calibration.io_iterations as f64;
     
     println!("Measuring baseline I/O throughput...");
-    let baseline_throughput = measure_baseline(baseline_threads, 1.0, cpu_iterations, io_iterations, 5);
-    println!("Baseline: {:.0} ops/sec (all I/O)\n", baseline_throughput);
+    let baseline_blocks = measure_baseline(baseline_threads, 1.0, calibration.cpu_iterations, calibration.io_iterations, 5);
+    let baseline_throughput = baseline_blocks * io_iters;
+    println!("Baseline: {:.0} I/O ops/sec\n", baseline_throughput);
     
-    let max_extra = baseline_threads * 4;
-    let mut best_total = baseline_throughput;
+    let logical_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let max_extra = logical_cores.max(baseline_threads * 2);
+    let mut best_io_ops = baseline_throughput;
     let mut best_extra_count = 0;
     
-    let filename = format!("io_slack_{}t_extra{}io.csv", 
+    let filename = format!("slack_{}io_adding_{}pct_io.csv", 
                            baseline_threads,
                            (extra_io_ratio * 100.0) as u32);
     let mut file = std::fs::File::create(&filename).unwrap();
     use std::io::Write;
-    writeln!(file, "extra_threads,total_threads,extra_io_pct,cpu_ops,io_ops,total_ops,throughput_change_pct").unwrap();
+    writeln!(file, "extra_threads,total_threads,extra_io_pct,cpu_ops,io_ops,total_ops,baseline_change_pct").unwrap();
     
-    println!("  {:>6} {:>8} | {:>12} {:>12} | {:>12} {:>10}",
-             "extra", "threads", "cpu_ops/s", "io_ops/s", "total_ops/s", "vs baseline");
-    println!("  {}", "-".repeat(75));
+    println!("  {:>6} {:>8} | {:>14} {:>14} | {:>14} {:>12}",
+             "extra", "threads", "cpu_ops/s", "io_ops/s", "total_ops/s", "i/o vs base");
+    println!("  {}", "-".repeat(90));
     
     for extra in 1..=max_extra {
-        let (cpu_ops, io_ops) = measure_total_throughput(
+        let (cpu_blocks, io_blocks) = measure_total_throughput(
             baseline_threads, extra, 1.0, extra_io_ratio,
-            cpu_iterations, io_iterations, 5
+            calibration.cpu_iterations, calibration.io_iterations, 5
         );
         
+        let cpu_ops = cpu_blocks * cpu_iters;
+        let io_ops = io_blocks * io_iters;
         let total_ops = cpu_ops + io_ops;
-        let throughput_change = (total_ops - baseline_throughput) / baseline_throughput * 100.0;
+        let baseline_change = (io_ops - baseline_throughput) / baseline_throughput * 100.0;
         
-        println!("  {:>6} {:>8} | {:>12.0} {:>12.0} | {:>12.0} {:>+9.1}%",
-                 extra, baseline_threads + extra, cpu_ops, io_ops, total_ops, throughput_change);
+        println!("  {:>6} {:>8} | {:>14.0} {:>14.0} | {:>14.0} {:>+11.1}%",
+                 extra, baseline_threads + extra, cpu_ops, io_ops, total_ops, baseline_change);
         
         writeln!(file, "{},{},{},{:.2},{:.2},{:.2},{:.2}", 
                  extra, baseline_threads + extra,
                  (extra_io_ratio * 100.0) as u32,
-                 cpu_ops, io_ops, total_ops, throughput_change).unwrap();
+                 cpu_ops, io_ops, total_ops, baseline_change).unwrap();
         
-        if total_ops > best_total {
-            best_total = total_ops;
+        if io_ops > best_io_ops {
+            best_io_ops = io_ops;
             best_extra_count = extra;
-        }
-        
-        if total_ops < baseline_throughput * 0.8 {
-            println!("\n  → Total throughput dropped >20% below baseline, stopping.");
-            break;
         }
     }
     
     println!("\n=== RESULTS ===");
-    println!("Baseline: {} threads = {:.0} ops/sec", baseline_threads, baseline_throughput);
-    println!("Best: {} threads = {:.0} ops/sec ({:+.1}%)", 
-             baseline_threads + best_extra_count, best_total,
-             (best_total - baseline_throughput) / baseline_throughput * 100.0);
+    println!("Baseline: {} threads = {:.0} I/O ops/sec", baseline_threads, baseline_throughput);
+    println!("Best I/O: {} threads = {:.0} I/O ops/sec ({:+.1}%)", 
+             baseline_threads + best_extra_count, best_io_ops,
+             (best_io_ops - baseline_throughput) / baseline_throughput * 100.0);
     println!("Results written to: {}", filename);
 }
 

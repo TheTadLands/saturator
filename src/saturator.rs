@@ -2,11 +2,36 @@ use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
+use std::ffi::CString;
 
 #[derive(Debug, Clone)]
 pub struct WorkloadConfig {
     pub name: String,
     pub io_perc: f64,
+}
+
+/// Tuning parameters that affect contention behavior
+#[derive(Debug, Clone, Copy)]
+pub struct TuningParams {
+    pub target_us: u128,      // calibration target per-operation (default: 50)
+    pub buffer_kb: usize,     // CPU work buffer size in KB (default: 100)
+    pub max_workers: usize,   // maximum thread/process count
+    pub duration_secs: u64,   // measurement duration per data point (default: 5)
+    pub samples: usize,       // number of samples per data point, median is taken (default: 3)
+}
+
+impl Default for TuningParams {
+    fn default() -> Self {
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get()).unwrap_or(4);
+        Self {
+            target_us: 50,
+            buffer_kb: 100,
+            max_workers: parallelism * 4,
+            duration_secs: 5,
+            samples: 3,
+        }
+    }
 }
 
 /// Calibration result containing iterations and timing info
@@ -33,17 +58,18 @@ impl CalibrationResult {
 }
 
 pub fn calibrate_operations() -> (usize, usize) {
-    let result = calibrate_operations_full();
+    let result = calibrate_operations_full(&TuningParams::default());
     (result.cpu_iterations, result.io_iterations)
 }
 
-pub fn calibrate_operations_full() -> CalibrationResult {
+pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
     println!("  Running calibration (3 passes, targeting <5% gap)...");
-    
+
+    let buffer_size = params.buffer_kb * 1024;
     let mut results = Vec::new();
-    
+
     for pass in 0..3 {
-        let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass();
+        let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass(params.target_us, buffer_size);
         let gap_pct = if cpu_us > io_us {
             ((cpu_us - io_us) as f64 / io_us as f64) * 100.0
         } else {
@@ -78,8 +104,7 @@ pub fn calibrate_operations_full() -> CalibrationResult {
     }
 }
 
-fn calibrate_single_pass() -> (usize, u128, usize, u128) {
-    let target_us: u128 = 50;
+fn calibrate_single_pass(target_us: u128, buffer_size: usize) -> (usize, u128, usize, u128) {
     
     // Calibrate I/O first (coarser granularity)
     let (io_iters, io_actual_us) = {
@@ -114,7 +139,7 @@ fn calibrate_single_pass() -> (usize, u128, usize, u128) {
     
     // Now calibrate CPU to match I/O timing precisely (within 5%)
     let (cpu_iters, cpu_actual_us) = {
-        let buffer: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
         let target_cpu_us = io_actual_us;
         let mut iters = 10;
         let mut actual_us = 0u128;
@@ -190,10 +215,11 @@ pub fn run_saturator(
     config: WorkloadConfig,
     cpu_iterations: usize,
     io_iterations: usize,
+    buffer_size: usize,
     total_ops: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
 ) {
-    let cpu_buffer: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+    let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_{}", thread_id);
     
     // Create a small file for I/O
@@ -232,17 +258,22 @@ pub fn run_saturator(
 
 fn do_cpu_work(buffer: &[u8], iterations: usize) -> u64 {
     let mut hash = 0u64;
-    
-    for _ in 0..iterations {
-        hash = buffer.iter().take(1000).fold(hash, |acc, &b| {
+    let len = buffer.len();
+
+    for i in 0..iterations {
+        // Stride through the entire buffer so the full working set stays hot.
+        // With large buffers and many processes, this creates real cache pressure.
+        let offset = (i * 1000) % len;
+        let end = (offset + 1000).min(len);
+        hash = buffer[offset..end].iter().fold(hash, |acc, &b| {
             acc.wrapping_mul(31).wrapping_add(b as u64)
         });
-        
-        for i in 0..50 {
-            hash = hash.wrapping_add(i).wrapping_mul(7);
+
+        for j in 0..50 {
+            hash = hash.wrapping_add(j).wrapping_mul(7);
         }
     }
-    
+
     std::hint::black_box(hash)
 }
 
@@ -280,17 +311,145 @@ pub fn cpu_work(iterations: usize) {
     });
 }
 
+pub fn cpu_work_with_buffer(buffer: &[u8], iterations: usize) {
+    do_cpu_work(buffer, iterations);
+}
+
 pub fn io_work(iterations: usize) {
     io_work_with_id(0, iterations);
 }
 
 pub fn io_work_with_id(thread_id: usize, iterations: usize) {
     let path = format!("/tmp/saturator_io_{}", thread_id);
-    
+
     // Create file once if it doesn't exist
     if !std::path::Path::new(&path).exists() {
         let _ = std::fs::write(&path, vec![0u8; 4096]);
     }
-    
+
     do_io_work_counted(&path, iterations);
+}
+
+// --- Shared memory infrastructure for process-based experiments ---
+
+#[repr(C)]
+pub struct SharedRegion {
+    pub total_ops: AtomicU64,
+    pub cpu_ops: AtomicU64,
+    pub io_ops: AtomicU64,
+    pub ready_count: AtomicU64,  // children increment when setup is complete
+    pub running: AtomicBool,
+    _padding: [u8; 7],
+}
+
+const SHM_SIZE: usize = 4096; // one page, plenty for SharedRegion
+
+pub fn create_shared_region(name: &str) -> (*mut SharedRegion, i32) {
+    unsafe {
+        let c_name = CString::new(name).unwrap();
+        let fd = libc::shm_open(
+            c_name.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR,
+            0o600,
+        );
+        assert!(fd >= 0, "shm_open failed: {}", std::io::Error::last_os_error());
+
+        assert_eq!(libc::ftruncate(fd, SHM_SIZE as libc::off_t), 0,
+            "ftruncate failed: {}", std::io::Error::last_os_error());
+
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            SHM_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        assert!(ptr != libc::MAP_FAILED, "mmap failed: {}", std::io::Error::last_os_error());
+
+        let region = ptr as *mut SharedRegion;
+        // Initialize all fields
+        std::ptr::write(&mut (*region).total_ops, AtomicU64::new(0));
+        std::ptr::write(&mut (*region).cpu_ops, AtomicU64::new(0));
+        std::ptr::write(&mut (*region).io_ops, AtomicU64::new(0));
+        std::ptr::write(&mut (*region).ready_count, AtomicU64::new(0));
+        std::ptr::write(&mut (*region).running, AtomicBool::new(true));
+
+        (region, fd)
+    }
+}
+
+pub fn open_shared_region(name: &str) -> *mut SharedRegion {
+    unsafe {
+        let c_name = CString::new(name).unwrap();
+        let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDWR, 0);
+        assert!(fd >= 0, "shm_open (child) failed: {}", std::io::Error::last_os_error());
+
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            SHM_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        assert!(ptr != libc::MAP_FAILED, "mmap (child) failed");
+
+        libc::close(fd);
+        ptr as *mut SharedRegion
+    }
+}
+
+pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32) {
+    unsafe {
+        libc::munmap(ptr as *mut libc::c_void, SHM_SIZE);
+        libc::close(fd);
+        let c_name = CString::new(name).unwrap();
+        libc::shm_unlink(c_name.as_ptr());
+    }
+}
+
+/// Child process entry point — opens shared memory and runs workload loop
+pub fn run_worker_process(
+    shm_name: &str,
+    worker_id: usize,
+    cpu_iterations: usize,
+    io_iterations: usize,
+    io_perc: f64,
+    buffer_size: usize,
+) {
+    let region = open_shared_region(shm_name);
+    let region_ref = unsafe { &*region };
+
+    let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
+    let io_path = format!("/tmp/saturator_proc_{}", worker_id);
+
+    if io_perc > 0.0 {
+        let _ = std::fs::write(&io_path, vec![0u8; 4096]);
+    }
+
+    // Signal that setup is complete
+    region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
+
+    let mut local_ops = 0u64;
+    let mut rng_state = worker_id as u64 + 12345;
+
+    while region_ref.running.load(Ordering::Relaxed) {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
+
+        if rand_f64 < io_perc {
+            do_io_work_counted(&io_path, io_iterations);
+        } else {
+            do_cpu_work(&cpu_buffer, cpu_iterations);
+        }
+
+        local_ops += 1;
+        if local_ops % 10 == 0 {
+            region_ref.total_ops.fetch_add(10, Ordering::Relaxed);
+            local_ops = 0;
+        }
+    }
+
+    let _ = std::fs::remove_file(&io_path);
 }

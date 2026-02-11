@@ -16,40 +16,43 @@ from pathlib import Path
 
 
 def plot_saturation(csv_path: str, output_dir: str):
-    """Plot saturation curve (throughput vs thread count)."""
+    """Plot saturation curve (throughput vs thread/worker count)."""
     df = pd.read_csv(csv_path)
     name = Path(csv_path).stem
-    
+
     # Determine if CPU or I/O saturation
     is_cpu = 'cpu' in name.lower()
+    is_proc = 'proc' in name.lower() or 'worker' in name.lower()
     color = 'tab:blue' if is_cpu else 'tab:green'
     label = 'CPU' if is_cpu else 'I/O'
-    
+    mode = 'Process' if is_proc else 'Thread'
+    x_label = 'Worker Count' if is_proc else 'Thread Count'
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
+
     # Left plot: Total throughput
     ax1.plot(df['threads'], df['throughput_ops_sec'], f'-o', color=color, linewidth=2, markersize=6)
-    
+
     # Mark the peak
     peak_idx = df['throughput_ops_sec'].idxmax()
     peak_threads = df.loc[peak_idx, 'threads']
     peak_throughput = df.loc[peak_idx, 'throughput_ops_sec']
-    ax1.axvline(x=peak_threads, color='r', linestyle='--', alpha=0.7, label=f'Peak: {peak_threads} threads')
+    ax1.axvline(x=peak_threads, color='r', linestyle='--', alpha=0.7, label=f'Peak: {peak_threads} {mode.lower()}s')
     ax1.scatter([peak_threads], [peak_throughput], color='r', s=100, zorder=5)
-    
-    ax1.set_xlabel('Thread Count', fontsize=12)
+
+    ax1.set_xlabel(x_label, fontsize=12)
     ax1.set_ylabel('Total Throughput (ops/sec)', fontsize=12)
-    ax1.set_title(f'{label} Saturation - Total Throughput', fontsize=14)
+    ax1.set_title(f'{label} Saturation ({mode}s) - Total Throughput', fontsize=14)
     ax1.legend(loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=2)
     ax1.grid(True, alpha=0.3)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_number(x)))
-    
-    # Right plot: Throughput per thread
+
+    # Right plot: Throughput per thread/worker
     ax2.plot(df['threads'], df['throughput_per_thread'], f'-s', color=color, linewidth=2, markersize=6)
-    
-    ax2.set_xlabel('Thread Count', fontsize=12)
-    ax2.set_ylabel('Throughput per Thread (ops/sec)', fontsize=12)
-    ax2.set_title(f'{label} Saturation - Per Thread Efficiency', fontsize=14)
+
+    ax2.set_xlabel(x_label, fontsize=12)
+    ax2.set_ylabel(f'Throughput per {mode} (ops/sec)', fontsize=12)
+    ax2.set_title(f'{label} Saturation ({mode}s) - Per {mode} Efficiency', fontsize=14)
     ax2.grid(True, alpha=0.3)
     ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_number(x)))
     
@@ -166,7 +169,7 @@ def main():
         print(f"Processing: {name}")
         
         try:
-            if 'throughput_vs_threads' in name:
+            if 'throughput_vs_threads' in name or 'throughput_vs_workers' in name:
                 plot_saturation(csv_path, output_dir)
             elif 'slack' in name:
                 plot_slack(csv_path, output_dir)

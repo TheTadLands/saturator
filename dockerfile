@@ -6,7 +6,7 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Install minimal dependencies
 RUN apt-get update && apt-get install -y \

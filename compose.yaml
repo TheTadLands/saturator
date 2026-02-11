@@ -8,7 +8,11 @@ services:
     mem_limit: 8g
     mem_reservation: 4g
     privileged: true
-    
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 16384
+
     # Additional isolation
     network_mode: none
     

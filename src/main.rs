@@ -31,6 +31,7 @@ fn main() {
         println!("  --max-workers <N>    Max worker count (default: parallelism * 16)");
         println!("  --duration <N>       Measurement duration in seconds (default: 5)");
         println!("  --samples <N>        Samples per data point, median taken (default: 3)");
+        println!("  --step <N>           Worker count increment per data point (default: 1)");
         println!("");
         println!("Examples:");
         println!("  find-slack 4 100     - 4 CPU baseline, add 100% I/O threads");
@@ -129,6 +130,12 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
                 i += 1;
                 if let Some(v) = args.get(i).and_then(|s| s.parse::<usize>().ok()) {
                     params.samples = v.max(1);
+                }
+            }
+            "--step" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse::<usize>().ok()) {
+                    params.step = v.max(1);
                 }
             }
             _ => {}
@@ -366,16 +373,17 @@ fn find_io_slack(
 
 fn find_cpu_saturation_proc(calibration: CalibrationResult, params: &TuningParams) {
     println!("=== FINDING CPU SATURATION POINT (PROCESS MODE) ===");
-    println!("target_us={}, buffer={}KB, max_workers={}, duration={}s",
-             params.target_us, params.buffer_kb, params.max_workers, params.duration_secs);
+    println!("target_us={}, buffer={}KB, max_workers={}, duration={}s, step={}",
+             params.target_us, params.buffer_kb, params.max_workers, params.duration_secs, params.step);
     println!("Adding worker processes until throughput degrades\n");
 
     let mut writer = ResultsWriter::new();
     let mut best_throughput = 0.0;
-    let mut saturation_point = 1;
+    let mut saturation_point = params.step;
     let iters = calibration.cpu_iterations as f64;
 
-    for worker_count in 1..=params.max_workers {
+    let mut worker_count = params.step;
+    while worker_count <= params.max_workers {
         let blocks_per_sec = measure_proc_throughput(
             worker_count, calibration.cpu_iterations, calibration.io_iterations,
             params.duration_secs, 0.0, params.buffer_kb, params.samples,
@@ -392,6 +400,8 @@ fn find_cpu_saturation_proc(calibration: CalibrationResult, params: &TuningParam
             best_throughput = throughput;
             saturation_point = worker_count;
         }
+
+        worker_count += params.step;
     }
 
     writer.write_saturation_csv("proc_cpu_throughput_vs_workers.csv").unwrap();
@@ -403,16 +413,17 @@ fn find_cpu_saturation_proc(calibration: CalibrationResult, params: &TuningParam
 
 fn find_io_saturation_proc(calibration: CalibrationResult, params: &TuningParams) {
     println!("=== FINDING I/O SATURATION POINT (PROCESS MODE) ===");
-    println!("target_us={}, buffer={}KB, max_workers={}, duration={}s",
-             params.target_us, params.buffer_kb, params.max_workers, params.duration_secs);
+    println!("target_us={}, buffer={}KB, max_workers={}, duration={}s, step={}",
+             params.target_us, params.buffer_kb, params.max_workers, params.duration_secs, params.step);
     println!("Adding worker processes until throughput degrades\n");
 
     let mut writer = ResultsWriter::new();
     let mut best_throughput = 0.0;
-    let mut saturation_point = 1;
+    let mut saturation_point = params.step;
     let iters = calibration.io_iterations as f64;
 
-    for worker_count in 1..=params.max_workers {
+    let mut worker_count = params.step;
+    while worker_count <= params.max_workers {
         let blocks_per_sec = measure_proc_throughput(
             worker_count, calibration.cpu_iterations, calibration.io_iterations,
             params.duration_secs, 1.0, params.buffer_kb, params.samples,
@@ -429,6 +440,8 @@ fn find_io_saturation_proc(calibration: CalibrationResult, params: &TuningParams
             best_throughput = throughput;
             saturation_point = worker_count;
         }
+
+        worker_count += params.step;
     }
 
     writer.write_saturation_csv("proc_io_throughput_vs_workers.csv").unwrap();

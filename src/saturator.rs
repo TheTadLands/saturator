@@ -18,6 +18,7 @@ pub struct TuningParams {
     pub max_workers: usize,   // maximum thread/process count
     pub duration_secs: u64,   // measurement duration per data point (default: 5)
     pub samples: usize,       // number of samples per data point, median is taken (default: 3)
+    pub step: usize,           // worker count increment per data point (default: 1)
 }
 
 impl Default for TuningParams {
@@ -30,6 +31,7 @@ impl Default for TuningParams {
             max_workers: parallelism * 4,
             duration_secs: 5,
             samples: 3,
+            step: 1,
         }
     }
 }

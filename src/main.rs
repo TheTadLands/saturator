@@ -1,5 +1,6 @@
 mod saturator;
 mod visualize;
+mod proc_metrics;
 
 use saturator::{
     calibrate_operations_full, CalibrationResult, TuningParams,
@@ -241,7 +242,7 @@ fn run_saturation_experiment(
     let end = params.max_workers;
 
     while worker_count <= end {
-        let blocks_per_sec = match exp.mode {
+        let (blocks_per_sec, throughput_stddev, metrics) = match exp.mode {
             Mode::Threads => measure_thread_throughput(
                 worker_count, calibration.cpu_iterations, calibration.io_iterations,
                 params.duration_secs, exp.io_perc, params.buffer_kb * 1024, params.samples,
@@ -252,15 +253,17 @@ fn run_saturation_experiment(
             ),
         };
         let throughput = blocks_per_sec * iters;
+        let throughput_stddev_ops = throughput_stddev * iters;
         let throughput_per_worker = throughput / worker_count as f64;
 
         let width = if use_step { 3 } else { 2 };
-        println!("  {:>width$} {}: {:12.0} ops/sec ({:10.0} per {})",
+        println!("  {:>width$} {}: {:12.0} ops/sec ({:10.0} per {}) [cpu:{:.1}% iow:{:.1}% ctx:{:.0}/s]",
                  worker_count, worker_label, throughput, throughput_per_worker,
                  if use_step { "proc" } else { "thread" },
+                 metrics.cpu_pct, metrics.iowait_pct, metrics.ctx_switches_per_sec,
                  width = width);
 
-        writer.add_saturation_point(worker_count, throughput);
+        writer.add_saturation_point(worker_count, throughput, throughput_stddev_ops, metrics);
 
         if throughput > best_throughput {
             best_throughput = throughput;
@@ -311,7 +314,7 @@ fn run_slack_experiment(
     let buffer_size = params.buffer_kb * 1024;
 
     println!("Measuring baseline {} throughput...", exp.baseline_label);
-    let baseline_blocks = measure_baseline(
+    let (baseline_blocks, _baseline_stddev, _baseline_metrics) = measure_baseline(
         baseline_threads, exp.baseline_io_ratio,
         calibration.cpu_iterations, calibration.io_iterations,
         params.duration_secs, buffer_size, params.samples,
@@ -333,7 +336,8 @@ fn run_slack_experiment(
                            (extra_io_ratio * 100.0) as u32);
     let mut file = std::fs::File::create(&filename).unwrap();
     use std::io::Write;
-    writeln!(file, "extra_threads,total_threads,extra_io_pct,cpu_ops,io_ops,total_ops,baseline_change_pct").unwrap();
+    writeln!(file, "extra_threads,total_threads,extra_io_pct,cpu_ops,io_ops,total_ops,baseline_change_pct,cpu_ops_stddev,io_ops_stddev,{}",
+             proc_metrics::csv_header()).unwrap();
 
     let vs_label = if exp.track_io { "i/o vs base" } else { "cpu vs base" };
     println!("  {:>6} {:>8} | {:>14} {:>14} | {:>14} {:>12}",
@@ -341,7 +345,7 @@ fn run_slack_experiment(
     println!("  {}", "-".repeat(90));
 
     for extra in 1..=max_extra {
-        let (cpu_blocks, io_blocks) = measure_total_throughput(
+        let (cpu_blocks, io_blocks, cpu_stddev, io_stddev, metrics) = measure_total_throughput(
             baseline_threads, extra, exp.baseline_io_ratio, extra_io_ratio,
             calibration.cpu_iterations, calibration.io_iterations, params.duration_secs, buffer_size, params.samples
         );
@@ -349,16 +353,20 @@ fn run_slack_experiment(
         let cpu_ops = cpu_blocks * cpu_iters;
         let io_ops = io_blocks * io_iters;
         let total_ops = cpu_ops + io_ops;
+        let cpu_ops_stddev = cpu_stddev * cpu_iters;
+        let io_ops_stddev = io_stddev * io_iters;
         let tracked_ops = if exp.track_io { io_ops } else { cpu_ops };
         let baseline_change = (tracked_ops - baseline_throughput) / baseline_throughput * 100.0;
 
         println!("  {:>6} {:>8} | {:>14.0} {:>14.0} | {:>14.0} {:>+11.1}%",
                  extra, baseline_threads + extra, cpu_ops, io_ops, total_ops, baseline_change);
 
-        writeln!(file, "{},{},{},{:.2},{:.2},{:.2},{:.2}",
+        writeln!(file, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
                  extra, baseline_threads + extra,
                  (extra_io_ratio * 100.0) as u32,
-                 cpu_ops, io_ops, total_ops, baseline_change).unwrap();
+                 cpu_ops, io_ops, total_ops, baseline_change,
+                 cpu_ops_stddev, io_ops_stddev,
+                 metrics.to_csv_row()).unwrap();
 
         if tracked_ops > best_tracked_ops {
             best_tracked_ops = tracked_ops;
@@ -386,11 +394,13 @@ fn measure_thread_throughput(
     io_perc: f64,
     buffer_size: usize,
     num_samples: usize,
-) -> f64 {
-    let samples: Vec<f64> = (0..num_samples).map(|_| {
+) -> (f64, f64, proc_metrics::SystemMetrics) {
+    let samples: Vec<(f64, proc_metrics::SystemMetrics)> = (0..num_samples).map(|_| {
         measure_single_run(thread_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_size)
     }).collect();
-    median(&samples)
+    let throughputs: Vec<f64> = samples.iter().map(|s| s.0).collect();
+    let metrics_list: Vec<proc_metrics::SystemMetrics> = samples.into_iter().map(|s| s.1).collect();
+    (median(&throughputs), stddev(&throughputs), proc_metrics::median_metrics(&metrics_list))
 }
 
 fn measure_proc_throughput(
@@ -401,11 +411,13 @@ fn measure_proc_throughput(
     io_perc: f64,
     buffer_kb: usize,
     num_samples: usize,
-) -> f64 {
-    let samples: Vec<f64> = (0..num_samples).map(|_| {
+) -> (f64, f64, proc_metrics::SystemMetrics) {
+    let samples: Vec<(f64, proc_metrics::SystemMetrics)> = (0..num_samples).map(|_| {
         measure_single_run_proc(worker_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_kb)
     }).collect();
-    median(&samples)
+    let throughputs: Vec<f64> = samples.iter().map(|s| s.0).collect();
+    let metrics_list: Vec<proc_metrics::SystemMetrics> = samples.into_iter().map(|s| s.1).collect();
+    (median(&throughputs), stddev(&throughputs), proc_metrics::median_metrics(&metrics_list))
 }
 
 fn measure_single_run_proc(
@@ -415,7 +427,7 @@ fn measure_single_run_proc(
     duration_secs: u64,
     io_perc: f64,
     buffer_kb: usize,
-) -> f64 {
+) -> (f64, proc_metrics::SystemMetrics) {
     use std::process::Command;
 
     let shm_name = format!("/saturator_{}_{}", std::process::id(), worker_count);
@@ -448,8 +460,11 @@ fn measure_single_run_proc(
     std::thread::sleep(Duration::from_secs(1));
     region.total_ops.store(0, Ordering::Relaxed);
 
+    let snap_before = proc_metrics::take_snapshot();
     // Measure
     std::thread::sleep(Duration::from_secs(duration_secs));
+    let snap_after = proc_metrics::take_snapshot();
+    let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
 
     region.running.store(false, Ordering::Relaxed);
     let ops = region.total_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
@@ -461,7 +476,7 @@ fn measure_single_run_proc(
 
     destroy_shared_region(&shm_name, region_ptr, shm_fd);
 
-    ops
+    (ops, metrics)
 }
 
 fn measure_baseline(
@@ -472,8 +487,8 @@ fn measure_baseline(
     duration_secs: u64,
     buffer_size: usize,
     num_samples: usize,
-) -> f64 {
-    let samples: Vec<f64> = (0..num_samples).map(|_| {
+) -> (f64, f64, proc_metrics::SystemMetrics) {
+    let samples: Vec<(f64, proc_metrics::SystemMetrics)> = (0..num_samples).map(|_| {
         let total_ops = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let mut handles = vec![];
@@ -490,7 +505,12 @@ fn measure_baseline(
 
         std::thread::sleep(Duration::from_secs(1));
         total_ops.store(0, Ordering::Relaxed);
+
+        let snap_before = proc_metrics::take_snapshot();
         std::thread::sleep(Duration::from_secs(duration_secs));
+        let snap_after = proc_metrics::take_snapshot();
+        let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
+
         let result = total_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
 
         running.store(false, Ordering::Relaxed);
@@ -498,16 +518,25 @@ fn measure_baseline(
             handle.join().unwrap();
         }
 
-        result
+        (result, metrics)
     }).collect();
 
-    median(&samples)
+    let throughputs: Vec<f64> = samples.iter().map(|s| s.0).collect();
+    let metrics_list: Vec<proc_metrics::SystemMetrics> = samples.into_iter().map(|s| s.1).collect();
+    (median(&throughputs), stddev(&throughputs), proc_metrics::median_metrics(&metrics_list))
 }
 
 fn median(samples: &[f64]) -> f64 {
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     sorted[sorted.len() / 2]
+}
+
+fn stddev(samples: &[f64]) -> f64 {
+    let n = samples.len() as f64;
+    let mean = samples.iter().sum::<f64>() / n;
+    let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    variance.sqrt()
 }
 
 fn measure_single_run(
@@ -517,7 +546,7 @@ fn measure_single_run(
     duration_secs: u64,
     io_perc: f64,
     buffer_size: usize,
-) -> f64 {
+) -> (f64, proc_metrics::SystemMetrics) {
     let total_ops = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
     let mut handles = vec![];
@@ -536,8 +565,12 @@ fn measure_single_run(
     std::thread::sleep(Duration::from_secs(1));
     total_ops.store(0, Ordering::Relaxed);
 
+    let snap_before = proc_metrics::take_snapshot();
     // Now measure for the actual duration
     std::thread::sleep(Duration::from_secs(duration_secs));
+    let snap_after = proc_metrics::take_snapshot();
+    let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
+
     let ops = total_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
 
     running.store(false, Ordering::Relaxed);
@@ -545,7 +578,7 @@ fn measure_single_run(
         handle.join().unwrap();
     }
 
-    ops
+    (ops, metrics)
 }
 
 fn measure_total_throughput(
@@ -558,19 +591,18 @@ fn measure_total_throughput(
     duration_secs: u64,
     buffer_size: usize,
     num_samples: usize,
-) -> (f64, f64) {
-    let results: Vec<(f64, f64)> = (0..num_samples).map(|_| {
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics) {
+    let results: Vec<(f64, f64, proc_metrics::SystemMetrics)> = (0..num_samples).map(|_| {
         measure_total_throughput_single(
             baseline_threads, extra_threads, baseline_io_ratio, extra_io_ratio,
             cpu_iterations, io_iterations, duration_secs, buffer_size,
         )
     }).collect();
 
-    let mut cpu_vals: Vec<f64> = results.iter().map(|r| r.0).collect();
-    let mut io_vals: Vec<f64> = results.iter().map(|r| r.1).collect();
-    cpu_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    io_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (cpu_vals[cpu_vals.len() / 2], io_vals[io_vals.len() / 2])
+    let cpu_vals: Vec<f64> = results.iter().map(|r| r.0).collect();
+    let io_vals: Vec<f64> = results.iter().map(|r| r.1).collect();
+    let metrics_list: Vec<proc_metrics::SystemMetrics> = results.into_iter().map(|r| r.2).collect();
+    (median(&cpu_vals), median(&io_vals), stddev(&cpu_vals), stddev(&io_vals), proc_metrics::median_metrics(&metrics_list))
 }
 
 fn measure_total_throughput_single(
@@ -582,7 +614,7 @@ fn measure_total_throughput_single(
     io_iterations: usize,
     duration_secs: u64,
     buffer_size: usize,
-) -> (f64, f64) {
+) -> (f64, f64, proc_metrics::SystemMetrics) {
     let cpu_ops = Arc::new(AtomicU64::new(0));
     let io_ops = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
@@ -619,8 +651,12 @@ fn measure_total_throughput_single(
     cpu_ops.store(0, Ordering::Relaxed);
     io_ops.store(0, Ordering::Relaxed);
 
+    let snap_before = proc_metrics::take_snapshot();
     // Measure
     std::thread::sleep(Duration::from_secs(duration_secs));
+    let snap_after = proc_metrics::take_snapshot();
+    let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
+
     let result = (
         cpu_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64,
         io_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64,
@@ -631,7 +667,7 @@ fn measure_total_throughput_single(
         handle.join().unwrap();
     }
 
-    result
+    (result.0, result.1, metrics)
 }
 
 fn run_saturator_split(

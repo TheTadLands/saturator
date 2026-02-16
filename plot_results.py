@@ -31,7 +31,10 @@ def plot_saturation(csv_path: str, output_dir: str):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     # Left plot: Total throughput
-    ax1.plot(df['threads'], df['throughput_ops_sec'], f'-o', color=color, linewidth=2, markersize=6)
+    has_stddev = 'throughput_stddev' in df.columns
+    yerr1 = df['throughput_stddev'] if has_stddev else None
+    ax1.errorbar(df['threads'], df['throughput_ops_sec'], yerr=yerr1, fmt='-o', color=color,
+                 linewidth=2, markersize=6, capsize=3, capthick=1)
 
     # Mark the peak
     peak_idx = df['throughput_ops_sec'].idxmax()
@@ -48,7 +51,9 @@ def plot_saturation(csv_path: str, output_dir: str):
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_number(x)))
 
     # Right plot: Throughput per thread/worker
-    ax2.plot(df['threads'], df['throughput_per_thread'], f'-s', color=color, linewidth=2, markersize=6)
+    yerr2 = df['throughput_stddev'] / df['threads'] if has_stddev else None
+    ax2.errorbar(df['threads'], df['throughput_per_thread'], yerr=yerr2, fmt='-s', color=color,
+                 linewidth=2, markersize=6, capsize=3, capthick=1)
 
     ax2.set_xlabel(x_label, fontsize=12)
     ax2.set_ylabel(f'Throughput per {mode} (ops/sec)', fontsize=12)
@@ -91,18 +96,25 @@ def plot_slack(csv_path: str, output_dir: str):
     color_cpu = 'tab:blue'
     color_io = 'tab:green'
     
+    has_cpu_stddev = 'cpu_ops_stddev' in df.columns
+    has_io_stddev = 'io_ops_stddev' in df.columns
+
     ax1.set_xlabel('Extra Threads', fontsize=12)
     ax1.set_ylabel('CPU ops/sec', fontsize=12, color=color_cpu)
-    line1, = ax1.plot(df['extra_threads'], df['cpu_ops'], 'o-', color=color_cpu, 
-                      label='CPU ops/s', linewidth=2, markersize=5)
+    line1 = ax1.errorbar(df['extra_threads'], df['cpu_ops'],
+                         yerr=df['cpu_ops_stddev'] if has_cpu_stddev else None,
+                         fmt='o-', color=color_cpu, label='CPU ops/s',
+                         linewidth=2, markersize=5, capsize=3, capthick=1)
     ax1.tick_params(axis='y', labelcolor=color_cpu)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_number(x)))
-    
+
     # Secondary y-axis for I/O ops
     ax1_io = ax1.twinx()
     ax1_io.set_ylabel('I/O ops/sec', fontsize=12, color=color_io)
-    line2, = ax1_io.plot(df['extra_threads'], df['io_ops'], 's-', color=color_io, 
-                         label='I/O ops/s', linewidth=2, markersize=5)
+    line2 = ax1_io.errorbar(df['extra_threads'], df['io_ops'],
+                            yerr=df['io_ops_stddev'] if has_io_stddev else None,
+                            fmt='s-', color=color_io, label='I/O ops/s',
+                            linewidth=2, markersize=5, capsize=3, capthick=1)
     ax1_io.tick_params(axis='y', labelcolor=color_io)
     ax1_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_number(x)))
     

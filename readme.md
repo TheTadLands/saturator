@@ -110,6 +110,8 @@ The `-proc` experiments accept optional flags to control workload parameters. Th
 | `--buffer-kb <N>` | 100 | CPU work buffer size in KB. Larger values (e.g. 1024-10240) cause L3 cache contention at high worker counts. |
 | `--max-workers <N>` | parallelism * 16 | Maximum number of workers to test. |
 | `--duration <N>` | 5 | Measurement duration per data point in seconds. |
+| `--samples <N>` | 3 | Samples per data point. Median and stddev are computed; stddev is written to CSV for error bar visualization. |
+| `--step <N>` | 1 | Worker count increment per data point. |
 
 Examples:
 ```bash
@@ -133,7 +135,7 @@ python plot_results.py              # Plot all CSVs in ./output
 python plot_results.py output/*.csv # Plot specific files
 ```
 
-This generates PNG visualizations:
+This generates PNG visualizations with stddev error bars:
 - Throughput vs thread/worker count (saturation curves)
 - Baseline degradation vs extra threads (slack analysis)
 

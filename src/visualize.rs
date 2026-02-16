@@ -3,10 +3,14 @@ use std::io::{Write, BufWriter};
 use std::path::PathBuf;
 use std::env;
 
+use crate::proc_metrics::{self, SystemMetrics};
+
 pub struct SaturationResult {
     pub thread_count: usize,
     pub throughput: f64,
     pub throughput_per_thread: f64,
+    pub throughput_stddev: f64,
+    pub metrics: SystemMetrics,
 }
 
 pub struct ResultsWriter {
@@ -20,11 +24,13 @@ impl ResultsWriter {
         }
     }
 
-    pub fn add_saturation_point(&mut self, thread_count: usize, throughput: f64) {
+    pub fn add_saturation_point(&mut self, thread_count: usize, throughput: f64, throughput_stddev: f64, metrics: SystemMetrics) {
         self.saturation_results.push(SaturationResult {
             thread_count,
             throughput,
             throughput_per_thread: throughput / thread_count as f64,
+            throughput_stddev,
+            metrics,
         });
     }
 
@@ -33,11 +39,13 @@ impl ResultsWriter {
         let file = File::create(&path)?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(writer, "threads,throughput_ops_sec,throughput_per_thread")?;
+        writeln!(writer, "threads,throughput_ops_sec,throughput_per_thread,throughput_stddev,{}",
+                 proc_metrics::csv_header())?;
 
         for r in &self.saturation_results {
-            writeln!(writer, "{},{:.2},{:.2}",
-                     r.thread_count, r.throughput, r.throughput_per_thread)?;
+            writeln!(writer, "{},{:.2},{:.2},{:.2},{}",
+                     r.thread_count, r.throughput, r.throughput_per_thread,
+                     r.throughput_stddev, r.metrics.to_csv_row())?;
         }
 
         writer.flush()?;

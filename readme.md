@@ -108,10 +108,12 @@ The `-proc` experiments accept optional flags to control workload parameters. Th
 |------|---------|-------------|
 | `--target-us <N>` | 50 | Calibration target per-operation in microseconds. Lower values (e.g. 1-5) make context switch overhead proportionally larger. |
 | `--buffer-kb <N>` | 100 | CPU work buffer size in KB. Larger values (e.g. 1024-10240) cause L3 cache contention at high worker counts. |
+| `--io-buffer-kb <N>` | 4 | IO read/write buffer size in KB. Larger values (e.g. 64-1024) increase bytes per IO operation, driving higher bandwidth utilization. |
 | `--max-workers <N>` | parallelism * 16 | Maximum number of workers to test. |
 | `--duration <N>` | 5 | Measurement duration per data point in seconds. |
 | `--samples <N>` | 3 | Samples per data point. Median and stddev are computed; stddev is written to CSV for error bar visualization. |
 | `--step <N>` | 1 | Worker count increment per data point. |
+| `--intensity <F>` | 1.0 | Work probability per iteration (0.0–1.0). Each idle iteration sleeps for `target_us` μs instead of working. Simulates partially-loaded workers. |
 
 Examples:
 ```bash
@@ -128,14 +130,54 @@ docker compose run --build --remove-orphans saturator find-saturation-proc \
 
 ## Output
 
-Results are written to CSV files in the `./output` directory. Plot them with:
+Results are written to CSV files in the `./output` directory.
+
+### Saturation CSV columns
+
+Produced by `find-saturation`, `find-io-saturation`, `find-saturation-proc`, and `find-io-saturation-proc`.
+
+| Column | Description |
+|--------|-------------|
+| `threads` | Number of threads or processes |
+| `cpu_ops_sec` | CPU operations per second across all workers |
+| `io_ops_sec` | IO operations per second across all workers |
+| `total_ops_sec` | Total operations per second (cpu + io) |
+| `throughput_per_thread` | Total operations per second per worker |
+| `cpu_ops_stddev` | Standard deviation of CPU ops across samples |
+| `io_ops_stddev` | Standard deviation of IO ops across samples |
+| `cpu_pct` | Container CPU utilization (cgroup-scoped, 100% = all assigned cores busy) |
+| `system_pct` | Kernel/system CPU time as percentage of available CPU |
+| `io_util_pct` | IO bandwidth utilization as percentage of cgroup limit (from `io.stat` / `io.max`) |
+| `io_psi_pct` | IO pressure — percentage of wall time at least one task was stalled on IO |
+| `psi_cpu_some_us` | PSI CPU "some" stall time in microseconds |
+| `psi_io_some_us` | PSI IO "some" stall time in microseconds |
+| `psi_io_full_us` | PSI IO "full" stall time in microseconds |
+
+### Slack CSV columns
+
+Produced by `find-slack` and `find-io-slack`.
+
+| Column | Description |
+|--------|-------------|
+| `extra_threads` | Number of extra threads added beyond baseline |
+| `total_threads` | Total thread count (baseline + extra) |
+| `extra_io_pct` | IO percentage of the extra threads |
+| `cpu_ops` | CPU operations per second |
+| `io_ops` | IO operations per second |
+| `total_ops` | Total operations per second (cpu_ops + io_ops) |
+| `baseline_change_pct` | Percentage change in tracked metric vs baseline |
+| `cpu_ops_stddev` | Standard deviation of CPU ops across samples |
+| `io_ops_stddev` | Standard deviation of IO ops across samples |
+| `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV |
+
+### Plotting
 
 ```bash
 python plot_results.py              # Plot all CSVs in ./output
 python plot_results.py output/*.csv # Plot specific files
 ```
 
-This generates PNG visualizations with stddev error bars:
+Generates PNG visualizations with stddev error bars:
 - Throughput vs thread/worker count (saturation curves)
 - Baseline degradation vs extra threads (slack analysis)
 
@@ -143,7 +185,9 @@ This generates PNG visualizations with stddev error bars:
 
 The `compose.yaml` includes isolation settings:
 - `cpuset`: Pin to specific CPU cores (adjust to match your system)
-- `mem_limit`: Fixed memory allocation
+- `mem_limit` / `mem_reservation`: Fixed memory allocation (8GB limit, 4GB reserved)
+- `blkio_config`: I/O throughput throttle (100 MB/s read/write) to simulate spinning disk speeds. Device path is hardware-specific — adjust for your system.
 - `volumes`: `./io_scratch:/tmp` for I/O operations
 - `network_mode: none`: No network interference
+- `privileged: true`: Required for shared memory operations
 - `ulimits`: Raised file descriptor limits for high process counts

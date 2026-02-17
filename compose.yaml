@@ -16,6 +16,15 @@ services:
     # Additional isolation
     network_mode: none
     
+    # Throttle I/O to simulate spinning disk speeds
+    blkio_config:
+      device_read_bps:
+        - path: /dev/nvme0n1
+          rate: '100mb'
+      device_write_bps:
+        - path: /dev/nvme0n1
+          rate: '100mb'
+
     # Use real disk for I/O operations
     volumes:
       - ./output:/app/output

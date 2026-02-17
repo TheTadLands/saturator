@@ -1,15 +1,16 @@
 use std::fs::File;
 use std::io::{Write, BufWriter};
-use std::path::PathBuf;
-use std::env;
 
 use crate::proc_metrics::{self, SystemMetrics};
 
 pub struct SaturationResult {
     pub thread_count: usize,
-    pub throughput: f64,
+    pub cpu_ops: f64,
+    pub io_ops: f64,
+    pub total_ops: f64,
     pub throughput_per_thread: f64,
-    pub throughput_stddev: f64,
+    pub cpu_ops_stddev: f64,
+    pub io_ops_stddev: f64,
     pub metrics: SystemMetrics,
 }
 
@@ -24,32 +25,37 @@ impl ResultsWriter {
         }
     }
 
-    pub fn add_saturation_point(&mut self, thread_count: usize, throughput: f64, throughput_stddev: f64, metrics: SystemMetrics) {
+    pub fn add_saturation_point(&mut self, thread_count: usize, cpu_ops: f64, io_ops: f64, cpu_ops_stddev: f64, io_ops_stddev: f64, metrics: SystemMetrics) {
+        let total_ops = cpu_ops + io_ops;
         self.saturation_results.push(SaturationResult {
             thread_count,
-            throughput,
-            throughput_per_thread: throughput / thread_count as f64,
-            throughput_stddev,
+            cpu_ops,
+            io_ops,
+            total_ops,
+            throughput_per_thread: total_ops / thread_count as f64,
+            cpu_ops_stddev,
+            io_ops_stddev,
             metrics,
         });
     }
 
-    pub fn write_saturation_csv(&self, filename: &str) -> std::io::Result<PathBuf> {
-        let path = env::current_dir()?.join(filename);
-        let file = File::create(&path)?;
+    pub fn write_saturation_csv(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(writer, "threads,throughput_ops_sec,throughput_per_thread,throughput_stddev,{}",
+        writeln!(writer, "threads,cpu_ops_sec,io_ops_sec,total_ops_sec,throughput_per_thread,cpu_ops_stddev,io_ops_stddev,{}",
                  proc_metrics::csv_header())?;
 
         for r in &self.saturation_results {
-            writeln!(writer, "{},{:.2},{:.2},{:.2},{}",
-                     r.thread_count, r.throughput, r.throughput_per_thread,
-                     r.throughput_stddev, r.metrics.to_csv_row())?;
+            writeln!(writer, "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+                     r.thread_count, r.cpu_ops, r.io_ops, r.total_ops,
+                     r.throughput_per_thread,
+                     r.cpu_ops_stddev, r.io_ops_stddev,
+                     r.metrics.to_csv_row())?;
         }
 
         writer.flush()?;
-        println!("Saturation results written to: {}", path.display());
-        Ok(path)
+        println!("Results written to: {}", path.display());
+        Ok(())
     }
 }

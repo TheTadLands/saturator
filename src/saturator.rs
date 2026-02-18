@@ -203,6 +203,9 @@ pub fn run_saturator(
     running: Arc<AtomicBool>,
     intensity: f64,
     sleep_us: u64,
+    pt_cpu: Arc<AtomicU64>,
+    pt_io: Arc<AtomicU64>,
+    pt_sleep: Arc<AtomicU64>,
 ) {
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_{}", thread_id);
@@ -215,6 +218,7 @@ pub fn run_saturator(
 
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
+    let mut local_sleep_ops = 0u64;
     let mut rng_state = thread_id as u64 + 12345;
 
     while running.load(Ordering::Relaxed) {
@@ -227,6 +231,11 @@ pub fn run_saturator(
             let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
             if intensity_roll >= intensity {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                local_sleep_ops += 1;
+                if local_sleep_ops >= 100 {
+                    pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
+                    local_sleep_ops = 0;
+                }
                 continue;
             }
         }
@@ -242,6 +251,8 @@ pub fn run_saturator(
         if (local_cpu_ops + local_io_ops) >= 100 {
             cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
             io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
+            pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
+            pt_io.fetch_add(local_io_ops, Ordering::Relaxed);
             local_cpu_ops = 0;
             local_io_ops = 0;
         }
@@ -249,9 +260,14 @@ pub fn run_saturator(
 
     if local_cpu_ops > 0 {
         cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
+        pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
     }
     if local_io_ops > 0 {
         io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
+        pt_io.fetch_add(local_io_ops, Ordering::Relaxed);
+    }
+    if local_sleep_ops > 0 {
+        pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
     }
 
     // Always try to clean up
@@ -319,10 +335,10 @@ pub struct SharedRegion {
     _padding: [u8; 7],
 }
 
-/// Compute shared memory size: header + per-worker counters (2 x AtomicU64 each), rounded up to page size
+/// Compute shared memory size: header + per-worker counters (3 x AtomicU64 each), rounded up to page size
 fn shm_size_for_workers(max_workers: usize) -> usize {
     let header = std::mem::size_of::<SharedRegion>();
-    let per_worker = max_workers * 16; // 2 x AtomicU64 (8 bytes each) per worker
+    let per_worker = max_workers * 24; // 3 x AtomicU64 (8 bytes each) per worker: cpu, io, sleep
     let total = header + per_worker;
     // Round up to page boundary (4096)
     (total + 4095) & !4095
@@ -362,7 +378,7 @@ pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegio
 
         // Zero-init per-worker area
         let worker_area = (ptr as *mut u8).add(std::mem::size_of::<SharedRegion>());
-        std::ptr::write_bytes(worker_area, 0, max_workers * 16);
+        std::ptr::write_bytes(worker_area, 0, max_workers * 24);
 
         (region, fd)
     }
@@ -400,18 +416,19 @@ pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_wo
     }
 }
 
-/// Get per-worker atomic counters (cpu_ops, io_ops) from the shared region.
-/// Worker counters are laid out after the SharedRegion header: [AtomicU64 cpu, AtomicU64 io] per worker.
+/// Get per-worker atomic counters (cpu_ops, io_ops, sleep_ops) from the shared region.
+/// Worker counters are laid out after the SharedRegion header: [AtomicU64 cpu, AtomicU64 io, AtomicU64 sleep] per worker.
 ///
 /// # Safety
 /// Caller must ensure `region` points to a valid shared region with space for `worker_id` workers.
-pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&'static AtomicU64, &'static AtomicU64) {
+pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&'static AtomicU64, &'static AtomicU64, &'static AtomicU64) {
     unsafe {
         let base = (region as *mut u8).add(std::mem::size_of::<SharedRegion>());
-        let slot = base.add(worker_id * 16);
-        let cpu = &*(slot as *const AtomicU64);
-        let io = &*((slot.add(8)) as *const AtomicU64);
-        (cpu, io)
+        let slot = base.add(worker_id * 24);
+        let cpu   = &*(slot as *const AtomicU64);
+        let io    = &*((slot.add(8))  as *const AtomicU64);
+        let sleep = &*((slot.add(16)) as *const AtomicU64);
+        (cpu, io, sleep)
     }
 }
 
@@ -430,7 +447,7 @@ pub fn run_worker_process(
 ) {
     let region = open_shared_region(shm_name, max_workers);
     let region_ref = unsafe { &*region };
-    let (wk_cpu, wk_io) = unsafe { worker_counters(region, worker_id) };
+    let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region, worker_id) };
 
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_proc_{}", worker_id);
@@ -445,6 +462,7 @@ pub fn run_worker_process(
 
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
+    let mut local_sleep_ops = 0u64;
     let mut rng_state = worker_id as u64 + 12345;
 
     while region_ref.running.load(Ordering::Relaxed) {
@@ -457,6 +475,11 @@ pub fn run_worker_process(
             let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
             if intensity_roll >= intensity {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                local_sleep_ops += 1;
+                if local_sleep_ops >= 100 {
+                    wk_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
+                    local_sleep_ops = 0;
+                }
                 continue;
             }
         }
@@ -486,6 +509,9 @@ pub fn run_worker_process(
     if local_io_ops > 0 {
         region_ref.io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
         wk_io.fetch_add(local_io_ops, Ordering::Relaxed);
+    }
+    if local_sleep_ops > 0 {
+        wk_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
     }
 
     let _ = std::fs::remove_file(&io_path);

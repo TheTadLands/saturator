@@ -397,7 +397,7 @@ fn run_saturation_experiment(
     let mut writer = ResultsWriter::new();
     let mut best_throughput = 0.0;
     let mut saturation_point = params.step;
-    let mut per_worker_rows: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
+    let mut per_worker_rows: Vec<(usize, Vec<(f64, f64, f64)>)> = Vec::new();
 
     let use_step = matches!(exp.mode, Mode::Procs);
     let mut worker_count = if use_step { params.step } else { 1 };
@@ -412,12 +412,12 @@ fn run_saturation_experiment(
         let sleep_us = calibration.cpu_us as u64;
         let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_worker_data) = match exp.mode {
             Mode::Threads => {
-                let (c, i, cs, is, m) = measure_thread_throughput(
+                let (c, i, cs, is, m, pw) = measure_thread_throughput(
                     worker_count, calibration.cpu_iterations, calibration.io_iterations,
                     params.duration_secs, exp.io_perc, params.buffer_kb * 1024, params.io_buffer_kb * 1024, params.samples,
                     params.intensity, sleep_us, params.warmup_secs,
                 );
-                (c, i, cs, is, m, None)
+                (c, i, cs, is, m, Some(pw))
             },
             Mode::Procs => {
                 let (c, i, cs, is, m, pw) = measure_proc_throughput(
@@ -465,15 +465,15 @@ fn run_saturation_experiment(
     let csv_path = format!("{}/{}.csv", run_dir, exp.csv_base);
     writer.write_saturation_csv(std::path::Path::new(&csv_path)).unwrap();
 
-    // Write per-worker CSV for proc mode
+    // Write per-worker CSV (both thread and proc mode)
     if !per_worker_rows.is_empty() {
         use std::io::Write as _;
         let pw_path = format!("{}/per_worker_{}.csv", run_dir, exp.csv_base);
         let mut pw_file = std::fs::File::create(&pw_path).unwrap();
-        writeln!(pw_file, "workers,worker_id,cpu_ops_sec,io_ops_sec,total_ops_sec").unwrap();
+        writeln!(pw_file, "workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec").unwrap();
         for (workers, per_worker) in &per_worker_rows {
-            for (wid, (wc, wi)) in per_worker.iter().enumerate() {
-                writeln!(pw_file, "{},{},{:.2},{:.2},{:.2}", workers, wid, wc, wi, wc + wi).unwrap();
+            for (wid, (wc, wi, ws)) in per_worker.iter().enumerate() {
+                writeln!(pw_file, "{},{},{:.2},{:.2},{:.2},{:.2}", workers, wid, wc, wi, ws, wc + wi).unwrap();
             }
         }
     }
@@ -523,7 +523,7 @@ fn run_slack_experiment(
     println!("Measuring baseline {} throughput...", exp.baseline_label);
     let sleep_us = calibration.cpu_us as u64;
     let io_buffer_size = params.io_buffer_kb * 1024;
-    let (baseline_cpu, baseline_io, _, _, _) = measure_baseline(
+    let (baseline_cpu, baseline_io, baseline_cpu_std, baseline_io_std, baseline_metrics, baseline_per_thread) = measure_baseline(
         baseline_threads, exp.baseline_io_ratio,
         calibration.cpu_iterations, calibration.io_iterations,
         params.duration_secs, buffer_size, io_buffer_size, params.samples,
@@ -559,13 +559,33 @@ fn run_slack_experiment(
     writeln!(file, "extra_threads,total_threads,extra_io_pct,cpu_ops,io_ops,total_ops,baseline_change_pct,cpu_ops_stddev,io_ops_stddev,{}",
              proc_metrics::csv_header()).unwrap();
 
+    // Write extra=0 baseline row
+    writeln!(file, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+             0, baseline_threads,
+             (extra_io_ratio * 100.0) as u32,
+             baseline_cpu, baseline_io, baseline_cpu + baseline_io, 0.0,
+             baseline_cpu_std, baseline_io_std,
+             baseline_metrics.to_csv_row()).unwrap();
+
     let vs_label = if exp.track_io { "vs base" } else { "vs base" };
     println!("  {:>5} {:>7} | {:>12} {:>12} {:>12} | {:>8} | {:>6} {:>6}",
              "extra", "total", "cpu ops/s", "io ops/s", "total ops/s", vs_label, "cpu%", "io%");
     println!("  {}", "-".repeat(90));
 
+    // Per-thread CSV: seed with extra=0 baseline data
+    let pw_filename = format!("{}/per_worker_{}.csv", run_dir, csv_base);
+    let mut pw_file = {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&pw_filename).unwrap();
+        writeln!(f, "extra_threads,total_threads,thread_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec").unwrap();
+        for (tid, (wc, wi, ws)) in baseline_per_thread.iter().enumerate() {
+            writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{:.2}", 0, baseline_threads, tid, wc, wi, ws, wc + wi).unwrap();
+        }
+        f
+    };
+
     for extra in 1..=max_extra {
-        let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics) = measure_total_throughput(
+        let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_thread) = measure_total_throughput(
             baseline_threads, extra, exp.baseline_io_ratio, extra_io_ratio,
             calibration.cpu_iterations, calibration.io_iterations, params.duration_secs, buffer_size, io_buffer_size, params.samples,
             params.intensity, sleep_us, params.warmup_secs,
@@ -587,6 +607,12 @@ fn run_slack_experiment(
                  cpu_ops, io_ops, total_ops, baseline_change,
                  cpu_ops_stddev, io_ops_stddev,
                  metrics.to_csv_row()).unwrap();
+
+        use std::io::Write as _;
+        for (tid, (wc, wi, ws)) in per_thread.iter().enumerate() {
+            writeln!(pw_file, "{},{},{},{:.2},{:.2},{:.2},{:.2}",
+                     extra, baseline_threads + extra, tid, wc, wi, ws, wc + wi).unwrap();
+        }
 
         if tracked_ops > best_tracked_ops {
             best_tracked_ops = tracked_ops;
@@ -618,14 +644,27 @@ fn measure_thread_throughput(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics) {
-    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics)> = (0..num_samples).map(|_| {
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
+    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)> = (0..num_samples).map(|_| {
         measure_single_run(thread_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_size, io_buffer_size, intensity, sleep_us, warmup_secs)
     }).collect();
     let cpu_vals: Vec<f64> = samples.iter().map(|s| s.0).collect();
     let io_vals: Vec<f64> = samples.iter().map(|s| s.1).collect();
+
+    // Pick per-thread data from the sample closest to median total throughput
+    let median_total = median(&cpu_vals) + median(&io_vals);
+    let median_idx = samples.iter().enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let da = ((a.0 + a.1) - median_total).abs();
+            let db = ((b.0 + b.1) - median_total).abs();
+            da.partial_cmp(&db).unwrap()
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let per_thread = samples[median_idx].3.clone();
+
     let metrics_list: Vec<proc_metrics::SystemMetrics> = samples.into_iter().map(|s| s.2).collect();
-    (median(&cpu_vals), median(&io_vals), stddev(&cpu_vals), stddev(&io_vals), proc_metrics::median_metrics(&metrics_list))
+    (median(&cpu_vals), median(&io_vals), stddev(&cpu_vals), stddev(&io_vals), proc_metrics::median_metrics(&metrics_list), per_thread)
 }
 
 fn measure_proc_throughput(
@@ -640,8 +679,8 @@ fn measure_proc_throughput(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>) {
-    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>)> = (0..num_samples).map(|_| {
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
+    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)> = (0..num_samples).map(|_| {
         measure_single_run_proc(worker_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_kb, io_buffer_kb, intensity, sleep_us, warmup_secs)
     }).collect();
     let cpu_vals: Vec<f64> = samples.iter().map(|s| s.0).collect();
@@ -674,7 +713,7 @@ fn measure_single_run_proc(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>) {
+) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     use std::process::Command;
 
     let shm_name = format!("/saturator_{}_{}", std::process::id(), worker_count);
@@ -713,9 +752,10 @@ fn measure_single_run_proc(
     region.io_ops.store(0, Ordering::Relaxed);
     // Reset per-worker counters after warmup
     for i in 0..worker_count {
-        let (wk_cpu, wk_io) = unsafe { worker_counters(region_ptr, i) };
+        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         wk_cpu.store(0, Ordering::Relaxed);
         wk_io.store(0, Ordering::Relaxed);
+        wk_sleep.store(0, Ordering::Relaxed);
     }
 
     let snap_before = proc_metrics::take_snapshot();
@@ -737,10 +777,11 @@ fn measure_single_run_proc(
     // Read per-worker counters
     let mut per_worker = Vec::with_capacity(worker_count);
     for i in 0..worker_count {
-        let (wk_cpu, wk_io) = unsafe { worker_counters(region_ptr, i) };
+        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        per_worker.push((wc, wi));
+        let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
+        per_worker.push((wc, wi, ws));
     }
 
     destroy_shared_region(&shm_name, region_ptr, shm_fd, worker_count);
@@ -760,20 +801,29 @@ fn measure_baseline(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics) {
-    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics)> = (0..num_samples).map(|_| {
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
+    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)> = (0..num_samples).map(|_| {
         let cpu_ops = Arc::new(AtomicU64::new(0));
         let io_ops = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
+
+        let per_thread: Vec<[Arc<AtomicU64>; 3]> = (0..threads)
+            .map(|_| [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))])
+            .collect();
+
         let mut handles = vec![];
 
-        for i in 0..threads {
+        for (i, pt) in per_thread.iter().enumerate() {
             let running = Arc::clone(&running);
             let cpu_ops = Arc::clone(&cpu_ops);
             let io_ops = Arc::clone(&io_ops);
+            let pt_cpu   = Arc::clone(&pt[0]);
+            let pt_io    = Arc::clone(&pt[1]);
+            let pt_sleep = Arc::clone(&pt[2]);
 
             let handle = std::thread::spawn(move || {
-                run_saturator(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size, cpu_ops, io_ops, running, intensity, sleep_us);
+                run_saturator(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
+                              cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
             });
             handles.push(handle);
         }
@@ -781,6 +831,11 @@ fn measure_baseline(
         std::thread::sleep(Duration::from_secs(warmup_secs));
         cpu_ops.store(0, Ordering::Relaxed);
         io_ops.store(0, Ordering::Relaxed);
+        for pt in &per_thread {
+            pt[0].store(0, Ordering::Relaxed);
+            pt[1].store(0, Ordering::Relaxed);
+            pt[2].store(0, Ordering::Relaxed);
+        }
 
         let snap_before = proc_metrics::take_snapshot();
         std::thread::sleep(Duration::from_secs(duration_secs));
@@ -794,13 +849,30 @@ fn measure_baseline(
 
         let cpu = cpu_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let io = io_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        (cpu, io, metrics)
+        let pt_data: Vec<(f64, f64, f64)> = per_thread.iter()
+            .map(|pt| (
+                pt[0].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+                pt[1].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+                pt[2].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+            ))
+            .collect();
+        (cpu, io, metrics, pt_data)
     }).collect();
 
     let cpu_vals: Vec<f64> = samples.iter().map(|s| s.0).collect();
     let io_vals: Vec<f64> = samples.iter().map(|s| s.1).collect();
+
+    let median_total = median(&cpu_vals) + median(&io_vals);
+    let median_idx = samples.iter().enumerate()
+        .min_by(|(_, a), (_, b)| {
+            ((a.0 + a.1) - median_total).abs()
+                .partial_cmp(&((b.0 + b.1) - median_total).abs()).unwrap()
+        })
+        .map(|(i, _)| i).unwrap_or(0);
+    let per_thread = samples[median_idx].3.clone();
+
     let metrics_list: Vec<proc_metrics::SystemMetrics> = samples.into_iter().map(|s| s.2).collect();
-    (median(&cpu_vals), median(&io_vals), stddev(&cpu_vals), stddev(&io_vals), proc_metrics::median_metrics(&metrics_list))
+    (median(&cpu_vals), median(&io_vals), stddev(&cpu_vals), stddev(&io_vals), proc_metrics::median_metrics(&metrics_list), per_thread)
 }
 
 fn median(samples: &[f64]) -> f64 {
@@ -827,27 +899,42 @@ fn measure_single_run(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, proc_metrics::SystemMetrics) {
+) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let cpu_ops = Arc::new(AtomicU64::new(0));
     let io_ops = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
+
+    // Per-thread counters: [cpu, io, sleep] per thread
+    let per_thread: Vec<[Arc<AtomicU64>; 3]> = (0..thread_count)
+        .map(|_| [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))])
+        .collect();
+
     let mut handles = vec![];
 
-    for i in 0..thread_count {
+    for (i, pt) in per_thread.iter().enumerate() {
         let running = Arc::clone(&running);
         let cpu_ops = Arc::clone(&cpu_ops);
         let io_ops = Arc::clone(&io_ops);
+        let pt_cpu   = Arc::clone(&pt[0]);
+        let pt_io    = Arc::clone(&pt[1]);
+        let pt_sleep = Arc::clone(&pt[2]);
 
         let handle = std::thread::spawn(move || {
-            run_saturator(i, io_perc, cpu_iterations, io_iterations, buffer_size, io_buffer_size, cpu_ops, io_ops, running, intensity, sleep_us);
+            run_saturator(i, io_perc, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
+                          cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
         });
         handles.push(handle);
     }
 
-    // Warmup: let threads run, then reset counter
+    // Warmup: let threads run, then reset counters
     std::thread::sleep(Duration::from_secs(warmup_secs));
     cpu_ops.store(0, Ordering::Relaxed);
     io_ops.store(0, Ordering::Relaxed);
+    for pt in &per_thread {
+        pt[0].store(0, Ordering::Relaxed);
+        pt[1].store(0, Ordering::Relaxed);
+        pt[2].store(0, Ordering::Relaxed);
+    }
 
     let snap_before = proc_metrics::take_snapshot();
     // Now measure for the actual duration
@@ -862,7 +949,16 @@ fn measure_single_run(
 
     let cpu = cpu_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
     let io = io_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-    (cpu, io, metrics)
+
+    let per_thread_data: Vec<(f64, f64, f64)> = per_thread.iter()
+        .map(|pt| (
+            pt[0].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+            pt[1].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+            pt[2].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+        ))
+        .collect();
+
+    (cpu, io, metrics, per_thread_data)
 }
 
 fn measure_total_throughput(
@@ -879,8 +975,8 @@ fn measure_total_throughput(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics) {
-    let results: Vec<(f64, f64, proc_metrics::SystemMetrics)> = (0..num_samples).map(|_| {
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
+    let results: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)> = (0..num_samples).map(|_| {
         measure_total_throughput_single(
             baseline_threads, extra_threads, baseline_io_ratio, extra_io_ratio,
             cpu_iterations, io_iterations, duration_secs, buffer_size, io_buffer_size,
@@ -890,8 +986,18 @@ fn measure_total_throughput(
 
     let cpu_vals: Vec<f64> = results.iter().map(|r| r.0).collect();
     let io_vals: Vec<f64> = results.iter().map(|r| r.1).collect();
+
+    let median_total = median(&cpu_vals) + median(&io_vals);
+    let median_idx = results.iter().enumerate()
+        .min_by(|(_, a), (_, b)| {
+            ((a.0 + a.1) - median_total).abs()
+                .partial_cmp(&((b.0 + b.1) - median_total).abs()).unwrap()
+        })
+        .map(|(i, _)| i).unwrap_or(0);
+    let per_thread = results[median_idx].3.clone();
+
     let metrics_list: Vec<proc_metrics::SystemMetrics> = results.into_iter().map(|r| r.2).collect();
-    (median(&cpu_vals), median(&io_vals), stddev(&cpu_vals), stddev(&io_vals), proc_metrics::median_metrics(&metrics_list))
+    (median(&cpu_vals), median(&io_vals), stddev(&cpu_vals), stddev(&io_vals), proc_metrics::median_metrics(&metrics_list), per_thread)
 }
 
 fn measure_total_throughput_single(
@@ -907,34 +1013,48 @@ fn measure_total_throughput_single(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, proc_metrics::SystemMetrics) {
+) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
+    let total_threads = baseline_threads + extra_threads;
     let cpu_ops = Arc::new(AtomicU64::new(0));
     let io_ops = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
+
+    let per_thread: Vec<[Arc<AtomicU64>; 3]> = (0..total_threads)
+        .map(|_| [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))])
+        .collect();
+
     let mut handles = vec![];
 
     // Spawn baseline threads
-    for i in 0..baseline_threads {
+    for (i, pt) in per_thread[..baseline_threads].iter().enumerate() {
         let running = Arc::clone(&running);
         let cpu_ops = Arc::clone(&cpu_ops);
         let io_ops = Arc::clone(&io_ops);
         let io_ratio = baseline_io_ratio;
+        let pt_cpu   = Arc::clone(&pt[0]);
+        let pt_io    = Arc::clone(&pt[1]);
+        let pt_sleep = Arc::clone(&pt[2]);
 
         let handle = std::thread::spawn(move || {
-            run_saturator_split(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size, cpu_ops, io_ops, running, intensity, sleep_us);
+            run_saturator_split(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
+                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
         });
         handles.push(handle);
     }
 
     // Spawn extra threads
-    for i in 0..extra_threads {
+    for (i, pt) in per_thread[baseline_threads..].iter().enumerate() {
         let running = Arc::clone(&running);
         let cpu_ops = Arc::clone(&cpu_ops);
         let io_ops = Arc::clone(&io_ops);
         let io_ratio = extra_io_ratio;
+        let pt_cpu   = Arc::clone(&pt[0]);
+        let pt_io    = Arc::clone(&pt[1]);
+        let pt_sleep = Arc::clone(&pt[2]);
 
         let handle = std::thread::spawn(move || {
-            run_saturator_split(baseline_threads + i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size, cpu_ops, io_ops, running, intensity, sleep_us);
+            run_saturator_split(baseline_threads + i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
+                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
         });
         handles.push(handle);
     }
@@ -943,6 +1063,11 @@ fn measure_total_throughput_single(
     std::thread::sleep(Duration::from_secs(warmup_secs));
     cpu_ops.store(0, Ordering::Relaxed);
     io_ops.store(0, Ordering::Relaxed);
+    for pt in &per_thread {
+        pt[0].store(0, Ordering::Relaxed);
+        pt[1].store(0, Ordering::Relaxed);
+        pt[2].store(0, Ordering::Relaxed);
+    }
 
     let snap_before = proc_metrics::take_snapshot();
     // Measure
@@ -957,7 +1082,16 @@ fn measure_total_throughput_single(
 
     let cpu = cpu_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
     let io = io_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-    (cpu, io, metrics)
+
+    let per_thread_data: Vec<(f64, f64, f64)> = per_thread.iter()
+        .map(|pt| (
+            pt[0].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+            pt[1].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+            pt[2].load(Ordering::Relaxed) as f64 / duration_secs as f64,
+        ))
+        .collect();
+
+    (cpu, io, metrics, per_thread_data)
 }
 
 // === Intensity sweep experiment ===
@@ -997,7 +1131,7 @@ fn run_intensity_sweep_experiment(
     let mut best_throughput = 0.0;
     let mut best_intensity = 0.0;
     let total_workers = base_workers + 1;
-    let mut per_worker_rows: Vec<(f64, Vec<(f64, f64)>)> = Vec::new();
+    let mut per_worker_rows: Vec<(f64, Vec<(f64, f64, f64)>)> = Vec::new();
 
     for step in 0..=20 {
         let probe_intensity = step as f64 * 0.05;
@@ -1029,10 +1163,10 @@ fn run_intensity_sweep_experiment(
     {
         let pw_path = format!("{}/per_worker_proc_intensity_sweep_{}base_{}pct_io.csv", run_dir, base_workers, io_pct_int);
         let mut pw_file = std::fs::File::create(&pw_path).unwrap();
-        writeln!(pw_file, "probe_intensity,workers,worker_id,cpu_ops_sec,io_ops_sec,total_ops_sec").unwrap();
+        writeln!(pw_file, "probe_intensity,workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec").unwrap();
         for (intensity, per_worker) in &per_worker_rows {
-            for (wid, (wc, wi)) in per_worker.iter().enumerate() {
-                writeln!(pw_file, "{:.2},{},{},{:.2},{:.2},{:.2}", intensity, total_workers, wid, wc, wi, wc + wi).unwrap();
+            for (wid, (wc, wi, ws)) in per_worker.iter().enumerate() {
+                writeln!(pw_file, "{:.2},{},{},{:.2},{:.2},{:.2},{:.2}", intensity, total_workers, wid, wc, wi, ws, wc + wi).unwrap();
             }
         }
     }
@@ -1054,8 +1188,8 @@ fn measure_proc_throughput_mixed_intensity(
     num_samples: usize,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>) {
-    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>)> = (0..num_samples).map(|_| {
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
+    let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)> = (0..num_samples).map(|_| {
         measure_single_run_proc_mixed_intensity(
             base_workers, probe_intensity, cpu_iterations, io_iterations,
             duration_secs, io_perc, buffer_kb, io_buffer_kb, sleep_us, warmup_secs,
@@ -1091,7 +1225,7 @@ fn measure_single_run_proc_mixed_intensity(
     io_buffer_kb: usize,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>) {
+) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     use std::process::Command;
 
     let total_workers = base_workers + 1;
@@ -1149,9 +1283,10 @@ fn measure_single_run_proc_mixed_intensity(
     region.io_ops.store(0, Ordering::Relaxed);
     // Reset per-worker counters after warmup
     for i in 0..total_workers {
-        let (wk_cpu, wk_io) = unsafe { worker_counters(region_ptr, i) };
+        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         wk_cpu.store(0, Ordering::Relaxed);
         wk_io.store(0, Ordering::Relaxed);
+        wk_sleep.store(0, Ordering::Relaxed);
     }
 
     let snap_before = proc_metrics::take_snapshot();
@@ -1171,10 +1306,11 @@ fn measure_single_run_proc_mixed_intensity(
     // Read per-worker counters
     let mut per_worker = Vec::with_capacity(total_workers);
     for i in 0..total_workers {
-        let (wk_cpu, wk_io) = unsafe { worker_counters(region_ptr, i) };
+        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        per_worker.push((wc, wi));
+        let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
+        per_worker.push((wc, wi, ws));
     }
 
     destroy_shared_region(&shm_name, region_ptr, shm_fd, total_workers);
@@ -1194,6 +1330,9 @@ fn run_saturator_split(
     running: Arc<AtomicBool>,
     intensity: f64,
     sleep_us: u64,
+    pt_cpu: Arc<AtomicU64>,
+    pt_io: Arc<AtomicU64>,
+    pt_sleep: Arc<AtomicU64>,
 ) {
     use saturator::{cpu_work_with_buffer, io_work_with_id};
 
@@ -1204,6 +1343,7 @@ fn run_saturator_split(
 
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
+    let mut local_sleep_ops = 0u64;
 
     while running.load(Ordering::Relaxed) {
         rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1215,6 +1355,11 @@ fn run_saturator_split(
             let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
             if intensity_roll >= intensity {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                local_sleep_ops += 1;
+                if local_sleep_ops >= 100 {
+                    pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
+                    local_sleep_ops = 0;
+                }
                 continue;
             }
         }
@@ -1231,6 +1376,8 @@ fn run_saturator_split(
         if (local_cpu_ops + local_io_ops) >= 100 {
             cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
             io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
+            pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
+            pt_io.fetch_add(local_io_ops, Ordering::Relaxed);
             local_cpu_ops = 0;
             local_io_ops = 0;
         }
@@ -1239,9 +1386,14 @@ fn run_saturator_split(
     // Flush remaining
     if local_cpu_ops > 0 {
         cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
+        pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
     }
     if local_io_ops > 0 {
         io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
+        pt_io.fetch_add(local_io_ops, Ordering::Relaxed);
+    }
+    if local_sleep_ops > 0 {
+        pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
     }
 }
 
@@ -1260,7 +1412,7 @@ fn measure_single_run_proc_slack(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>) {
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     use std::process::Command;
 
     let total_workers = baseline_workers + extra_workers;
@@ -1315,9 +1467,10 @@ fn measure_single_run_proc_slack(
     region.cpu_ops.store(0, Ordering::Relaxed);
     region.io_ops.store(0, Ordering::Relaxed);
     for i in 0..total_workers {
-        let (wk_cpu, wk_io) = unsafe { worker_counters(region_ptr, i) };
+        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         wk_cpu.store(0, Ordering::Relaxed);
         wk_io.store(0, Ordering::Relaxed);
+        wk_sleep.store(0, Ordering::Relaxed);
     }
 
     let snap_before = proc_metrics::take_snapshot();
@@ -1337,10 +1490,11 @@ fn measure_single_run_proc_slack(
     let mut per_worker = Vec::with_capacity(total_workers);
 
     for i in 0..total_workers {
-        let (wk_cpu, wk_io) = unsafe { worker_counters(region_ptr, i) };
+        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        per_worker.push((wc, wi));
+        let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
+        per_worker.push((wc, wi, ws));
         if i < baseline_workers {
             baseline_cpu += wc;
             baseline_io += wi;
@@ -1368,7 +1522,7 @@ fn measure_proc_slack(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
-) -> (f64, f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64)>) {
+) -> (f64, f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let samples: Vec<_> = (0..num_samples).map(|_| {
         measure_single_run_proc_slack(
             baseline_workers, extra_workers, baseline_io_perc, extra_io_perc,
@@ -1422,7 +1576,7 @@ fn run_slack_proc_experiment(
 
     let sleep_us = calibration.cpu_us as u64;
 
-    let (b_cpu, b_io, _, _, _, _, _, _) = measure_proc_slack(
+    let (b_cpu, b_io, _, _, b0_cpu_std, b0_io_std, b0_metrics, b0_per_worker) = measure_proc_slack(
         baseline_workers, 0, baseline_io_perc, 0.0,
         calibration.cpu_iterations, calibration.io_iterations,
         params.duration_secs, params.buffer_kb, params.io_buffer_kb,
@@ -1451,11 +1605,19 @@ fn run_slack_proc_experiment(
     writeln!(file, "extra_workers,total_workers,baseline_workers,extra_io_pct,baseline_cpu_ops,baseline_io_ops,extra_cpu_ops,extra_io_ops,total_ops,baseline_change_pct,baseline_cpu_stddev,baseline_io_stddev,{}",
              proc_metrics::csv_header()).unwrap();
 
+    // Write extra=0 baseline row
+    writeln!(file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+             0, baseline_workers, baseline_workers,
+             (extra_io_perc * 100.0) as u32,
+             b_cpu, b_io, 0.0_f64, 0.0_f64, b_cpu + b_io, 0.0,
+             b0_cpu_std, b0_io_std,
+             b0_metrics.to_csv_row()).unwrap();
+
     println!("  {:>5} {:>7} | {:>12} {:>12} | {:>12} {:>12} | {:>8} | {:>6} {:>6}",
              "extra", "total", "base_cpu/s", "base_io/s", "extra_cpu/s", "extra_io/s", "vs base", "cpu%", "io%");
     println!("  {}", "-".repeat(105));
 
-    let mut per_worker_rows: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
+    let mut per_worker_rows: Vec<(usize, Vec<(f64, f64, f64)>)> = vec![(baseline_workers, b0_per_worker)];
 
     for extra in (1..=params.max_workers).step_by(params.step) {
         let (b_cpu, b_io, e_cpu, e_io, b_cpu_std, b_io_std, metrics, per_worker) = measure_proc_slack(
@@ -1487,12 +1649,12 @@ fn run_slack_proc_experiment(
         use std::io::Write as _;
         let pw_path = format!("{}/per_worker_{}.csv", run_dir, csv_base);
         let mut pw_file = std::fs::File::create(&pw_path).unwrap();
-        writeln!(pw_file, "extra_workers,total_workers,baseline_workers,worker_id,cpu_ops_sec,io_ops_sec,total_ops_sec").unwrap();
+        writeln!(pw_file, "extra_workers,total_workers,baseline_workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec").unwrap();
         for (total_workers, per_worker) in &per_worker_rows {
             let extra = total_workers - baseline_workers;
-            for (wid, (wc, wi)) in per_worker.iter().enumerate() {
-                writeln!(pw_file, "{},{},{},{},{:.2},{:.2},{:.2}",
-                         extra, total_workers, baseline_workers, wid, wc, wi, wc + wi).unwrap();
+            for (wid, (wc, wi, ws)) in per_worker.iter().enumerate() {
+                writeln!(pw_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2}",
+                         extra, total_workers, baseline_workers, wid, wc, wi, ws, wc + wi).unwrap();
             }
         }
     }

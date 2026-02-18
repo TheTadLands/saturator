@@ -19,4 +19,4 @@ COPY --from=builder /app/target/release/saturator /app/saturator
 # Create directories
 RUN mkdir -p /tmp /app/output
 
-ENTRYPOINT ["/app/saturator"]
+ENTRYPOINT ["/bin/sh", "-c", "umask 0000 && /app/saturator \"$@\"", "--"]

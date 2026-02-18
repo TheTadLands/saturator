@@ -9,6 +9,11 @@ Saturator helps answer:
 2. How many I/O-bound threads can run before throughput plateaus?
 3. How many additional threads (at a given I/O ratio) can be added to a saturated baseline without degrading performance?
 4. At what point does adding more worker **processes** cause throughput to actually **drop** (not just plateau)?
+5. How does a mixed CPU+I/O workload saturate compared to pure CPU or pure I/O?
+6. Given a saturated system, at what probe intensity does a new worker tip the system into degradation?
+7. How much slack capacity exists in a process-based baseline before additional processes degrade it?
+
+Workload parameters are tunable: CPU buffer size (`--buffer-kb`), I/O buffer size (`--io-buffer-kb`), worker intensity (`--intensity`), and measurement duration/samples. This lets you control how much cache pressure, I/O bandwidth, and context switch overhead each worker generates.
 
 ## Running
 
@@ -91,50 +96,93 @@ Process-based experiments spawn separate OS processes instead of threads. Each p
 docker compose run --build --remove-orphans saturator find-saturation-proc
 ```
 
-**Output:** `proc_cpu_throughput_vs_workers.csv`
+**Output:** `proc_cpu_throughput_vs_workers.csv`, `per_worker_proc_cpu_throughput_vs_workers.csv`
 
 #### Find I/O Saturation (Processes)
 ```bash
 docker compose run --build --remove-orphans saturator find-io-saturation-proc
 ```
 
-**Output:** `proc_io_throughput_vs_workers.csv`
+**Output:** `proc_io_throughput_vs_workers.csv`, `per_worker_proc_io_throughput_vs_workers.csv`
+
+#### Find Mixed Saturation (Processes)
+Incrementally adds processes running a mix of CPU and I/O work at a given ratio until throughput degrades.
+
+```bash
+docker compose run --build --remove-orphans saturator find-mixed-saturation-proc <io_pct>
+```
+
+**Output:** `proc_mixed_<io_pct>pct_io_throughput_vs_workers.csv`, `per_worker_proc_mixed_<io_pct>pct_io_throughput_vs_workers.csv`
+
+#### Find Saturation Intensity (Processes)
+Holds N base processes at full intensity and sweeps a single probe process from 0.0 to 1.0 intensity, finding the point at which the probe tips the system into degradation.
+
+```bash
+docker compose run --build --remove-orphans saturator find-saturation-intensity-proc <N> <io_pct>
+```
+
+**Output:** `proc_intensity_sweep_<N>base_<io_pct>pct_io.csv`, `per_worker_proc_intensity_sweep_<N>base_<io_pct>pct_io.csv`
+
+#### Find Slack (CPU Baseline, Processes)
+Holds N CPU-only baseline processes at full intensity, then incrementally adds extra processes at a specified I/O percentage. Tracks baseline throughput separately from extra worker throughput, revealing how much the baseline degrades as contention increases.
+
+```bash
+docker compose run --build --remove-orphans saturator find-slack-proc <N> <extra_io%>
+```
+
+**Output:** `proc_slack_<N>cpuproc_adding_<io%>pct_io.csv`, `per_worker_proc_slack_<N>cpuproc_adding_<io%>pct_io.csv`
+
+#### Find Slack (I/O Baseline, Processes)
+Same as above but with an I/O-only baseline.
+
+```bash
+docker compose run --build --remove-orphans saturator find-io-slack-proc <N> <extra_io%>
+```
+
+**Output:** `proc_slack_<N>ioproc_adding_<io%>pct_io.csv`, `per_worker_proc_slack_<N>ioproc_adding_<io%>pct_io.csv`
 
 ### Tuning Options
 
-The `-proc` experiments accept optional flags to control workload parameters. These can also be used with the thread-based experiments.
+All experiments accept optional flags to control workload parameters.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--target-us <N>` | 50 | Calibration target per-operation in microseconds. Lower values (e.g. 1-5) make context switch overhead proportionally larger. |
 | `--buffer-kb <N>` | 100 | CPU work buffer size in KB. Larger values (e.g. 1024-10240) cause L3 cache contention at high worker counts. |
 | `--io-buffer-kb <N>` | 4 | IO read/write buffer size in KB. Larger values (e.g. 64-1024) increase bytes per IO operation, driving higher bandwidth utilization. |
-| `--max-workers <N>` | parallelism * 16 | Maximum number of workers to test. |
+| `--max-workers <N>` | parallelism * 16 | Maximum number of workers to test. For proc slack experiments, controls the maximum number of extra workers added. |
 | `--duration <N>` | 5 | Measurement duration per data point in seconds. |
-| `--samples <N>` | 3 | Samples per data point. Median and stddev are computed; stddev is written to CSV for error bar visualization. |
+| `--samples <N>` | 5 | Samples per data point. Median and stddev are computed; stddev is written to CSV for error bar visualization. |
 | `--step <N>` | 1 | Worker count increment per data point. |
-| `--intensity <F>` | 1.0 | Work probability per iteration (0.0–1.0). Each idle iteration sleeps for `target_us` μs instead of working. Simulates partially-loaded workers. |
+| `--intensity <F>` | 1.0 | Work probability per iteration (0.0–1.0). Each idle iteration sleeps instead of working. Simulates partially-loaded workers. |
+| `--warmup <N>` | 1 | Warmup duration in seconds before each measurement. |
+| `--chain` | — | After a proc saturation experiment finds the saturation point N, automatically runs `find-saturation-intensity-proc` with N base workers. |
 
 Examples:
 ```bash
-# Small work units + large buffers to maximize degradation visibility
+# Large buffers to maximize cache pressure
 docker compose run --build --remove-orphans saturator find-saturation-proc \
-    --target-us 5 --buffer-kb 1024 --max-workers 100
+    --buffer-kb 1024 --max-workers 100
 
 # Compare threads vs processes with same parameters
 docker compose run --build --remove-orphans saturator find-saturation \
     --max-workers 64
 docker compose run --build --remove-orphans saturator find-saturation-proc \
     --max-workers 64
+
+# Find proc slack: 4 CPU baseline processes, add I/O-only processes
+docker compose run --build --remove-orphans saturator find-slack-proc 4 100
+
+# Chain saturation into intensity sweep automatically
+docker compose run --build --remove-orphans saturator find-saturation-proc --chain
 ```
 
 ## Output
 
-Results are written to CSV files in the `./output` directory.
+Each experiment run creates a timestamped directory inside `./output/` containing CSV files and a `params.txt` recording the exact parameters used.
 
 ### Saturation CSV columns
 
-Produced by `find-saturation`, `find-io-saturation`, `find-saturation-proc`, and `find-io-saturation-proc`.
+Produced by `find-saturation`, `find-io-saturation`, `find-saturation-proc`, `find-io-saturation-proc`, and `find-mixed-saturation-proc`.
 
 | Column | Description |
 |--------|-------------|
@@ -170,16 +218,66 @@ Produced by `find-slack` and `find-io-slack`.
 | `io_ops_stddev` | Standard deviation of IO ops across samples |
 | `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV |
 
+### Proc Slack CSV columns
+
+Produced by `find-slack-proc` and `find-io-slack-proc`. Baseline and extra worker throughputs are tracked separately using per-worker counters.
+
+| Column | Description |
+|--------|-------------|
+| `extra_workers` | Number of extra processes added beyond baseline |
+| `total_workers` | Total process count (baseline + extra) |
+| `baseline_workers` | Fixed number of baseline processes |
+| `extra_io_pct` | IO percentage of the extra processes |
+| `baseline_cpu_ops` | CPU ops/sec summed across baseline workers only |
+| `baseline_io_ops` | IO ops/sec summed across baseline workers only |
+| `extra_cpu_ops` | CPU ops/sec summed across extra workers only |
+| `extra_io_ops` | IO ops/sec summed across extra workers only |
+| `total_ops` | Total ops/sec across all workers |
+| `baseline_change_pct` | Percentage change in baseline tracked metric vs alone |
+| `baseline_cpu_stddev` | Standard deviation of baseline CPU ops across samples |
+| `baseline_io_stddev` | Standard deviation of baseline IO ops across samples |
+| `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV |
+
+### Per-Worker CSVs
+
+Process-based experiments produce a `per_worker_*.csv` alongside the aggregate CSV. This reveals fairness and starvation issues across individual workers.
+
+| Experiment type | Columns |
+|----------------|---------|
+| Saturation (`-proc`) | `workers, worker_id, cpu_ops_sec, io_ops_sec, total_ops_sec` |
+| Intensity sweep | `probe_intensity, workers, worker_id, cpu_ops_sec, io_ops_sec, total_ops_sec` |
+| Proc slack | `extra_workers, total_workers, baseline_workers, worker_id, cpu_ops_sec, io_ops_sec, total_ops_sec` |
+
 ### Plotting
 
 ```bash
 python plot_results.py              # Plot all CSVs in ./output
-python plot_results.py output/*.csv # Plot specific files
+python plot_results.py output/run/  # Plot a specific run directory
+python plot_results.py path/to/file.csv # Plot a specific file
 ```
 
-Generates PNG visualizations with stddev error bars:
-- Throughput vs thread/worker count (saturation curves)
-- Baseline degradation vs extra threads (slack analysis)
+Generates PNG visualizations alongside each CSV:
+
+| File | Description |
+|------|-------------|
+| File | Produced by | Description |
+|------|-------------|-------------|
+| `throughput_total.png` | Saturation | CPU, IO, and total ops/sec vs worker count with stddev error bars |
+| `throughput_per_worker.png` | Saturation | Per-worker efficiency vs worker count |
+| `utilization.png` | Saturation, Slack | CPU% and IO% vs worker/thread count |
+| `throughput_vs_cpu.png` | Saturation | Dual-axis: total throughput and CPU utilization |
+| `throughput_vs_utilization.png` | Saturation, Slack | Normalized throughput % of peak vs utilization % |
+| `throughput.png` | Slack | CPU and IO ops/sec vs extra thread count (dual y-axes) |
+| `baseline_change.png` | Slack | Baseline throughput degradation % vs extra thread count |
+| `per_worker_distribution.png` | Saturation (proc) | Box plot of per-worker throughput distribution at each worker count |
+| `per_worker_fairness.png` | Saturation (proc) | Total throughput vs coefficient of variation (fairness) |
+| `per_worker_intensity.png` | Intensity sweep | Base worker box plots vs probe worker throughput line |
+| `proc_slack_throughput.png` | Proc slack | Baseline and extra worker throughputs vs extra worker count |
+| `proc_slack_baseline_change.png` | Proc slack | Baseline throughput degradation % vs extra worker count |
+| `proc_slack_utilization.png` | Proc slack | CPU% and IO% vs extra worker count |
+| `proc_slack_throughput_vs_utilization.png` | Proc slack | Normalized baseline throughput % of peak vs utilization % |
+| `per_worker_proc_slack_distribution.png` | Proc slack | Side-by-side box plots: baseline workers (blue) vs extra workers (orange) |
+| `per_worker_proc_slack_fairness.png` | Proc slack | Baseline total throughput vs fairness CV% |
 
 ## Configuration
 

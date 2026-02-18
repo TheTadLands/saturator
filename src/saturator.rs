@@ -7,14 +7,15 @@ use std::ffi::CString;
 /// Tuning parameters that affect contention behavior
 #[derive(Debug, Clone, Copy)]
 pub struct TuningParams {
-    pub target_us: u128,      // calibration target per-operation (default: 50)
     pub buffer_kb: usize,     // CPU work buffer size in KB (default: 100)
     pub io_buffer_kb: usize,  // IO read/write buffer size in KB (default: 4)
     pub max_workers: usize,   // maximum thread/process count
     pub duration_secs: u64,   // measurement duration per data point (default: 5)
-    pub samples: usize,       // number of samples per data point, median is taken (default: 3)
+    pub samples: usize,       // number of samples per data point, median is taken (default: 5)
     pub step: usize,          // worker count increment per data point (default: 1)
     pub intensity: f64,       // probability of working vs sleeping per iteration (default: 1.0)
+    pub chain: bool,          // auto-chain saturation → intensity sweep (default: false)
+    pub warmup_secs: u64,     // warmup duration before measurement in seconds (default: 1)
 }
 
 impl Default for TuningParams {
@@ -22,14 +23,15 @@ impl Default for TuningParams {
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get()).unwrap_or(4);
         Self {
-            target_us: 50,
             buffer_kb: 100,
             io_buffer_kb: 4,
             max_workers: parallelism * 4,
             duration_secs: 5,
-            samples: 3,
+            samples: 5,
             step: 1,
             intensity: 1.0,
+            chain: false,
+            warmup_secs: 1,
         }
     }
 }
@@ -65,7 +67,7 @@ pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
     let mut results = Vec::new();
 
     for pass in 0..3 {
-        let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass(params.target_us, buffer_size, io_buffer_size);
+        let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass(buffer_size, io_buffer_size);
         let gap_pct = if cpu_us > io_us {
             ((cpu_us - io_us) as f64 / io_us as f64) * 100.0
         } else {
@@ -100,38 +102,22 @@ pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
     }
 }
 
-fn calibrate_single_pass(target_us: u128, buffer_size: usize, io_buffer_size: usize) -> (usize, u128, usize, u128) {
+fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u128, usize, u128) {
 
-    // Calibrate I/O first (coarser granularity)
+    // Measure a single IO operation (seek + read + O_SYNC write) directly
     let (io_iters, io_actual_us) = {
         let path = "/tmp/saturator_calibrate";
         let _ = std::fs::write(path, vec![0u8; io_buffer_size]);
         let io_buf = vec![0u8; io_buffer_size];
 
-        let mut iters = 1;
-        let mut actual_us = 0u128;
-
-        loop {
-            let start = std::time::Instant::now();
-            let samples = 100;
-            for _ in 0..samples {
-                do_io_work_counted(path, iters, &io_buf);
-            }
-            actual_us = start.elapsed().as_micros() / samples as u128;
-
-            if actual_us >= target_us {
-                let _ = std::fs::remove_file(path);
-                break (iters, actual_us);
-            }
-
-            let scale = (target_us / actual_us.max(1)).max(2) as usize;
-            iters = (iters * scale).max(iters + 1);
-
-            if iters > 10000 {
-                let _ = std::fs::remove_file(path);
-                break (iters, actual_us);
-            }
+        let samples = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..samples {
+            do_io_work_counted(path, 1, &io_buf);
         }
+        let actual_us = (start.elapsed().as_micros() / samples as u128).max(1);
+        let _ = std::fs::remove_file(path);
+        (1usize, actual_us)
     };
 
     // Calibrate CPU to match I/O timing as closely as possible
@@ -139,7 +125,6 @@ fn calibrate_single_pass(target_us: u128, buffer_size: usize, io_buffer_size: us
         let buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
         let target_cpu_us = io_actual_us;
         let mut iters = 10;
-        let mut actual_us = 0u128;
 
         // First, get close with scaling
         loop {
@@ -148,7 +133,7 @@ fn calibrate_single_pass(target_us: u128, buffer_size: usize, io_buffer_size: us
             for _ in 0..samples {
                 do_cpu_work(&buffer, iters);
             }
-            actual_us = start.elapsed().as_micros() / samples as u128;
+            let actual_us = start.elapsed().as_micros() / samples as u128;
 
             if actual_us >= target_cpu_us {
                 break;
@@ -179,7 +164,7 @@ fn calibrate_single_pass(target_us: u128, buffer_size: usize, io_buffer_size: us
             for _ in 0..samples {
                 do_cpu_work(&buffer, mid);
             }
-            actual_us = start.elapsed().as_micros() / samples as u128;
+            let actual_us = start.elapsed().as_micros() / samples as u128;
 
             if actual_us >= lower_bound && actual_us <= upper_bound {
                 iters = mid;
@@ -198,7 +183,7 @@ fn calibrate_single_pass(target_us: u128, buffer_size: usize, io_buffer_size: us
         for _ in 0..samples {
             do_cpu_work(&buffer, iters);
         }
-        actual_us = start.elapsed().as_micros() / samples as u128;
+        let actual_us = start.elapsed().as_micros() / samples as u128;
 
         (iters, actual_us)
     };
@@ -334,9 +319,17 @@ pub struct SharedRegion {
     _padding: [u8; 7],
 }
 
-const SHM_SIZE: usize = 4096; // one page, plenty for SharedRegion
+/// Compute shared memory size: header + per-worker counters (2 x AtomicU64 each), rounded up to page size
+fn shm_size_for_workers(max_workers: usize) -> usize {
+    let header = std::mem::size_of::<SharedRegion>();
+    let per_worker = max_workers * 16; // 2 x AtomicU64 (8 bytes each) per worker
+    let total = header + per_worker;
+    // Round up to page boundary (4096)
+    (total + 4095) & !4095
+}
 
-pub fn create_shared_region(name: &str) -> (*mut SharedRegion, i32) {
+pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegion, i32) {
+    let size = shm_size_for_workers(max_workers);
     unsafe {
         let c_name = CString::new(name).unwrap();
         let fd = libc::shm_open(
@@ -346,12 +339,12 @@ pub fn create_shared_region(name: &str) -> (*mut SharedRegion, i32) {
         );
         assert!(fd >= 0, "shm_open failed: {}", std::io::Error::last_os_error());
 
-        assert_eq!(libc::ftruncate(fd, SHM_SIZE as libc::off_t), 0,
+        assert_eq!(libc::ftruncate(fd, size as libc::off_t), 0,
             "ftruncate failed: {}", std::io::Error::last_os_error());
 
         let ptr = libc::mmap(
             std::ptr::null_mut(),
-            SHM_SIZE,
+            size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
@@ -367,11 +360,16 @@ pub fn create_shared_region(name: &str) -> (*mut SharedRegion, i32) {
         std::ptr::write(&mut (*region).ready_count, AtomicU64::new(0));
         std::ptr::write(&mut (*region).running, AtomicBool::new(true));
 
+        // Zero-init per-worker area
+        let worker_area = (ptr as *mut u8).add(std::mem::size_of::<SharedRegion>());
+        std::ptr::write_bytes(worker_area, 0, max_workers * 16);
+
         (region, fd)
     }
 }
 
-pub fn open_shared_region(name: &str) -> *mut SharedRegion {
+pub fn open_shared_region(name: &str, max_workers: usize) -> *mut SharedRegion {
+    let size = shm_size_for_workers(max_workers);
     unsafe {
         let c_name = CString::new(name).unwrap();
         let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDWR, 0);
@@ -379,7 +377,7 @@ pub fn open_shared_region(name: &str) -> *mut SharedRegion {
 
         let ptr = libc::mmap(
             std::ptr::null_mut(),
-            SHM_SIZE,
+            size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
@@ -392,12 +390,28 @@ pub fn open_shared_region(name: &str) -> *mut SharedRegion {
     }
 }
 
-pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32) {
+pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_workers: usize) {
+    let size = shm_size_for_workers(max_workers);
     unsafe {
-        libc::munmap(ptr as *mut libc::c_void, SHM_SIZE);
+        libc::munmap(ptr as *mut libc::c_void, size);
         libc::close(fd);
         let c_name = CString::new(name).unwrap();
         libc::shm_unlink(c_name.as_ptr());
+    }
+}
+
+/// Get per-worker atomic counters (cpu_ops, io_ops) from the shared region.
+/// Worker counters are laid out after the SharedRegion header: [AtomicU64 cpu, AtomicU64 io] per worker.
+///
+/// # Safety
+/// Caller must ensure `region` points to a valid shared region with space for `worker_id` workers.
+pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&'static AtomicU64, &'static AtomicU64) {
+    unsafe {
+        let base = (region as *mut u8).add(std::mem::size_of::<SharedRegion>());
+        let slot = base.add(worker_id * 16);
+        let cpu = &*(slot as *const AtomicU64);
+        let io = &*((slot.add(8)) as *const AtomicU64);
+        (cpu, io)
     }
 }
 
@@ -412,9 +426,11 @@ pub fn run_worker_process(
     io_buffer_size: usize,
     intensity: f64,
     sleep_us: u64,
+    max_workers: usize,
 ) {
-    let region = open_shared_region(shm_name);
+    let region = open_shared_region(shm_name, max_workers);
     let region_ref = unsafe { &*region };
+    let (wk_cpu, wk_io) = unsafe { worker_counters(region, worker_id) };
 
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_proc_{}", worker_id);
@@ -456,6 +472,8 @@ pub fn run_worker_process(
         if (local_cpu_ops + local_io_ops) >= 100 {
             region_ref.cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
             region_ref.io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
+            wk_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
+            wk_io.fetch_add(local_io_ops, Ordering::Relaxed);
             local_cpu_ops = 0;
             local_io_ops = 0;
         }
@@ -463,9 +481,11 @@ pub fn run_worker_process(
 
     if local_cpu_ops > 0 {
         region_ref.cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
+        wk_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
     }
     if local_io_ops > 0 {
         region_ref.io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
+        wk_io.fetch_add(local_io_ops, Ordering::Relaxed);
     }
 
     let _ = std::fs::remove_file(&io_path);

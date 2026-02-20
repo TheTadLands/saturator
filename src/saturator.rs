@@ -104,7 +104,7 @@ pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
 
 fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u128, usize, u128) {
 
-    // Measure a single IO operation (seek + read + O_SYNC write) directly
+    // Measure a single IO operation (O_SYNC write) directly
     let (io_iters, io_actual_us) = {
         let path = "/tmp/saturator_calibrate";
         let _ = std::fs::write(path, vec![0u8; io_buffer_size]);

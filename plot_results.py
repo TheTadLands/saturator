@@ -15,6 +15,7 @@ import os
 import glob
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 from pathlib import Path
 
 # Colorblind-friendly palette (Wong 2011)
@@ -39,20 +40,22 @@ def format_number(x):
 
 
 def save_fig(fig, path):
-    fig.tight_layout()
+    if not fig.get_constrained_layout():
+        fig.tight_layout(pad=0.5, h_pad=None, w_pad=None, rect=(0, 0.02, 1, 1))
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"    {Path(path).name}")
 
 
 def detect_experiment(name):
-    """Return (label, mode, x_label) from CSV stem name."""
+    """Return (label, mode, mode_plural, x_label) from CSV stem name."""
     is_cpu = 'cpu' in name.lower()
     is_proc = 'proc' in name.lower() or 'worker' in name.lower()
     label = 'CPU' if is_cpu else 'I/O'
     mode = 'Process' if is_proc else 'Thread'
+    mode_plural = 'Processes' if is_proc else 'Threads'
     x_label = 'Worker Count' if is_proc else 'Thread Count'
-    return label, mode, x_label
+    return label, mode, mode_plural, x_label
 
 
 def plot_saturation(csv_path: str):
@@ -60,7 +63,7 @@ def plot_saturation(csv_path: str):
     df = pd.read_csv(csv_path)
     name = Path(csv_path).stem
     folder = str(Path(csv_path).parent)
-    label, mode, x_label = detect_experiment(name)
+    label, mode, mode_plural, x_label = detect_experiment(name)
     x = df['threads']
 
     # Support both old (throughput_ops_sec) and new (cpu_ops_sec/io_ops_sec) CSV formats
@@ -83,46 +86,85 @@ def plot_saturation(csv_path: str):
 
     # 1. Throughput breakdown (CPU + IO)
     peak_idx = df[primary_col].idxmax()
+    peak_label = f'Peak: {df.loc[peak_idx, "threads"]} {mode_plural.lower()}'
     if has_split:
-        fig, ax1 = plt.subplots(figsize=(8, 5))
-        ln1 = ax1.errorbar(x, df['cpu_ops_sec'],
-                           yerr=df['cpu_ops_stddev'] if has_cpu_stddev else None,
-                           fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
-                           capsize=3, capthick=1, label='CPU ops/s')
-        ax1.set_xlabel(x_label)
-        ax1.set_ylabel('CPU ops/sec', color=C_BLUE)
-        ax1.tick_params(axis='y', labelcolor=C_BLUE)
-        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        has_cpu = df['cpu_ops_sec'].max() > 0
+        has_io = df['io_ops_sec'].max() > 0
+        both = has_cpu and has_io
 
-        ax2 = ax1.twinx()
-        ln2 = ax2.errorbar(x, df['io_ops_sec'],
+        if both:
+            # Stacked subplots for mixed workloads
+            fig, (ax_cpu, ax_io) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
+                                                 layout='constrained')
+            ax_cpu.errorbar(x, df['cpu_ops_sec'],
+                            yerr=df['cpu_ops_stddev'] if has_cpu_stddev else None,
+                            fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
+                            capsize=3, capthick=1, label='CPU ops/s')
+            peak_x = df.loc[peak_idx, 'threads']
+            ax_cpu.axvline(x=peak_x, color=C_RED, linestyle='--', alpha=0.7, label=peak_label)
+            if primary_col == 'cpu_ops_sec':
+                ax_cpu.scatter([peak_x], [df.loc[peak_idx, primary_col]],
+                               color=C_RED, s=100, zorder=5)
+            ax_cpu.set_ylabel('CPU ops/sec')
+            ax_cpu.set_ylim(bottom=0)
+            ax_cpu.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            ax_cpu.legend(loc='best', fontsize=9)
+            ax_cpu.set_title(f'{label} Saturation ({mode_plural}) — Throughput')
+            ax_cpu.grid(True, alpha=0.3)
+
+            ax_io.errorbar(x, df['io_ops_sec'],
                            yerr=df['io_ops_stddev'] if has_io_stddev else None,
                            fmt='-s', color=C_GREEN, linewidth=2, markersize=6,
                            capsize=3, capthick=1, label='IO ops/s')
-        ax2.set_ylabel('IO ops/sec', color=C_GREEN)
-        ax2.tick_params(axis='y', labelcolor=C_GREEN)
-        ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            ax_io.axvline(x=peak_x, color=C_RED, linestyle='--', alpha=0.7)
+            if primary_col == 'io_ops_sec':
+                ax_io.scatter([peak_x], [df.loc[peak_idx, primary_col]],
+                              color=C_RED, s=100, zorder=5)
+            ax_io.set_xlabel(x_label)
+            ax_io.set_ylabel('IO ops/sec')
+            ax_io.set_ylim(bottom=0)
+            ax_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            ax_io.legend(loc='best', fontsize=9)
+            ax_io.set_xlim(left=1)
+            ax_io.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax_io.grid(True, alpha=0.3)
+        else:
+            # Single axis for pure CPU or pure IO workloads
+            col = 'cpu_ops_sec' if has_cpu else 'io_ops_sec'
+            col_label = 'CPU ops/s' if has_cpu else 'IO ops/s'
+            stddev = df['cpu_ops_stddev'] if (has_cpu and has_cpu_stddev) else (df['io_ops_stddev'] if has_io_stddev else None)
 
-        peak_ax = ax1 if primary_col == 'cpu_ops_sec' else ax2
-        peak_ax.axvline(x=df.loc[peak_idx, 'threads'], color=C_RED, linestyle='--', alpha=0.7,
-                        label=f'Peak: {df.loc[peak_idx, "threads"]} {mode.lower()}s')
-        peak_ax.scatter([df.loc[peak_idx, 'threads']], [df.loc[peak_idx, primary_col]],
-                        color=C_RED, s=100, zorder=5)
-        ax1.legend(handles=[ln1, ln2], loc='best')
-        ax1.set_title(f'{label} Saturation ({mode}s) — Throughput')
-        ax1.grid(True, alpha=0.3)
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.errorbar(x, df[col], yerr=stddev, fmt='-o', color=C_BLUE,
+                        linewidth=2, markersize=6, capsize=3, capthick=1, label=col_label)
+            ax.axvline(x=df.loc[peak_idx, 'threads'], color=C_RED, linestyle='--', alpha=0.7,
+                       label=peak_label)
+            ax.scatter([df.loc[peak_idx, 'threads']], [df.loc[peak_idx, primary_col]],
+                       color=C_RED, s=100, zorder=5)
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(f'{col_label} (ops/sec)')
+            ax.set_title(f'{label} Saturation ({mode_plural}) — Throughput')
+            ax.set_ylim(bottom=0)
+            ax.set_xlim(left=1)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
     else:
         fig, ax = plt.subplots(figsize=(8, 5))
         yerr = df.get('throughput_stddev')
         ax.errorbar(x, df['total_ops'], yerr=yerr, fmt='-o', color=C_BLUE,
                     linewidth=2, markersize=6, capsize=3, capthick=1)
         ax.axvline(x=df.loc[peak_idx, 'threads'], color=C_RED, linestyle='--', alpha=0.7,
-                   label=f'Peak: {df.loc[peak_idx, "threads"]} {mode.lower()}s')
+                   label=peak_label)
         ax.scatter([df.loc[peak_idx, 'threads']], [df.loc[peak_idx, primary_col]],
                    color=C_RED, s=100, zorder=5)
         ax.set_xlabel(x_label)
         ax.set_ylabel('Throughput (ops/sec)')
-        ax.set_title(f'{label} Saturation ({mode}s) — Throughput')
+        ax.set_title(f'{label} Saturation ({mode_plural}) — Throughput')
+        ax.set_ylim(bottom=0)
+        ax.set_xlim(left=1)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.legend()
         ax.grid(True, alpha=0.3)
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
@@ -141,8 +183,11 @@ def plot_saturation(csv_path: str):
                 arrowprops=dict(arrowstyle='->', color='gray'),
                 fontsize=10, color='gray')
     ax.set_xlabel(x_label)
-    ax.set_ylabel(f'Throughput per {mode} (ops/sec)')
-    ax.set_title(f'{label} Saturation ({mode}s) — Per {mode} Efficiency')
+    ax.set_ylabel(f'Throughput per {mode.lower()} (ops/sec)')
+    ax.set_title(f'{label} Saturation ({mode_plural}) — Per-{mode} Efficiency')
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=1)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
     save_fig(fig, os.path.join(folder, 'throughput_per_worker.png'))
@@ -155,8 +200,10 @@ def plot_saturation(csv_path: str):
             ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO %')
         ax.set_xlabel(x_label)
         ax.set_ylabel('Utilization (%)')
-        ax.set_title(f'{label} Saturation ({mode}s) — Resource Utilization')
+        ax.set_title(f'{label} Saturation ({mode_plural}) — Resource Utilization')
         ax.set_ylim(0, 100)
+        ax.set_xlim(left=1)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.legend()
         ax.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(folder, 'utilization.png'))
@@ -169,6 +216,7 @@ def plot_saturation(csv_path: str):
         ax1.set_xlabel(x_label)
         ax1.set_ylabel(f'{primary_label} (ops/sec)', color=C_BLUE)
         ax1.tick_params(axis='y', labelcolor=C_BLUE)
+        ax1.set_ylim(bottom=0)
         ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
 
         ax2 = ax1.twinx()
@@ -181,42 +229,73 @@ def plot_saturation(csv_path: str):
         lines = ln1 + ln2
         labels = [l.get_label() for l in lines]
         ax1.legend(lines, labels, loc='best')
-        ax1.set_title(f'{label} Saturation ({mode}s) — Throughput vs CPU')
+        ax1.set_title(f'{label} Saturation ({mode_plural}) — Throughput vs CPU')
+        ax1.set_xlim(left=1)
+        ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax1.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(folder, 'throughput_vs_cpu.png'))
 
-    # 5. Normalized: throughput % of peak vs utilization %
+    # 5. Throughput (% of peak) vs utilization split by resource (CPU subplot + IO subplot)
     if 'cpu_pct' in df.columns:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        has_io_util = 'io_util_pct' in df.columns and df['io_util_pct'].max() > 1
 
         if has_split:
-            cpu_peak = df['cpu_ops_sec'].max()
-            io_peak = df['io_ops_sec'].max()
-            if cpu_peak > 0:
-                ax.plot(x, df['cpu_ops_sec'] / cpu_peak * 100, '-o', color=C_BLUE,
-                        linewidth=2, markersize=5, label='CPU ops (% of peak)')
-            if io_peak > 0:
-                ax.plot(x, df['io_ops_sec'] / io_peak * 100, '-s', color=C_CYAN,
-                        linewidth=2, markersize=5, label='IO ops (% of peak)')
+            cpu_tp = df['cpu_ops_sec']
+            io_tp = df['io_ops_sec']
+            has_cpu_tp = cpu_tp.max() > 0
+            has_io_tp = io_tp.max() > 0
         else:
-            total_peak = df['total_ops'].max()
-            if total_peak > 0:
-                ax.plot(x, df['total_ops'] / total_peak * 100, '-o', color=C_BLUE,
-                        linewidth=2, markersize=5, label='Throughput (% of peak)')
+            cpu_tp = df['total_ops']
+            io_tp = None
+            has_cpu_tp = cpu_tp.max() > 0
+            has_io_tp = False
 
-        ax.plot(x, df['cpu_pct'], '--', color=C_ORANGE, linewidth=2,
-                markersize=4, alpha=0.8, label='CPU utilization %')
-        if 'io_util_pct' in df.columns:
-            ax.plot(x, df['io_util_pct'], '--', color=C_GREEN, linewidth=2,
-                    markersize=4, alpha=0.8, label='IO utilization %')
+        nplots = (1 if has_cpu_tp else 0) + (1 if (has_io_tp or has_io_util) else 0)
+        if nplots > 0:
+            fig, axes = plt.subplots(nplots, 1, figsize=(10, 3 * nplots), sharex=True,
+                                     layout='constrained')
+            if nplots == 1:
+                axes = [axes]
+            ax_idx = 0
 
-        ax.set_xlabel(x_label)
-        ax.set_ylabel('% of Peak / Utilization %')
-        ax.set_title(f'{label} Saturation ({mode}s) — Throughput vs Utilization')
-        ax.set_ylim(0, 105)
-        ax.legend(loc='best', fontsize=9)
-        ax.grid(True, alpha=0.3)
-        save_fig(fig, os.path.join(folder, 'throughput_vs_utilization.png'))
+            if has_cpu_tp:
+                ax_cpu = axes[ax_idx]
+                ax_idx += 1
+                cpu_pct_peak = cpu_tp / cpu_tp.max() * 100
+                ln1 = ax_cpu.plot(x, cpu_pct_peak, '-o', color=C_BLUE, linewidth=2,
+                                  markersize=5, label='CPU throughput (% of peak)')
+                ln2 = ax_cpu.plot(x, df['cpu_pct'], '--s', color=C_ORANGE, linewidth=1.5,
+                                  markersize=4, alpha=0.8, label='CPU utilization %')
+                ax_cpu.set_ylabel('CPU %')
+                ax_cpu.set_ylim(0, 105)
+                ax_cpu.set_xlim(left=1)
+                ax_cpu.grid(True, alpha=0.3)
+                ax_cpu.legend(loc='best', fontsize=9)
+                ax_cpu.set_title(f'{label} Saturation ({mode_plural}) — CPU')
+
+            if has_io_tp or has_io_util:
+                ax_io = axes[ax_idx]
+                lines = []
+                if has_io_tp:
+                    io_pct_peak = io_tp / io_tp.max() * 100
+                    ln1 = ax_io.plot(x, io_pct_peak, '-o', color=C_GREEN, linewidth=2,
+                                     markersize=5, label='IO throughput (% of peak)')
+                    lines += ln1
+                if has_io_util:
+                    ln2 = ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
+                                     markersize=4, alpha=0.8, label='IO utilization %')
+                    lines += ln2
+                ax_io.set_ylabel('IO %')
+                ax_io.set_ylim(0, 105)
+                ax_io.set_xlim(left=1)
+                ax_io.grid(True, alpha=0.3)
+                ax_io.legend(loc='best', fontsize=9)
+                if not has_cpu_tp:
+                    ax_io.set_title(f'{label} Saturation ({mode_plural}) — IO')
+
+            axes[-1].set_xlabel(x_label)
+            axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
+            save_fig(fig, os.path.join(folder, 'throughput_vs_utilization.png'))
 
 
 def plot_slack(csv_path: str):
@@ -234,44 +313,45 @@ def plot_slack(csv_path: str):
 
     print(f"  -> {folder}/")
 
-    # 1. Throughput breakdown (dual y-axes)
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ln1 = ax1.errorbar(x, df['cpu_ops'],
-                       yerr=df['cpu_ops_stddev'] if has_cpu_stddev else None,
-                       fmt='o-', color=C_BLUE, label='CPU ops/s',
-                       linewidth=2, markersize=5, capsize=3, capthick=1)
-    ax1.set_xlabel('Extra Threads')
-    ax1.set_ylabel('CPU ops/sec', color=C_BLUE)
-    ax1.tick_params(axis='y', labelcolor=C_BLUE)
-    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    # 1. Throughput breakdown (stacked subplots)
+    fig, (ax_cpu, ax_io) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
+                                         layout='constrained')
+    ax_cpu.errorbar(x, df['cpu_ops'],
+                    yerr=df['cpu_ops_stddev'] if has_cpu_stddev else None,
+                    fmt='o-', color=C_BLUE, label='CPU ops/s',
+                    linewidth=2, markersize=5, capsize=3, capthick=1)
+    ax_cpu.set_ylabel('CPU ops/sec')
+    ax_cpu.set_ylim(bottom=0)
+    ax_cpu.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    ax_cpu.legend(loc='best', fontsize=9)
+    ax_cpu.set_title(f'{baseline_type} Slack — Throughput')
+    ax_cpu.grid(True, alpha=0.3)
 
-    ax1_io = ax1.twinx()
-    ln2 = ax1_io.errorbar(x, df['io_ops'],
-                          yerr=df['io_ops_stddev'] if has_io_stddev else None,
-                          fmt='s-', color=C_GREEN, label='I/O ops/s',
-                          linewidth=2, markersize=5, capsize=3, capthick=1)
-    ax1_io.set_ylabel('I/O ops/sec', color=C_GREEN)
-    ax1_io.tick_params(axis='y', labelcolor=C_GREEN)
-    ax1_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
-
-    ax1.legend(handles=[ln1, ln2], loc='best')
-    ax1.set_title(f'{name.replace("_", " ").title()} — Throughput')
-    ax1.grid(True, alpha=0.3)
+    ax_io.errorbar(x, df['io_ops'],
+                   yerr=df['io_ops_stddev'] if has_io_stddev else None,
+                   fmt='s-', color=C_GREEN, label='I/O ops/s',
+                   linewidth=2, markersize=5, capsize=3, capthick=1)
+    ax_io.set_xlabel('Extra Threads')
+    ax_io.set_ylabel('I/O ops/sec')
+    ax_io.set_ylim(bottom=0)
+    ax_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    ax_io.legend(loc='best', fontsize=9)
+    ax_io.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_io.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(folder, 'throughput.png'))
 
     # 2. Baseline degradation
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(x, df['baseline_change_pct'], '-o', color=C_RED, linewidth=2, markersize=5)
     ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
-    ax.axhline(y=-20, color=C_ORANGE, linestyle='--', alpha=0.7, label='-20% threshold')
     ax.fill_between(x, df['baseline_change_pct'], 0,
-                    where=(df['baseline_change_pct'] >= 0), alpha=0.2, color=C_GREEN)
+                    where=(df['baseline_change_pct'] >= 0), interpolate=True, alpha=0.2, color=C_GREEN)
     ax.fill_between(x, df['baseline_change_pct'], 0,
-                    where=(df['baseline_change_pct'] < 0), alpha=0.2, color=C_RED)
+                    where=(df['baseline_change_pct'] < 0), interpolate=True, alpha=0.2, color=C_RED)
     ax.set_xlabel('Extra Threads')
     ax.set_ylabel(f'{baseline_type} Baseline Change (%)')
-    ax.set_title(f'{baseline_type} Baseline Degradation')
-    ax.legend()
+    ax.set_title(f'{baseline_type} Slack — Baseline Degradation')
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(folder, 'baseline_change.png'))
 
@@ -283,35 +363,58 @@ def plot_slack(csv_path: str):
             ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO %')
         ax.set_xlabel('Extra Threads')
         ax.set_ylabel('Utilization (%)')
-        ax.set_title(f'{name.replace("_", " ").title()} — Resource Utilization')
+        ax.set_title(f'{baseline_type} Slack — Resource Utilization')
         ax.set_ylim(0, 100)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.legend()
         ax.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(folder, 'utilization.png'))
 
-    # 4. Normalized throughput % of peak vs utilization %
+    # 4. Throughput (% of peak) vs utilization split by resource
     if 'cpu_pct' in df.columns:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        cpu_peak = df['cpu_ops'].max()
-        io_peak = df['io_ops'].max()
-        if cpu_peak > 0:
-            ax.plot(x, df['cpu_ops'] / cpu_peak * 100, '-o', color=C_BLUE,
-                    linewidth=2, markersize=5, label='CPU ops (% of peak)')
-        if io_peak > 0:
-            ax.plot(x, df['io_ops'] / io_peak * 100, '-s', color=C_CYAN,
-                    linewidth=2, markersize=5, label='IO ops (% of peak)')
-        ax.plot(x, df['cpu_pct'], '--', color=C_ORANGE, linewidth=2,
-                markersize=4, alpha=0.8, label='CPU utilization %')
-        if 'io_util_pct' in df.columns:
-            ax.plot(x, df['io_util_pct'], '--', color=C_GREEN, linewidth=2,
-                    markersize=4, alpha=0.8, label='IO utilization %')
-        ax.set_xlabel('Extra Threads')
-        ax.set_ylabel('% of Peak / Utilization %')
-        ax.set_title(f'{baseline_type} Slack — Throughput vs Utilization')
-        ax.set_ylim(0, 105)
-        ax.legend(loc='best', fontsize=9)
-        ax.grid(True, alpha=0.3)
-        save_fig(fig, os.path.join(folder, 'throughput_vs_utilization.png'))
+        has_io_util = 'io_util_pct' in df.columns and df['io_util_pct'].max() > 1
+        has_cpu_tp = df['cpu_ops'].max() > 0
+        has_io_tp = df['io_ops'].max() > 0
+
+        nplots = (1 if has_cpu_tp else 0) + (1 if (has_io_tp or has_io_util) else 0)
+        if nplots > 0:
+            fig, axes = plt.subplots(nplots, 1, figsize=(10, 3 * nplots), sharex=True,
+                                     layout='constrained')
+            if nplots == 1:
+                axes = [axes]
+            ax_idx = 0
+
+            if has_cpu_tp:
+                ax_cpu = axes[ax_idx]
+                ax_idx += 1
+                cpu_pct_peak = df['cpu_ops'] / df['cpu_ops'].max() * 100
+                ax_cpu.plot(x, cpu_pct_peak, '-o', color=C_BLUE, linewidth=2,
+                            markersize=5, label='CPU throughput (% of peak)')
+                ax_cpu.plot(x, df['cpu_pct'], '--s', color=C_ORANGE, linewidth=1.5,
+                            markersize=4, alpha=0.8, label='CPU utilization %')
+                ax_cpu.set_ylabel('CPU %')
+                ax_cpu.set_ylim(0, 105)
+                ax_cpu.grid(True, alpha=0.3)
+                ax_cpu.legend(loc='best', fontsize=9)
+                ax_cpu.set_title(f'{baseline_type} Slack — CPU')
+
+            if has_io_tp or has_io_util:
+                ax_io = axes[ax_idx]
+                if has_io_tp:
+                    io_pct_peak = df['io_ops'] / df['io_ops'].max() * 100
+                    ax_io.plot(x, io_pct_peak, '-o', color=C_GREEN, linewidth=2,
+                               markersize=5, label='IO throughput (% of peak)')
+                if has_io_util:
+                    ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
+                               markersize=4, alpha=0.8, label='IO utilization %')
+                ax_io.set_ylabel('IO %')
+                ax_io.set_ylim(0, 105)
+                ax_io.grid(True, alpha=0.3)
+                ax_io.legend(loc='best', fontsize=9)
+
+            axes[-1].set_xlabel('Extra Threads')
+            axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
+            save_fig(fig, os.path.join(folder, 'throughput_vs_utilization.png'))
 
 
 def plot_per_worker_saturation(csv_path: str):
@@ -319,7 +422,7 @@ def plot_per_worker_saturation(csv_path: str):
     df = pd.read_csv(csv_path)
     name = Path(csv_path).stem
     folder = str(Path(csv_path).parent)
-    label, mode, x_label = detect_experiment(name)
+    label, mode, mode_plural, x_label = detect_experiment(name)
 
     worker_counts = sorted(df['workers'].unique())
     box_width = (worker_counts[1] - worker_counts[0]) * 0.6 if len(worker_counts) > 1 else 0.6
@@ -334,7 +437,10 @@ def plot_per_worker_saturation(csv_path: str):
                medianprops=dict(color=C_BLUE, linewidth=2))
     ax.set_xlabel(x_label)
     ax.set_ylabel('Per-Worker Throughput (ops/sec)')
-    ax.set_title(f'{label} Saturation ({mode}s) — Per-Worker Distribution')
+    ax.set_title(f'{label} Saturation ({mode_plural}) — Per-Worker Distribution')
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=1)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
     save_fig(fig, os.path.join(folder, 'per_worker_distribution.png'))
@@ -352,6 +458,7 @@ def plot_per_worker_saturation(csv_path: str):
     ax1.set_xlabel(x_label)
     ax1.set_ylabel('Total Throughput (ops/sec)', color=C_BLUE)
     ax1.tick_params(axis='y', labelcolor=C_BLUE)
+    ax1.set_ylim(bottom=0)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
 
     ax2 = ax1.twinx()
@@ -362,7 +469,9 @@ def plot_per_worker_saturation(csv_path: str):
 
     lines = ln1 + ln2
     ax1.legend(lines, [l.get_label() for l in lines], loc='best')
-    ax1.set_title(f'{label} Saturation ({mode}s) — Throughput vs Fairness')
+    ax1.set_title(f'{label} Saturation ({mode_plural}) — Throughput vs Fairness')
+    ax1.set_xlim(left=1)
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax1.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(folder, 'per_worker_fairness.png'))
 
@@ -381,50 +490,60 @@ def plot_proc_slack(csv_path: str):
 
     print(f"  -> {folder}/")
 
-    # 1. Baseline throughput degradation vs extra workers (CPU left axis, IO right axis)
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ln1 = ax1.errorbar(x, df['baseline_cpu_ops'],
-                       yerr=df['baseline_cpu_stddev'],
-                       fmt='o-', color=C_BLUE, linewidth=2, markersize=5,
-                       capsize=3, capthick=1, label=f'Baseline CPU ops/s ({baseline_workers} procs)')
-    ln3 = ax1.plot(x, df['extra_cpu_ops'], '--^', color=C_CYAN, linewidth=1.5,
-                   markersize=4, alpha=0.8, label='Extra CPU ops/s')
-    ax1.set_xlabel('Extra Worker Processes')
-    ax1.set_ylabel('CPU ops/sec', color=C_BLUE)
-    ax1.tick_params(axis='y', labelcolor=C_BLUE)
-    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    # 1. Baseline throughput degradation vs extra workers (stacked subplots)
+    fig, (ax_cpu, ax_io) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
+                                         layout='constrained')
+    has_baseline_cpu = df['baseline_cpu_ops'].max() > 0
+    has_extra_cpu = df['extra_cpu_ops'].max() > 0
+    has_baseline_io = df['baseline_io_ops'].max() > 0
+    has_extra_io = df['extra_io_ops'].max() > 0
 
-    ax2 = ax1.twinx()
-    ln2 = ax2.errorbar(x, df['baseline_io_ops'],
+    if has_baseline_cpu:
+        ax_cpu.errorbar(x, df['baseline_cpu_ops'],
+                        yerr=df['baseline_cpu_stddev'],
+                        fmt='o-', color=C_BLUE, linewidth=2, markersize=5,
+                        capsize=3, capthick=1, label=f'Baseline ({baseline_workers} procs)')
+    if has_extra_cpu:
+        ax_cpu.plot(x, df['extra_cpu_ops'], '--^', color=C_CYAN, linewidth=1.5,
+                    markersize=4, alpha=0.8, label='Extra')
+    ax_cpu.set_ylabel('CPU ops/sec')
+    ax_cpu.set_ylim(bottom=0)
+    ax_cpu.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    if has_baseline_cpu or has_extra_cpu:
+        ax_cpu.legend(loc='best', fontsize=9)
+    ax_cpu.set_title(f'Proc Slack ({baseline_label} baseline, {baseline_workers} procs) — Throughput')
+    ax_cpu.grid(True, alpha=0.3)
+
+    if has_baseline_io:
+        ax_io.errorbar(x, df['baseline_io_ops'],
                        yerr=df['baseline_io_stddev'],
                        fmt='s-', color=C_GREEN, linewidth=2, markersize=5,
-                       capsize=3, capthick=1, label=f'Baseline IO ops/s ({baseline_workers} procs)')
-    ln4 = ax2.plot(x, df['extra_io_ops'], '--v', color=C_ORANGE, linewidth=1.5,
-                   markersize=4, alpha=0.8, label='Extra IO ops/s')
-    ax2.set_ylabel('IO ops/sec', color=C_GREEN)
-    ax2.tick_params(axis='y', labelcolor=C_GREEN)
-    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
-    ax2.set_ylim(bottom=0)
-
-    lines = [ln1] + ln3 + [ln2] + ln4
-    ax1.legend(lines, [l.get_label() for l in lines], loc='best', fontsize=8)
-    ax1.set_title(f'Proc Slack ({baseline_label} baseline, {baseline_workers} procs) — Throughput')
-    ax1.grid(True, alpha=0.3)
+                       capsize=3, capthick=1, label=f'Baseline ({baseline_workers} procs)')
+    if has_extra_io:
+        ax_io.plot(x, df['extra_io_ops'], '--v', color=C_ORANGE, linewidth=1.5,
+                   markersize=4, alpha=0.8, label='Extra')
+    ax_io.set_xlabel('Extra Worker Processes')
+    ax_io.set_ylabel('IO ops/sec')
+    ax_io.set_ylim(bottom=0)
+    ax_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    if has_baseline_io or has_extra_io:
+        ax_io.legend(loc='best', fontsize=9)
+    ax_io.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_io.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(folder, 'throughput.png'))
 
     # 2. Baseline change % with zero line
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(x, df['baseline_change_pct'], '-o', color=C_RED, linewidth=2, markersize=5)
     ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
-    ax.axhline(y=-20, color=C_ORANGE, linestyle='--', alpha=0.7, label='-20% threshold')
     ax.fill_between(x, df['baseline_change_pct'], 0,
-                    where=(df['baseline_change_pct'] >= 0), alpha=0.2, color=C_GREEN)
+                    where=(df['baseline_change_pct'] >= 0), interpolate=True, alpha=0.2, color=C_GREEN)
     ax.fill_between(x, df['baseline_change_pct'], 0,
-                    where=(df['baseline_change_pct'] < 0), alpha=0.2, color=C_RED)
+                    where=(df['baseline_change_pct'] < 0), interpolate=True, alpha=0.2, color=C_RED)
     ax.set_xlabel('Extra Worker Processes')
     ax.set_ylabel(f'{baseline_label} Baseline Change (%)')
     ax.set_title(f'Proc Slack — Baseline Degradation ({baseline_label} baseline, {baseline_workers} procs)')
-    ax.legend()
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(folder, 'baseline_change.png'))
 
@@ -438,41 +557,68 @@ def plot_proc_slack(csv_path: str):
         ax.set_ylabel('Utilization (%)')
         ax.set_title(f'Proc Slack — Resource Utilization')
         ax.set_ylim(0, 100)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.legend()
         ax.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(folder, 'utilization.png'))
 
-    # 4. Normalized throughput % of peak vs utilization %
+    # 4. Throughput (% of peak) vs utilization split by resource
     if 'cpu_pct' in df.columns:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        b_cpu_peak = df['baseline_cpu_ops'].max()
-        b_io_peak = df['baseline_io_ops'].max()
-        e_cpu_peak = df['extra_cpu_ops'].max()
-        e_io_peak = df['extra_io_ops'].max()
-        if b_cpu_peak > 0:
-            ax.plot(x, df['baseline_cpu_ops'] / b_cpu_peak * 100, '-o', color=C_BLUE,
-                    linewidth=2, markersize=5, label='Baseline CPU ops (% of peak)')
-        if b_io_peak > 0:
-            ax.plot(x, df['baseline_io_ops'] / b_io_peak * 100, '-s', color=C_CYAN,
-                    linewidth=2, markersize=5, label='Baseline IO ops (% of peak)')
-        if e_cpu_peak > 0:
-            ax.plot(x, df['extra_cpu_ops'] / e_cpu_peak * 100, '--^', color=C_BLUE,
-                    linewidth=1.5, markersize=4, alpha=0.8, label='Extra CPU ops (% of peak)')
-        if e_io_peak > 0:
-            ax.plot(x, df['extra_io_ops'] / e_io_peak * 100, '--v', color=C_CYAN,
-                    linewidth=1.5, markersize=4, alpha=0.8, label='Extra IO ops (% of peak)')
-        ax.plot(x, df['cpu_pct'], '--', color=C_ORANGE, linewidth=2,
-                markersize=4, alpha=0.8, label='CPU utilization %')
-        if 'io_util_pct' in df.columns:
-            ax.plot(x, df['io_util_pct'], '--', color=C_GREEN, linewidth=2,
-                    markersize=4, alpha=0.8, label='IO utilization %')
-        ax.set_xlabel('Extra Worker Processes')
-        ax.set_ylabel('% of Peak / Utilization %')
-        ax.set_title(f'Proc Slack ({baseline_label} baseline, {baseline_workers} procs) — Throughput vs Utilization')
-        ax.set_ylim(0, 105)
-        ax.legend(loc='best', fontsize=9)
-        ax.grid(True, alpha=0.3)
-        save_fig(fig, os.path.join(folder, 'throughput_vs_utilization.png'))
+        has_io_util = 'io_util_pct' in df.columns and df['io_util_pct'].max() > 1
+        has_any_cpu = df['baseline_cpu_ops'].max() > 0 or df['extra_cpu_ops'].max() > 0
+        has_any_io = df['baseline_io_ops'].max() > 0 or df['extra_io_ops'].max() > 0
+
+        nplots = (1 if has_any_cpu else 0) + (1 if (has_any_io or has_io_util) else 0)
+        if nplots > 0:
+            fig, axes = plt.subplots(nplots, 1, figsize=(10, 3 * nplots), sharex=True,
+                                     layout='constrained')
+            if nplots == 1:
+                axes = [axes]
+            ax_idx = 0
+
+            if has_any_cpu:
+                ax_cpu = axes[ax_idx]
+                ax_idx += 1
+                # Combine baseline + extra CPU throughput for peak normalization
+                total_cpu = df['baseline_cpu_ops'] + df['extra_cpu_ops']
+                cpu_peak = total_cpu.max()
+                if cpu_peak > 0:
+                    if df['baseline_cpu_ops'].max() > 0:
+                        ax_cpu.plot(x, df['baseline_cpu_ops'] / cpu_peak * 100, '-o', color=C_BLUE,
+                                    linewidth=2, markersize=5, label='Baseline CPU (% of peak)')
+                    if df['extra_cpu_ops'].max() > 0:
+                        ax_cpu.plot(x, df['extra_cpu_ops'] / cpu_peak * 100, '--^', color=C_CYAN,
+                                    linewidth=1.5, markersize=4, alpha=0.8, label='Extra CPU (% of peak)')
+                ax_cpu.plot(x, df['cpu_pct'], '--s', color=C_ORANGE, linewidth=1.5,
+                            markersize=4, alpha=0.8, label='CPU utilization %')
+                ax_cpu.set_ylabel('CPU %')
+                ax_cpu.set_ylim(0, 105)
+                ax_cpu.grid(True, alpha=0.3)
+                ax_cpu.legend(loc='best', fontsize=9)
+                ax_cpu.set_title(f'Proc Slack ({baseline_label} baseline, {baseline_workers} procs) — CPU')
+
+            if has_any_io or has_io_util:
+                ax_io = axes[ax_idx]
+                total_io = df['baseline_io_ops'] + df['extra_io_ops']
+                io_peak = total_io.max()
+                if io_peak > 0:
+                    if df['baseline_io_ops'].max() > 0:
+                        ax_io.plot(x, df['baseline_io_ops'] / io_peak * 100, '-o', color=C_GREEN,
+                                   linewidth=2, markersize=5, label='Baseline IO (% of peak)')
+                    if df['extra_io_ops'].max() > 0:
+                        ax_io.plot(x, df['extra_io_ops'] / io_peak * 100, '--v', color=C_ORANGE,
+                                   linewidth=1.5, markersize=4, alpha=0.8, label='Extra IO (% of peak)')
+                if has_io_util:
+                    ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
+                               markersize=4, alpha=0.8, label='IO utilization %')
+                ax_io.set_ylabel('IO %')
+                ax_io.set_ylim(0, 105)
+                ax_io.grid(True, alpha=0.3)
+                ax_io.legend(loc='best', fontsize=9)
+
+            axes[-1].set_xlabel('Extra Worker Processes')
+            axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
+            save_fig(fig, os.path.join(folder, 'throughput_vs_utilization.png'))
 
 
 def plot_per_worker_proc_slack(csv_path: str):
@@ -487,29 +633,21 @@ def plot_per_worker_proc_slack(csv_path: str):
     print(f"  -> {folder}/")
 
     base_df  = df[df['worker_id'] < baseline_workers]
-    extra_df = df[df['worker_id'] >= baseline_workers]
 
-    # 1. Box plot separating baseline vs extra workers
+    # 1. Box plot of baseline worker throughput distribution
     fig, ax = plt.subplots(figsize=(max(8, len(extra_counts) * 0.5), 5))
-    base_data  = [base_df[base_df['extra_workers'] == e]['total_ops_sec'].values for e in extra_counts]
-    extra_data = [extra_df[extra_df['extra_workers'] == e]['total_ops_sec'].values for e in extra_counts]
+    base_data = [base_df[base_df['extra_workers'] == e]['total_ops_sec'].values for e in extra_counts]
 
-    offsets = [-box_width * 0.3, box_width * 0.3]
-    bp1 = ax.boxplot(base_data, positions=[e + offsets[0] for e in extra_counts],
-                     widths=box_width * 0.55, patch_artist=True,
-                     boxprops=dict(facecolor=C_CYAN, alpha=0.7),
-                     medianprops=dict(color=C_BLUE, linewidth=2), manage_ticks=False)
-    bp2 = ax.boxplot(extra_data, positions=[e + offsets[1] for e in extra_counts],
-                     widths=box_width * 0.55, patch_artist=True,
-                     boxprops=dict(facecolor=C_ORANGE, alpha=0.7),
-                     medianprops=dict(color=C_RED, linewidth=2), manage_ticks=False)
+    ax.boxplot(base_data, positions=extra_counts, widths=box_width * 0.7, patch_artist=True,
+               boxprops=dict(facecolor=C_CYAN, alpha=0.7),
+               medianprops=dict(color=C_BLUE, linewidth=2), manage_ticks=False)
 
     ax.set_xticks(extra_counts)
     ax.set_xticklabels(extra_counts)
     ax.set_xlabel('Extra Worker Processes')
     ax.set_ylabel('Per-Worker Throughput (ops/sec)')
-    ax.set_title(f'Proc Slack — Per-Worker Distribution (blue=baseline, orange=extra)')
-    ax.legend([bp1['boxes'][0], bp2['boxes'][0]], [f'Baseline ({baseline_workers})', 'Extra'], loc='best')
+    ax.set_title(f'Proc Slack — Baseline Worker Distribution ({baseline_workers} procs)')
+    ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
     save_fig(fig, os.path.join(folder, 'per_worker_distribution.png'))
@@ -527,6 +665,7 @@ def plot_per_worker_proc_slack(csv_path: str):
     ax1.set_xlabel('Extra Worker Processes')
     ax1.set_ylabel('Baseline Total Throughput (ops/sec)', color=C_BLUE)
     ax1.tick_params(axis='y', labelcolor=C_BLUE)
+    ax1.set_ylim(bottom=0)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
 
     ax2 = ax1.twinx()
@@ -538,6 +677,7 @@ def plot_per_worker_proc_slack(csv_path: str):
     lines = ln1 + ln2
     ax1.legend(lines, [l.get_label() for l in lines], loc='best')
     ax1.set_title(f'Proc Slack — Baseline Throughput vs Fairness')
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax1.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(folder, 'per_worker_fairness.png'))
 
@@ -573,6 +713,7 @@ def plot_per_worker_intensity_sweep(csv_path: str):
     ax.set_xlabel('Probe Intensity')
     ax.set_ylabel('Per-Worker Throughput (ops/sec)')
     ax.set_title(f'Intensity Sweep — Base Workers (box) vs Probe Worker')
+    ax.set_ylim(bottom=0)
     ax.legend()
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))

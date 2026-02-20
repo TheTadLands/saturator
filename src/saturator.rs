@@ -4,6 +4,8 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::ffi::CString;
 
+use crate::constants::*;
+
 /// Tuning parameters that affect contention behavior
 #[derive(Debug, Clone, Copy)]
 pub struct TuningParams {
@@ -59,14 +61,15 @@ impl CalibrationResult {
     }
 }
 
+/// Run multi-pass calibration to find CPU and IO iteration counts that produce matched timings.
 pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
-    println!("  Running calibration (3 passes, targeting <5% gap)...");
+    println!("  Running calibration ({} passes, targeting <5% gap)...", CALIBRATION_PASSES);
 
     let buffer_size = params.buffer_kb * 1024;
     let io_buffer_size = params.io_buffer_kb * 1024;
     let mut results = Vec::new();
 
-    for pass in 0..3 {
+    for pass in 0..CALIBRATION_PASSES {
         let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass(buffer_size, io_buffer_size);
         let gap_pct = if cpu_us > io_us {
             ((cpu_us - io_us) as f64 / io_us as f64) * 100.0
@@ -110,7 +113,7 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
         let _ = std::fs::write(path, vec![0u8; io_buffer_size]);
         let io_buf = vec![0u8; io_buffer_size];
 
-        let samples = 100;
+        let samples = CALIBRATION_IO_SAMPLES;
         let start = std::time::Instant::now();
         for _ in 0..samples {
             do_io_work_counted(path, 1, &io_buf);
@@ -129,7 +132,7 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
         // First, get close with scaling
         loop {
             let start = std::time::Instant::now();
-            let samples = 200; // More samples for precision
+            let samples = CALIBRATION_CPU_SCALING_SAMPLES;
             for _ in 0..samples {
                 do_cpu_work(&buffer, iters);
             }
@@ -142,25 +145,25 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
             let scale = (target_cpu_us / actual_us.max(1)).max(2) as usize;
             iters *= scale;
 
-            if iters > 1_000_000 {
+            if iters > CALIBRATION_MAX_CPU_ITERS {
                 break;
             }
         }
 
-        // Fine-tune with binary search to get within 2%
+        // Fine-tune with binary search to get within tolerance
         let mut low = iters / 2;
         let mut high = iters * 2;
-        let lower_bound = target_cpu_us * 98 / 100;
-        let upper_bound = target_cpu_us * 102 / 100;
+        let lower_bound = target_cpu_us * (100 - CALIBRATION_TOLERANCE_PCT) / 100;
+        let upper_bound = target_cpu_us * (100 + CALIBRATION_TOLERANCE_PCT) / 100;
 
-        for _ in 0..40 {
+        for _ in 0..CALIBRATION_MAX_SEARCH_ITERS {
             let mid = (low + high) / 2;
             if mid == low || mid == high {
                 break;
             }
 
             let start = std::time::Instant::now();
-            let samples = 500;
+            let samples = CALIBRATION_CPU_SEARCH_SAMPLES;
             for _ in 0..samples {
                 do_cpu_work(&buffer, mid);
             }
@@ -179,7 +182,7 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
 
         // Final measurement with more samples for accuracy
         let start = std::time::Instant::now();
-        let samples = 1000;
+        let samples = CALIBRATION_CPU_FINAL_SAMPLES;
         for _ in 0..samples {
             do_cpu_work(&buffer, iters);
         }
@@ -191,6 +194,7 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
     (cpu_iters, cpu_actual_us, io_iters, io_actual_us)
 }
 
+/// Thread work loop: runs CPU and IO work at the given ratio until `running` is set to false.
 pub fn run_saturator(
     thread_id: usize,
     io_perc: f64,
@@ -219,20 +223,20 @@ pub fn run_saturator(
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
     let mut local_sleep_ops = 0u64;
-    let mut rng_state = thread_id as u64 + 12345;
+    let mut rng_state = thread_id as u64 + RNG_SEED_OFFSET;
 
     while running.load(Ordering::Relaxed) {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 
         // Intensity gate: sleep instead of working with probability (1 - intensity)
         if intensity < 1.0 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
             let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
             if intensity_roll >= intensity {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
                 local_sleep_ops += 1;
-                if local_sleep_ops >= 100 {
+                if local_sleep_ops >= BATCH_FLUSH_THRESHOLD {
                     pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
                     local_sleep_ops = 0;
                 }
@@ -248,7 +252,7 @@ pub fn run_saturator(
             local_cpu_ops += cpu_iterations as u64;
         }
 
-        if (local_cpu_ops + local_io_ops) >= 100 {
+        if (local_cpu_ops + local_io_ops) >= BATCH_FLUSH_THRESHOLD {
             cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
             io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
             pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
@@ -281,14 +285,14 @@ fn do_cpu_work(buffer: &[u8], iterations: usize) -> u64 {
     for i in 0..iterations {
         // Stride through the entire buffer so the full working set stays hot.
         // With large buffers and many processes, this creates real cache pressure.
-        let offset = (i * 1000) % len;
-        let end = (offset + 1000).min(len);
+        let offset = (i * CPU_BUFFER_STRIDE) % len;
+        let end = (offset + CPU_BUFFER_STRIDE).min(len);
         hash = buffer[offset..end].iter().fold(hash, |acc, &b| {
-            acc.wrapping_mul(31).wrapping_add(b as u64)
+            acc.wrapping_mul(HASH_MUL_PRIMARY).wrapping_add(b as u64)
         });
 
-        for j in 0..50 {
-            hash = hash.wrapping_add(j).wrapping_mul(7);
+        for j in 0..CPU_HASH_UNROLL {
+            hash = hash.wrapping_add(j).wrapping_mul(HASH_MUL_SECONDARY);
         }
     }
 
@@ -308,10 +312,12 @@ fn do_io_work_counted(path: &str, iterations: usize, io_buf: &[u8]) {
     }
 }
 
+/// Public wrapper around `do_cpu_work` for use outside the workload loop.
 pub fn cpu_work_with_buffer(buffer: &[u8], iterations: usize) {
     do_cpu_work(buffer, iterations);
 }
 
+/// Public wrapper around `do_io_work_counted` that manages a per-thread scratch file.
 pub fn io_work_with_id(thread_id: usize, iterations: usize, io_buf: &[u8]) {
     let path = format!("/tmp/saturator_io_{}", thread_id);
 
@@ -325,6 +331,7 @@ pub fn io_work_with_id(thread_id: usize, iterations: usize, io_buf: &[u8]) {
 
 // --- Shared memory infrastructure for process-based experiments ---
 
+/// Cross-process shared memory region with atomic counters for throughput tracking.
 #[repr(C)]
 pub struct SharedRegion {
     pub total_ops: AtomicU64,
@@ -335,15 +342,15 @@ pub struct SharedRegion {
     _padding: [u8; 7],
 }
 
-/// Compute shared memory size: header + per-worker counters (3 x AtomicU64 each), rounded up to page size
+/// Compute shared memory size: header + per-worker counters, rounded up to page size.
 fn shm_size_for_workers(max_workers: usize) -> usize {
     let header = std::mem::size_of::<SharedRegion>();
-    let per_worker = max_workers * 24; // 3 x AtomicU64 (8 bytes each) per worker: cpu, io, sleep
+    let per_worker = max_workers * SHM_BYTES_PER_WORKER;
     let total = header + per_worker;
-    // Round up to page boundary (4096)
-    (total + 4095) & !4095
+    (total + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
+/// Create a named POSIX shared memory region for `max_workers` workers. Returns (pointer, fd).
 pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegion, i32) {
     let size = shm_size_for_workers(max_workers);
     unsafe {
@@ -378,12 +385,13 @@ pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegio
 
         // Zero-init per-worker area
         let worker_area = (ptr as *mut u8).add(std::mem::size_of::<SharedRegion>());
-        std::ptr::write_bytes(worker_area, 0, max_workers * 24);
+        std::ptr::write_bytes(worker_area, 0, max_workers * SHM_BYTES_PER_WORKER);
 
         (region, fd)
     }
 }
 
+/// Open an existing named shared memory region (used by child processes).
 pub fn open_shared_region(name: &str, max_workers: usize) -> *mut SharedRegion {
     let size = shm_size_for_workers(max_workers);
     unsafe {
@@ -406,6 +414,7 @@ pub fn open_shared_region(name: &str, max_workers: usize) -> *mut SharedRegion {
     }
 }
 
+/// Unmap and unlink a shared memory region, closing the file descriptor.
 pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_workers: usize) {
     let size = shm_size_for_workers(max_workers);
     unsafe {
@@ -424,7 +433,7 @@ pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_wo
 pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&'static AtomicU64, &'static AtomicU64, &'static AtomicU64) {
     unsafe {
         let base = (region as *mut u8).add(std::mem::size_of::<SharedRegion>());
-        let slot = base.add(worker_id * 24);
+        let slot = base.add(worker_id * SHM_BYTES_PER_WORKER);
         let cpu   = &*(slot as *const AtomicU64);
         let io    = &*((slot.add(8))  as *const AtomicU64);
         let sleep = &*((slot.add(16)) as *const AtomicU64);
@@ -463,20 +472,20 @@ pub fn run_worker_process(
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
     let mut local_sleep_ops = 0u64;
-    let mut rng_state = worker_id as u64 + 12345;
+    let mut rng_state = worker_id as u64 + RNG_SEED_OFFSET;
 
     while region_ref.running.load(Ordering::Relaxed) {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 
         // Intensity gate: sleep instead of working with probability (1 - intensity)
         if intensity < 1.0 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
             let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
             if intensity_roll >= intensity {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
                 local_sleep_ops += 1;
-                if local_sleep_ops >= 100 {
+                if local_sleep_ops >= BATCH_FLUSH_THRESHOLD {
                     wk_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
                     local_sleep_ops = 0;
                 }
@@ -492,7 +501,7 @@ pub fn run_worker_process(
             local_cpu_ops += cpu_iterations as u64;
         }
 
-        if (local_cpu_ops + local_io_ops) >= 100 {
+        if (local_cpu_ops + local_io_ops) >= BATCH_FLUSH_THRESHOLD {
             region_ref.cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
             region_ref.io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
             wk_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);

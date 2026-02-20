@@ -23,10 +23,7 @@ C_BLUE = '#0072B2'
 C_ORANGE = '#E69F00'
 C_GREEN = '#009E73'
 C_RED = '#D55E00'
-C_PURPLE = '#CC79A7'
 C_CYAN = '#56B4E9'
-C_YELLOW = '#F0E442'
-C_BLACK = '#000000'
 
 
 def format_number(x):
@@ -40,6 +37,7 @@ def format_number(x):
 
 
 def save_fig(fig, path):
+    """Save figure to path with tight layout, close it, and print the filename."""
     if not fig.get_constrained_layout():
         fig.tight_layout(pad=0.5, h_pad=None, w_pad=None, rect=(0, 0.02, 1, 1))
     fig.savefig(path, dpi=150)
@@ -211,8 +209,8 @@ def plot_saturation(csv_path: str):
     # 4. Combined: primary throughput metric + CPU% on dual axes
     if 'cpu_pct' in df.columns:
         fig, ax1 = plt.subplots(figsize=(8, 5))
-        ln1 = ax1.plot(x, df[primary_col], '-o', color=C_BLUE, linewidth=2,
-                       markersize=6, label=primary_label)
+        line_throughput = ax1.plot(x, df[primary_col], '-o', color=C_BLUE, linewidth=2,
+                                   markersize=6, label=primary_label)
         ax1.set_xlabel(x_label)
         ax1.set_ylabel(f'{primary_label} (ops/sec)', color=C_BLUE)
         ax1.tick_params(axis='y', labelcolor=C_BLUE)
@@ -220,13 +218,13 @@ def plot_saturation(csv_path: str):
         ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
 
         ax2 = ax1.twinx()
-        ln2 = ax2.plot(x, df['cpu_pct'], '-s', color=C_ORANGE, linewidth=2,
-                       markersize=5, label='CPU %')
+        line_cpu = ax2.plot(x, df['cpu_pct'], '-s', color=C_ORANGE, linewidth=2,
+                            markersize=5, label='CPU %')
         ax2.set_ylabel('CPU Utilization (%)', color=C_ORANGE)
         ax2.tick_params(axis='y', labelcolor=C_ORANGE)
         ax2.set_ylim(bottom=0)
 
-        lines = ln1 + ln2
+        lines = line_throughput + line_cpu
         labels = [l.get_label() for l in lines]
         ax1.legend(lines, labels, loc='best')
         ax1.set_title(f'{label} Saturation ({mode_plural}) — Throughput vs CPU')
@@ -262,10 +260,10 @@ def plot_saturation(csv_path: str):
                 ax_cpu = axes[ax_idx]
                 ax_idx += 1
                 cpu_pct_peak = cpu_tp / cpu_tp.max() * 100
-                ln1 = ax_cpu.plot(x, cpu_pct_peak, '-o', color=C_BLUE, linewidth=2,
-                                  markersize=5, label='CPU throughput (% of peak)')
-                ln2 = ax_cpu.plot(x, df['cpu_pct'], '--s', color=C_ORANGE, linewidth=1.5,
-                                  markersize=4, alpha=0.8, label='CPU utilization %')
+                ax_cpu.plot(x, cpu_pct_peak, '-o', color=C_BLUE, linewidth=2,
+                            markersize=5, label='CPU throughput (% of peak)')
+                ax_cpu.plot(x, df['cpu_pct'], '--s', color=C_ORANGE, linewidth=1.5,
+                            markersize=4, alpha=0.8, label='CPU utilization %')
                 ax_cpu.set_ylabel('CPU %')
                 ax_cpu.set_ylim(0, 105)
                 ax_cpu.set_xlim(left=1)
@@ -275,16 +273,13 @@ def plot_saturation(csv_path: str):
 
             if has_io_tp or has_io_util:
                 ax_io = axes[ax_idx]
-                lines = []
                 if has_io_tp:
                     io_pct_peak = io_tp / io_tp.max() * 100
-                    ln1 = ax_io.plot(x, io_pct_peak, '-o', color=C_GREEN, linewidth=2,
-                                     markersize=5, label='IO throughput (% of peak)')
-                    lines += ln1
+                    ax_io.plot(x, io_pct_peak, '-o', color=C_GREEN, linewidth=2,
+                               markersize=5, label='IO throughput (% of peak)')
                 if has_io_util:
-                    ln2 = ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
-                                     markersize=4, alpha=0.8, label='IO utilization %')
-                    lines += ln2
+                    ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
+                               markersize=4, alpha=0.8, label='IO utilization %')
                 ax_io.set_ylabel('IO %')
                 ax_io.set_ylim(0, 105)
                 ax_io.set_xlim(left=1)
@@ -454,7 +449,7 @@ def plot_per_worker_saturation(csv_path: str):
         cvs.append(vals.std() / mean * 100 if mean > 0 else 0)
 
     fig, ax1 = plt.subplots(figsize=(8, 5))
-    ln1 = ax1.plot(worker_counts, totals, '-o', color=C_BLUE, linewidth=2, markersize=6, label='Total throughput')
+    line_throughput = ax1.plot(worker_counts, totals, '-o', color=C_BLUE, linewidth=2, markersize=6, label='Total throughput')
     ax1.set_xlabel(x_label)
     ax1.set_ylabel('Total Throughput (ops/sec)', color=C_BLUE)
     ax1.tick_params(axis='y', labelcolor=C_BLUE)
@@ -462,12 +457,12 @@ def plot_per_worker_saturation(csv_path: str):
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
 
     ax2 = ax1.twinx()
-    ln2 = ax2.plot(worker_counts, cvs, '-s', color=C_RED, linewidth=2, markersize=5, label='Fairness CV%')
+    line_cv = ax2.plot(worker_counts, cvs, '-s', color=C_RED, linewidth=2, markersize=5, label='Fairness CV%')
     ax2.set_ylabel('Coefficient of Variation (%)', color=C_RED)
     ax2.tick_params(axis='y', labelcolor=C_RED)
     ax2.set_ylim(bottom=0)
 
-    lines = ln1 + ln2
+    lines = line_throughput + line_cv
     ax1.legend(lines, [l.get_label() for l in lines], loc='best')
     ax1.set_title(f'{label} Saturation ({mode_plural}) — Throughput vs Fairness')
     ax1.set_xlim(left=1)
@@ -483,6 +478,7 @@ def plot_proc_slack(csv_path: str):
     folder = str(Path(csv_path).parent)
 
     baseline_workers = int(df['baseline_workers'].iloc[0])
+    # Parse baseline type from filename: e.g. "proc_slack_4io_proc_adding_50pct_io" → 'io' present → IO baseline
     is_io_baseline = 'io' in name.split('proc_slack_')[1].split('proc_adding')[0]
     baseline_label = 'I/O' if is_io_baseline else 'CPU'
     tracked_col = 'baseline_io_ops' if is_io_baseline else 'baseline_cpu_ops'
@@ -661,7 +657,7 @@ def plot_per_worker_proc_slack(csv_path: str):
         cvs.append(vals.std() / mean * 100 if mean > 0 else 0)
 
     fig, ax1 = plt.subplots(figsize=(8, 5))
-    ln1 = ax1.plot(extra_counts, totals, '-o', color=C_BLUE, linewidth=2, markersize=6, label='Baseline total throughput')
+    line_throughput = ax1.plot(extra_counts, totals, '-o', color=C_BLUE, linewidth=2, markersize=6, label='Baseline total throughput')
     ax1.set_xlabel('Extra Worker Processes')
     ax1.set_ylabel('Baseline Total Throughput (ops/sec)', color=C_BLUE)
     ax1.tick_params(axis='y', labelcolor=C_BLUE)
@@ -669,12 +665,12 @@ def plot_per_worker_proc_slack(csv_path: str):
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
 
     ax2 = ax1.twinx()
-    ln2 = ax2.plot(extra_counts, cvs, '-s', color=C_RED, linewidth=2, markersize=5, label='Baseline fairness CV%')
+    line_cv = ax2.plot(extra_counts, cvs, '-s', color=C_RED, linewidth=2, markersize=5, label='Baseline fairness CV%')
     ax2.set_ylabel('Coefficient of Variation (%)', color=C_RED)
     ax2.tick_params(axis='y', labelcolor=C_RED)
     ax2.set_ylim(bottom=0)
 
-    lines = ln1 + ln2
+    lines = line_throughput + line_cv
     ax1.legend(lines, [l.get_label() for l in lines], loc='best')
     ax1.set_title(f'Proc Slack — Baseline Throughput vs Fairness')
     ax1.xaxis.set_major_locator(MaxNLocator(integer=True))

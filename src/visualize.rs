@@ -3,6 +3,7 @@ use std::io::{Write, BufWriter};
 
 use crate::proc_metrics::{self, SystemMetrics};
 
+/// A single data point in a saturation experiment.
 pub struct SaturationResult {
     pub thread_count: usize,
     pub cpu_ops: f64,
@@ -14,6 +15,7 @@ pub struct SaturationResult {
     pub metrics: SystemMetrics,
 }
 
+/// Collects saturation data points and writes them to CSV.
 pub struct ResultsWriter {
     saturation_results: Vec<SaturationResult>,
 }
@@ -25,6 +27,7 @@ impl ResultsWriter {
         }
     }
 
+    /// Record a data point: worker count, throughput values, stddevs, and system metrics.
     pub fn add_saturation_point(&mut self, thread_count: usize, cpu_ops: f64, io_ops: f64, cpu_ops_stddev: f64, io_ops_stddev: f64, metrics: SystemMetrics) {
         let total_ops = cpu_ops + io_ops;
         self.saturation_results.push(SaturationResult {
@@ -39,6 +42,7 @@ impl ResultsWriter {
         });
     }
 
+    /// Write all collected data points to a CSV file at the given path.
     pub fn write_saturation_csv(&self, path: &std::path::Path) -> std::io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);

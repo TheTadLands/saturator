@@ -1,5 +1,6 @@
 use std::fs::read_to_string;
 
+/// Snapshot of cgroup/proc metrics at a point in time, used to compute deltas.
 pub struct ProcSnapshot {
     // Cgroup CPU accounting (microseconds)
     usage_usec: u64,
@@ -18,6 +19,7 @@ pub struct ProcSnapshot {
     psi_io_full_us: u64,
 }
 
+/// Computed system metrics for a measurement window (delta between two snapshots).
 #[derive(Clone, Debug)]
 pub struct SystemMetrics {
     pub cpu_pct: f64,
@@ -29,6 +31,7 @@ pub struct SystemMetrics {
     pub psi_io_full_us: u64,
 }
 
+/// Capture a snapshot of current cgroup CPU, IO, and PSI metrics.
 pub fn take_snapshot() -> ProcSnapshot {
     let (usage_usec, system_usec) = read_cgroup_cpu_stat();
 
@@ -172,6 +175,7 @@ fn read_psi_total(path: &str, kind: &str) -> Option<u64> {
     None
 }
 
+/// Compute system metrics from the delta between two snapshots over a given duration.
 pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs: f64) -> SystemMetrics {
     let d_usage = after.usage_usec.saturating_sub(before.usage_usec);
     let d_system = after.system_usec.saturating_sub(before.system_usec);
@@ -224,6 +228,7 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
     }
 }
 
+/// Return the CSV column header string for system metrics.
 pub fn csv_header() -> &'static str {
     "cpu_pct,system_pct,io_util_pct,io_psi_pct,psi_cpu_some_us,psi_io_some_us,psi_io_full_us"
 }
@@ -236,6 +241,7 @@ impl SystemMetrics {
     }
 }
 
+/// Compute element-wise median across multiple SystemMetrics samples.
 pub fn median_metrics(samples: &[SystemMetrics]) -> SystemMetrics {
     if samples.is_empty() {
         return empty();
@@ -272,6 +278,7 @@ pub fn median_metrics(samples: &[SystemMetrics]) -> SystemMetrics {
     }
 }
 
+/// Return a zeroed SystemMetrics (used as a fallback when no samples exist).
 pub fn empty() -> SystemMetrics {
     SystemMetrics {
         cpu_pct: 0.0,

@@ -43,6 +43,8 @@ fn main() {
         println!("  --intensity <F>      Work probability per iteration, 0.0-1.0 (default: 1.0)");
         println!("  --chain              Auto-run intensity sweep at saturation point (proc only)");
         println!("  --warmup <N>         Warmup duration in seconds before measurement (default: 1)");
+        println!("  --random-access      Use random buffer access pattern to defeat hardware prefetcher");
+        println!("  --direct-io          Use O_DIRECT to bypass page cache for I/O ops");
         println!("");
         println!("Examples:");
         println!("  find-slack 4 100     - 4 CPU baseline, add 100% I/O threads");
@@ -56,7 +58,7 @@ fn main() {
 
     // Hidden worker subcommand — child process entry point
     if experiment == "__worker" {
-        // Args: __worker <shm_name> <worker_id> <cpu_iters> <io_iters> <io_perc> <buffer_kb> <io_buffer_kb> <intensity> <sleep_us> <max_workers>
+        // Args: __worker <shm_name> <worker_id> <cpu_iters> <io_iters> <io_perc> <buffer_kb> <io_buffer_kb> <intensity> <sleep_us> <max_workers> <random_access> <direct_io>
         let shm_name = &args[2];
         let worker_id: usize = args[3].parse().unwrap();
         let cpu_iters: usize = args[4].parse().unwrap();
@@ -67,8 +69,10 @@ fn main() {
         let intensity: f64 = args[9].parse().unwrap();
         let sleep_us: u64 = args[10].parse().unwrap();
         let max_workers: usize = args[11].parse().unwrap();
+        let random_access: bool = args[12].parse().unwrap();
+        let direct_io: bool = args[13].parse().unwrap();
 
-        run_worker_process(shm_name, worker_id, cpu_iters, io_iters, io_perc, buffer_kb * 1024, io_buffer_kb * 1024, intensity, sleep_us, max_workers);
+        run_worker_process(shm_name, worker_id, cpu_iters, io_iters, io_perc, buffer_kb * 1024, io_buffer_kb * 1024, intensity, sleep_us, max_workers, random_access, direct_io);
         return;
     }
 
@@ -274,6 +278,12 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
             }
             "--chain" => {
                 params.chain = true;
+            }
+            "--random-access" => {
+                params.random_access = true;
+            }
+            "--direct-io" => {
+                params.direct_io = true;
             }
             "--warmup" => {
                 i += 1;

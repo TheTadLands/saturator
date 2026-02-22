@@ -50,7 +50,7 @@ pub fn run_intensity_sweep_experiment(
         let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_worker) = measure_proc_throughput_mixed_intensity(
             base_workers, probe_intensity, calibration.cpu_iterations, calibration.io_iterations,
             params.duration_secs, io_perc, params.buffer_kb, params.io_buffer_kb, params.samples,
-            sleep_us, params.warmup_secs,
+            sleep_us, params.warmup_secs, params.random_access, params.direct_io,
         );
         let total_ops = cpu_ops + io_ops;
 

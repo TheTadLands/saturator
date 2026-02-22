@@ -19,9 +19,11 @@ pub fn measure_proc_throughput(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let samples: Vec<_> = (0..num_samples).map(|_| {
-        measure_single_run_proc(worker_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_kb, io_buffer_kb, intensity, sleep_us, warmup_secs)
+        measure_single_run_proc(worker_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_kb, io_buffer_kb, intensity, sleep_us, warmup_secs, random_access, direct_io)
     }).collect();
     aggregate_samples(samples)
 }
@@ -38,6 +40,8 @@ pub fn measure_single_run_proc(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     use std::process::Command;
 
@@ -61,6 +65,8 @@ pub fn measure_single_run_proc(
             .arg(intensity.to_string())
             .arg(sleep_us.to_string())
             .arg(worker_count.to_string())
+            .arg(random_access.to_string())
+            .arg(direct_io.to_string())
             .spawn()
             .expect("Failed to spawn worker process");
         children.push(child);
@@ -96,16 +102,17 @@ pub fn measure_single_run_proc(
         let _ = child.wait();
     }
 
-    let cpu = region.cpu_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-    let io = region.io_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-
-    // Read per-worker counters
+    // Sum per-worker counters (global counters are no longer written by workers)
+    let mut cpu = 0.0_f64;
+    let mut io = 0.0_f64;
     let mut per_worker = Vec::with_capacity(worker_count);
     for i in 0..worker_count {
         let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
+        cpu += wc;
+        io += wi;
         per_worker.push((wc, wi, ws));
     }
 
@@ -127,11 +134,13 @@ pub fn measure_proc_throughput_mixed_intensity(
     num_samples: usize,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let samples: Vec<_> = (0..num_samples).map(|_| {
         measure_single_run_proc_mixed_intensity(
             base_workers, probe_intensity, cpu_iterations, io_iterations,
-            duration_secs, io_perc, buffer_kb, io_buffer_kb, sleep_us, warmup_secs,
+            duration_secs, io_perc, buffer_kb, io_buffer_kb, sleep_us, warmup_secs, random_access, direct_io,
         )
     }).collect();
     aggregate_samples(samples)
@@ -149,6 +158,8 @@ pub fn measure_single_run_proc_mixed_intensity(
     io_buffer_kb: usize,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     use std::process::Command;
 
@@ -174,6 +185,8 @@ pub fn measure_single_run_proc_mixed_intensity(
             .arg("1.0")
             .arg(sleep_us.to_string())
             .arg(total_workers.to_string())
+            .arg(random_access.to_string())
+            .arg(direct_io.to_string())
             .spawn()
             .expect("Failed to spawn base worker process");
         children.push(child);
@@ -192,6 +205,8 @@ pub fn measure_single_run_proc_mixed_intensity(
         .arg(probe_intensity.to_string())
         .arg(sleep_us.to_string())
         .arg(total_workers.to_string())
+        .arg(random_access.to_string())
+        .arg(direct_io.to_string())
         .spawn()
         .expect("Failed to spawn probe worker process");
     children.push(child);
@@ -224,16 +239,17 @@ pub fn measure_single_run_proc_mixed_intensity(
         let _ = child.wait();
     }
 
-    let cpu = region.cpu_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-    let io = region.io_ops.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-
-    // Read per-worker counters
+    // Sum per-worker counters (global counters are no longer written by workers)
+    let mut cpu = 0.0_f64;
+    let mut io = 0.0_f64;
     let mut per_worker = Vec::with_capacity(total_workers);
     for i in 0..total_workers {
         let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
         let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
         let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
+        cpu += wc;
+        io += wi;
         per_worker.push((wc, wi, ws));
     }
 
@@ -256,6 +272,8 @@ pub fn measure_single_run_proc_slack(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     use std::process::Command;
 
@@ -280,6 +298,8 @@ pub fn measure_single_run_proc_slack(
             .arg(intensity.to_string())
             .arg(sleep_us.to_string())
             .arg(total_workers.to_string())
+            .arg(random_access.to_string())
+            .arg(direct_io.to_string())
             .spawn()
             .expect("Failed to spawn baseline worker");
         children.push(child);
@@ -298,6 +318,8 @@ pub fn measure_single_run_proc_slack(
             .arg(intensity.to_string())
             .arg(sleep_us.to_string())
             .arg(total_workers.to_string())
+            .arg(random_access.to_string())
+            .arg(direct_io.to_string())
             .spawn()
             .expect("Failed to spawn extra worker");
         children.push(child);
@@ -367,12 +389,14 @@ pub fn measure_proc_slack(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let samples: Vec<_> = (0..num_samples).map(|_| {
         measure_single_run_proc_slack(
             baseline_workers, extra_workers, baseline_io_perc, extra_io_perc,
             cpu_iterations, io_iterations, duration_secs, buffer_kb, io_buffer_kb,
-            intensity, sleep_us, warmup_secs,
+            intensity, sleep_us, warmup_secs, random_access, direct_io,
         )
     }).collect();
 

@@ -20,9 +20,11 @@ pub fn measure_thread_throughput(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let samples: Vec<_> = (0..num_samples).map(|_| {
-        measure_single_run(thread_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_size, io_buffer_size, intensity, sleep_us, warmup_secs)
+        measure_single_run(thread_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_size, io_buffer_size, intensity, sleep_us, warmup_secs, random_access, direct_io)
     }).collect();
     aggregate_samples(samples)
 }
@@ -39,6 +41,8 @@ pub fn measure_single_run(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let cpu_ops = Arc::new(AtomicU64::new(0));
     let io_ops = Arc::new(AtomicU64::new(0));
@@ -61,7 +65,7 @@ pub fn measure_single_run(
 
         let handle = std::thread::spawn(move || {
             run_saturator(i, io_perc, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                          cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
+                          cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
         });
         handles.push(handle);
     }
@@ -114,6 +118,8 @@ pub fn measure_baseline(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)> = (0..num_samples).map(|_| {
         let cpu_ops = Arc::new(AtomicU64::new(0));
@@ -136,7 +142,7 @@ pub fn measure_baseline(
 
             let handle = std::thread::spawn(move || {
                 run_saturator(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                              cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
+                              cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
             });
             handles.push(handle);
         }
@@ -190,12 +196,14 @@ pub fn measure_total_throughput(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let results: Vec<_> = (0..num_samples).map(|_| {
         measure_total_throughput_single(
             baseline_threads, extra_threads, baseline_io_ratio, extra_io_ratio,
             cpu_iterations, io_iterations, duration_secs, buffer_size, io_buffer_size,
-            intensity, sleep_us, warmup_secs,
+            intensity, sleep_us, warmup_secs, random_access, direct_io,
         )
     }).collect();
 
@@ -216,6 +224,8 @@ pub fn measure_total_throughput_single(
     intensity: f64,
     sleep_us: u64,
     warmup_secs: u64,
+    random_access: bool,
+    direct_io: bool,
 ) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let total_threads = baseline_threads + extra_threads;
     let cpu_ops = Arc::new(AtomicU64::new(0));
@@ -240,7 +250,7 @@ pub fn measure_total_throughput_single(
 
         let handle = std::thread::spawn(move || {
             run_saturator_split(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
+                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
         });
         handles.push(handle);
     }
@@ -257,7 +267,7 @@ pub fn measure_total_throughput_single(
 
         let handle = std::thread::spawn(move || {
             run_saturator_split(baseline_threads + i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep);
+                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
         });
         handles.push(handle);
     }
@@ -313,9 +323,16 @@ pub fn run_saturator_split(
     pt_cpu: Arc<AtomicU64>,
     pt_io: Arc<AtomicU64>,
     pt_sleep: Arc<AtomicU64>,
+    random_access: bool,
+    direct_io: bool,
 ) {
+    use crate::saturator::alloc_aligned_io_buf;
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
-    let io_buf = vec![0u8; io_buffer_size];
+    let io_buf: &[u8] = if direct_io {
+        alloc_aligned_io_buf(io_buffer_size)
+    } else {
+        Vec::leak(vec![0u8; io_buffer_size])
+    };
 
     let mut rng_state = thread_id as u64 + RNG_SEED_OFFSET;
 
@@ -343,10 +360,10 @@ pub fn run_saturator_split(
         }
 
         if rand_f64 < io_ratio {
-            io_work_with_id(thread_id, io_iterations, &io_buf);
+            io_work_with_id(thread_id, io_iterations, io_buf, direct_io);
             local_io_ops += io_iterations as u64;
         } else {
-            cpu_work_with_buffer(&cpu_buffer, cpu_iterations);
+            cpu_work_with_buffer(&cpu_buffer, cpu_iterations, random_access);
             local_cpu_ops += cpu_iterations as u64;
         }
 

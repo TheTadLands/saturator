@@ -31,7 +31,7 @@ def format_number(x):
     if x >= 1_000_000:
         return f'{x/1_000_000:.1f}M'
     elif x >= 1_000:
-        return f'{x/1_000:.0f}K'
+        return f'{x/1_000:.1f}K'
     else:
         return f'{x:.0f}'
 

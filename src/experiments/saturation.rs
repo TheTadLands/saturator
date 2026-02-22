@@ -56,7 +56,7 @@ pub fn run_saturation_experiment(
                 let (c, i, cs, is, m, pw) = measure_thread_throughput(
                     worker_count, calibration.cpu_iterations, calibration.io_iterations,
                     params.duration_secs, exp.io_perc, params.buffer_kb * 1024, params.io_buffer_kb * 1024, params.samples,
-                    params.intensity, sleep_us, params.warmup_secs,
+                    params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
                 );
                 (c, i, cs, is, m, Some(pw))
             },
@@ -64,7 +64,7 @@ pub fn run_saturation_experiment(
                 let (c, i, cs, is, m, pw) = measure_proc_throughput(
                     worker_count, calibration.cpu_iterations, calibration.io_iterations,
                     params.duration_secs, exp.io_perc, params.buffer_kb, params.io_buffer_kb, params.samples,
-                    params.intensity, sleep_us, params.warmup_secs,
+                    params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
                 );
                 (c, i, cs, is, m, Some(pw))
             },

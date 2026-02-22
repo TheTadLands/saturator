@@ -44,7 +44,8 @@ pub const CALIBRATION_MAX_CPU_ITERS: usize = 1_000_000;
 pub const CALIBRATION_PASSES: usize = 3;
 
 /// Bytes per worker in shared memory layout (3 x AtomicU64: cpu_ops, io_ops, sleep_ops).
-pub const SHM_BYTES_PER_WORKER: usize = 24;
+/// Padded to 64 bytes (one cache line) to eliminate false sharing between adjacent workers.
+pub const SHM_BYTES_PER_WORKER: usize = 64;
 
 /// Page size for shared memory alignment (rounds up to page boundary).
 pub const PAGE_SIZE: usize = 4096;

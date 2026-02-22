@@ -32,7 +32,7 @@ pub fn run_slack_experiment(
         baseline_threads, exp.baseline_io_ratio,
         calibration.cpu_iterations, calibration.io_iterations,
         params.duration_secs, buffer_size, io_buffer_size, params.samples,
-        params.intensity, sleep_us, params.warmup_secs,
+        params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
     );
     let baseline_throughput = if exp.track_io { baseline_io } else { baseline_cpu };
     println!("Baseline: {:.0} {} ops/sec (cpu: {:.0}, io: {:.0})\n",
@@ -92,7 +92,7 @@ pub fn run_slack_experiment(
         let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_thread) = measure_total_throughput(
             baseline_threads, extra, exp.baseline_io_ratio, extra_io_ratio,
             calibration.cpu_iterations, calibration.io_iterations, params.duration_secs, buffer_size, io_buffer_size, params.samples,
-            params.intensity, sleep_us, params.warmup_secs,
+            params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
         );
 
         let total_ops = cpu_ops + io_ops;

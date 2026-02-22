@@ -72,6 +72,8 @@ pub fn write_params_file(
     writeln!(f, "step: {}", params.step).unwrap();
     writeln!(f, "intensity: {}", params.intensity).unwrap();
     writeln!(f, "warmup_secs: {}", params.warmup_secs).unwrap();
+    writeln!(f, "random_access: {}", params.random_access).unwrap();
+    writeln!(f, "direct_io: {}", params.direct_io).unwrap();
     writeln!(f, "cpu_iterations: {}", calibration.cpu_iterations).unwrap();
     writeln!(f, "io_iterations: {}", calibration.io_iterations).unwrap();
     writeln!(f, "cpu_us: {}", calibration.cpu_us).unwrap();

@@ -42,6 +42,8 @@ There are no tests or lints configured.
 - `--intensity <F>` — work probability per iteration, 0.0–1.0 (default: 1.0). Idle iterations sleep for `target_us` μs.
 - `--chain` — after a proc saturation experiment finds the saturation point N, automatically run `find-saturation-intensity-proc` with N base workers.
 - `--warmup <N>` — warmup duration in seconds before each measurement (default: 1). Longer warmup useful for cold caches or heavy I/O workloads.
+- `--random-access` — use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size.
+- `--direct-io` — use `O_DIRECT | O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. Requires page-aligned buffers (handled automatically via `posix_memalign`).
 
 ### Plotting
 
@@ -59,7 +61,7 @@ Source files in `src/`:
 
 - **`constants.rs`** — Named constants for magic numbers used throughout: RNG parameters (PCG multiplier, seed offset), CPU work parameters (buffer stride, hash multipliers, unroll factor), calibration sample counts and tolerances, shared memory layout sizes, and batch flush threshold.
 
-- **`saturator.rs`** — Core workload engine and shared memory infrastructure. `TuningParams` controls calibration target, buffer size, max workers, duration, and intensity. Calibrates CPU and I/O operations using binary search (configurable target, default ~50μs). CPU work = hash computation over a configurable buffer. I/O work = write with `O_SYNC`. `SharedRegion` is a `#[repr(C)]` struct with atomic counters laid out for cross-process mmap. Helpers `create_shared_region`/`open_shared_region`/`destroy_shared_region` use `libc::shm_open` + `libc::mmap(MAP_SHARED)`. `run_worker_process` is the child process work loop. Uses batched atomic counter updates to reduce contention.
+- **`saturator.rs`** — Core workload engine and shared memory infrastructure. `TuningParams` controls calibration target, buffer size, max workers, duration, intensity, random access pattern, and direct I/O mode. Calibrates CPU and I/O operations using binary search (configurable target, default ~50μs). CPU work = hash computation over a configurable buffer (sequential stride by default, hash-derived random offsets with `--random-access`). I/O work = write with `O_SYNC` (or `O_DIRECT | O_SYNC` with `--direct-io`; uses `posix_memalign` for aligned buffers). `SharedRegion` is a `#[repr(C)]` struct with atomic counters laid out for cross-process mmap. Per-worker counter slots are cache-line-aligned (64 bytes each) to eliminate false sharing. Workers only write to their own per-worker slot during measurement; aggregate totals are summed from per-worker counters after measurement. Helpers `create_shared_region`/`open_shared_region`/`destroy_shared_region` use `libc::shm_open` + `libc::mmap(MAP_SHARED)`. `run_worker_process` is the child process work loop.
 
 - **`experiments/`** — Experiment orchestration, one file per experiment type:
   - `mod.rs` — `Mode` enum (Threads/Procs), `SaturationExperiment` and `SlackExperiment` config structs.
@@ -80,7 +82,7 @@ Source files in `src/`:
 ## Key Design Details
 
 - Thread-safe coordination via `Arc<AtomicU64>` counters and `Arc<AtomicBool>` shutdown signals (relaxed ordering).
-- Process-based experiments use named POSIX shared memory (`/dev/shm`) for the same atomic counter pattern across process boundaries.
+- Process-based experiments use named POSIX shared memory (`/dev/shm`) for the same atomic counter pattern across process boundaries. Per-worker slots are padded to 64 bytes (one cache line) to eliminate false sharing; workers never write to global counters during measurement.
 - Configurable warmup before each measurement (default 1s, tunable via `--warmup`); configurable measurement window (default 5s).
 - Docker compose pins to CPU cores 4-7 (`cpuset` in `compose.yaml`), 8GB memory limit, no network, raised ulimits for high process counts. Adjust `cpuset` for your hardware.
 - I/O scratch files go to `/tmp` (mapped to `./io_scratch` in Docker).

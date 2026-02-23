@@ -9,7 +9,7 @@ Saturator helps answer:
 2. How many processes with a given workload can we add before performance degrades?
 3. Can we model our our system's slack with system tools?
 
-Workload parameters are tunable: CPU buffer size (`--buffer-kb`), I/O buffer size (`--io-buffer-kb`), worker intensity (`--intensity`), and measurement duration/samples. This lets you control how much cache pressure, I/O bandwidth, and context switch overhead each worker generates.
+Workload parameters are tunable: CPU buffer size (`--buffer-kb`), I/O buffer size (`--io-buffer-kb`), worker intensity (`--intensity`), random access patterns (`--random-access`), direct I/O (`--direct-io`), and measurement duration/samples. This lets you control how much cache pressure, I/O bandwidth, and context switch overhead each worker generates.
 
 ## Running
 
@@ -151,6 +151,8 @@ All experiments accept optional flags to control workload parameters.
 | `--step <N>` | 1 | Worker count increment per data point. |
 | `--intensity <F>` | 1.0 | Work probability per iteration (0.0–1.0). Each idle iteration sleeps instead of working. Simulates partially-loaded workers. |
 | `--warmup <N>` | 1 | Warmup duration in seconds before each measurement. |
+| `--random-access` | — | Use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size. |
+| `--direct-io` | — | Use `O_DIRECT \| O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. |
 | `--chain` | — | After a proc saturation experiment finds the saturation point N, automatically runs `find-saturation-intensity-proc` with N base workers. |
 
 Examples:

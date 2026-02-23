@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::constants::*;
-use crate::saturator::{create_shared_region, destroy_shared_region, worker_counters};
+use crate::saturator::{create_shared_region, destroy_shared_region, worker_counters, now_ns};
 use crate::proc_metrics;
 use super::aggregate_samples;
 
@@ -90,14 +90,14 @@ pub fn measure_single_run_proc(
     }
 
     let snap_before = proc_metrics::take_snapshot();
-    // Measure
+    let deadline = now_ns() + duration_secs * 1_000_000_000;
+    region.deadline_ns.store(deadline, Ordering::Relaxed);
+    // Measure — workers self-terminate when clock passes deadline
     std::thread::sleep(Duration::from_secs(duration_secs));
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
 
-    region.running.store(false, Ordering::Relaxed);
-
-    // Reap children so they flush remaining local_ops
+    // Reap children (they already stopped themselves via deadline)
     for mut child in children {
         let _ = child.wait();
     }
@@ -229,11 +229,11 @@ pub fn measure_single_run_proc_mixed_intensity(
     }
 
     let snap_before = proc_metrics::take_snapshot();
+    let deadline = now_ns() + duration_secs * 1_000_000_000;
+    region.deadline_ns.store(deadline, Ordering::Relaxed);
     std::thread::sleep(Duration::from_secs(duration_secs));
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
-
-    region.running.store(false, Ordering::Relaxed);
 
     for mut child in children {
         let _ = child.wait();
@@ -340,11 +340,12 @@ pub fn measure_single_run_proc_slack(
     }
 
     let snap_before = proc_metrics::take_snapshot();
+    let deadline = now_ns() + duration_secs * 1_000_000_000;
+    region.deadline_ns.store(deadline, Ordering::Relaxed);
     std::thread::sleep(Duration::from_secs(duration_secs));
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
 
-    region.running.store(false, Ordering::Relaxed);
     for mut child in children {
         let _ = child.wait();
     }

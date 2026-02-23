@@ -37,12 +37,12 @@ fn main() {
         println!("  --buffer-kb <N>      CPU work buffer size in KB (default: 100)");
         println!("  --io-buffer-kb <N>   IO read/write buffer size in KB (default: 4)");
         println!("  --max-workers <N>    Max worker count (default: parallelism * 16)");
-        println!("  --duration <N>       Measurement duration in seconds (default: 5)");
+        println!("  --duration <N>       Measurement duration in seconds (default: 30)");
         println!("  --samples <N>        Samples per data point, median taken (default: 5)");
         println!("  --step <N>           Worker count increment per data point (default: 1)");
         println!("  --intensity <F>      Work probability per iteration, 0.0-1.0 (default: 1.0)");
         println!("  --chain              Auto-run intensity sweep at saturation point (proc only)");
-        println!("  --warmup <N>         Warmup duration in seconds before measurement (default: 1)");
+        println!("  --warmup <N>         Warmup duration in seconds before measurement (default: 10)");
         println!("  --random-access      Use random buffer access pattern to defeat hardware prefetcher");
         println!("  --direct-io          Use O_DIRECT to bypass page cache for I/O ops");
         println!("");

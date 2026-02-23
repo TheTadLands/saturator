@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -6,18 +6,28 @@ use std::ffi::CString;
 
 use crate::constants::*;
 
+/// Read CLOCK_MONOTONIC and return nanoseconds. This is a vDSO call on Linux (~20ns).
+pub fn now_ns() -> u64 {
+    unsafe {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr());
+        let ts = ts.assume_init();
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+}
+
 /// Tuning parameters that affect contention behavior
 #[derive(Debug, Clone, Copy)]
 pub struct TuningParams {
     pub buffer_kb: usize,     // CPU work buffer size in KB (default: 100)
     pub io_buffer_kb: usize,  // IO read/write buffer size in KB (default: 4)
     pub max_workers: usize,   // maximum thread/process count
-    pub duration_secs: u64,   // measurement duration per data point (default: 5)
+    pub duration_secs: u64,   // measurement duration per data point (default: 30)
     pub samples: usize,       // number of samples per data point, median is taken (default: 5)
     pub step: usize,          // worker count increment per data point (default: 1)
     pub intensity: f64,       // probability of working vs sleeping per iteration (default: 1.0)
     pub chain: bool,          // auto-chain saturation → intensity sweep (default: false)
-    pub warmup_secs: u64,     // warmup duration before measurement in seconds (default: 1)
+    pub warmup_secs: u64,     // warmup duration before measurement in seconds (default: 10)
     pub random_access: bool,  // use random buffer access pattern to defeat prefetcher (default: false)
     pub direct_io: bool,      // use O_DIRECT to bypass page cache for I/O ops (default: false)
 }
@@ -30,12 +40,12 @@ impl Default for TuningParams {
             buffer_kb: 100,
             io_buffer_kb: 4,
             max_workers: parallelism * 4,
-            duration_secs: 5,
+            duration_secs: 30,
             samples: 5,
             step: 1,
             intensity: 1.0,
             chain: false,
-            warmup_secs: 1,
+            warmup_secs: 10,
             random_access: false,
             direct_io: false,
         }
@@ -203,7 +213,7 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize, random_acces
     (cpu_iters, cpu_actual_us, io_iters, io_actual_us)
 }
 
-/// Thread work loop: runs CPU and IO work at the given ratio until `running` is set to false.
+/// Thread work loop: runs CPU and IO work at the given ratio until wall clock passes deadline.
 pub fn run_saturator(
     thread_id: usize,
     io_perc: f64,
@@ -213,7 +223,7 @@ pub fn run_saturator(
     io_buffer_size: usize,
     cpu_ops: Arc<AtomicU64>,
     io_ops: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
+    deadline_ns: Arc<AtomicU64>,
     intensity: f64,
     sleep_us: u64,
     pt_cpu: Arc<AtomicU64>,
@@ -240,7 +250,12 @@ pub fn run_saturator(
     let mut local_sleep_ops = 0u64;
     let mut rng_state = thread_id as u64 + RNG_SEED_OFFSET;
 
-    while running.load(Ordering::Relaxed) {
+    loop {
+        let d = deadline_ns.load(Ordering::Relaxed);
+        if d != 0 && now_ns() >= d {
+            break;
+        }
+
         rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 
@@ -368,8 +383,7 @@ pub struct SharedRegion {
     pub cpu_ops: AtomicU64,
     pub io_ops: AtomicU64,
     pub ready_count: AtomicU64,  // children increment when setup is complete
-    pub running: AtomicBool,
-    _padding: [u8; 7],
+    pub deadline_ns: AtomicU64,  // 0 = no deadline (warmup), >0 = stop when clock >= this
 }
 
 /// Compute shared memory size: header + per-worker counters, rounded up to page size.
@@ -411,7 +425,7 @@ pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegio
         std::ptr::write(&mut (*region).cpu_ops, AtomicU64::new(0));
         std::ptr::write(&mut (*region).io_ops, AtomicU64::new(0));
         std::ptr::write(&mut (*region).ready_count, AtomicU64::new(0));
-        std::ptr::write(&mut (*region).running, AtomicBool::new(true));
+        std::ptr::write(&mut (*region).deadline_ns, AtomicU64::new(0));
 
         // Zero-init per-worker area
         let worker_area = (ptr as *mut u8).add(std::mem::size_of::<SharedRegion>());
@@ -510,7 +524,12 @@ pub fn run_worker_process(
     let mut local_sleep_ops = 0u64;
     let mut rng_state = worker_id as u64 + RNG_SEED_OFFSET;
 
-    while region_ref.running.load(Ordering::Relaxed) {
+    loop {
+        let d = region_ref.deadline_ns.load(Ordering::Relaxed);
+        if d != 0 && now_ns() >= d {
+            break;
+        }
+
         rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 

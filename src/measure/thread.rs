@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::constants::*;
-use crate::saturator::{run_saturator, cpu_work_with_buffer, io_work_with_id};
+use crate::saturator::{run_saturator, cpu_work_with_buffer, io_work_with_id, now_ns};
 use crate::proc_metrics;
 use super::aggregate_samples;
 
@@ -46,7 +46,7 @@ pub fn measure_single_run(
 ) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
     let cpu_ops = Arc::new(AtomicU64::new(0));
     let io_ops = Arc::new(AtomicU64::new(0));
-    let running = Arc::new(AtomicBool::new(true));
+    let deadline_ns = Arc::new(AtomicU64::new(0));
 
     // Per-thread counters: [cpu, io, sleep] per thread
     let per_thread: Vec<[Arc<AtomicU64>; 3]> = (0..thread_count)
@@ -56,7 +56,7 @@ pub fn measure_single_run(
     let mut handles = vec![];
 
     for (i, pt) in per_thread.iter().enumerate() {
-        let running = Arc::clone(&running);
+        let deadline_ns = Arc::clone(&deadline_ns);
         let cpu_ops = Arc::clone(&cpu_ops);
         let io_ops = Arc::clone(&io_ops);
         let pt_cpu   = Arc::clone(&pt[0]);
@@ -65,7 +65,7 @@ pub fn measure_single_run(
 
         let handle = std::thread::spawn(move || {
             run_saturator(i, io_perc, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                          cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
+                          cpu_ops, io_ops, deadline_ns, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
         });
         handles.push(handle);
     }
@@ -81,12 +81,13 @@ pub fn measure_single_run(
     }
 
     let snap_before = proc_metrics::take_snapshot();
-    // Now measure for the actual duration
+    let deadline = now_ns() + duration_secs * 1_000_000_000;
+    deadline_ns.store(deadline, Ordering::Relaxed);
+    // Now measure for the actual duration — workers self-terminate when clock passes deadline
     std::thread::sleep(Duration::from_secs(duration_secs));
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
 
-    running.store(false, Ordering::Relaxed);
     for handle in handles {
         handle.join().unwrap();
     }
@@ -124,7 +125,7 @@ pub fn measure_baseline(
     let samples: Vec<(f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)> = (0..num_samples).map(|_| {
         let cpu_ops = Arc::new(AtomicU64::new(0));
         let io_ops = Arc::new(AtomicU64::new(0));
-        let running = Arc::new(AtomicBool::new(true));
+        let deadline_ns = Arc::new(AtomicU64::new(0));
 
         let per_thread: Vec<[Arc<AtomicU64>; 3]> = (0..threads)
             .map(|_| [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))])
@@ -133,7 +134,7 @@ pub fn measure_baseline(
         let mut handles = vec![];
 
         for (i, pt) in per_thread.iter().enumerate() {
-            let running = Arc::clone(&running);
+            let deadline_ns = Arc::clone(&deadline_ns);
             let cpu_ops = Arc::clone(&cpu_ops);
             let io_ops = Arc::clone(&io_ops);
             let pt_cpu   = Arc::clone(&pt[0]);
@@ -142,7 +143,7 @@ pub fn measure_baseline(
 
             let handle = std::thread::spawn(move || {
                 run_saturator(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                              cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
+                              cpu_ops, io_ops, deadline_ns, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
             });
             handles.push(handle);
         }
@@ -156,12 +157,13 @@ pub fn measure_baseline(
             pt[2].store(0, Ordering::Relaxed);
         }
 
+        let deadline = now_ns() + duration_secs * 1_000_000_000;
+        deadline_ns.store(deadline, Ordering::Relaxed);
         let snap_before = proc_metrics::take_snapshot();
         std::thread::sleep(Duration::from_secs(duration_secs));
         let snap_after = proc_metrics::take_snapshot();
         let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
 
-        running.store(false, Ordering::Relaxed);
         for handle in handles {
             handle.join().unwrap();
         }
@@ -230,7 +232,7 @@ pub fn measure_total_throughput_single(
     let total_threads = baseline_threads + extra_threads;
     let cpu_ops = Arc::new(AtomicU64::new(0));
     let io_ops = Arc::new(AtomicU64::new(0));
-    let running = Arc::new(AtomicBool::new(true));
+    let deadline_ns = Arc::new(AtomicU64::new(0));
 
     let per_thread: Vec<[Arc<AtomicU64>; 3]> = (0..total_threads)
         .map(|_| [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))])
@@ -240,7 +242,7 @@ pub fn measure_total_throughput_single(
 
     // Spawn baseline threads
     for (i, pt) in per_thread[..baseline_threads].iter().enumerate() {
-        let running = Arc::clone(&running);
+        let deadline_ns = Arc::clone(&deadline_ns);
         let cpu_ops = Arc::clone(&cpu_ops);
         let io_ops = Arc::clone(&io_ops);
         let io_ratio = baseline_io_ratio;
@@ -250,14 +252,14 @@ pub fn measure_total_throughput_single(
 
         let handle = std::thread::spawn(move || {
             run_saturator_split(i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
+                                cpu_ops, io_ops, deadline_ns, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
         });
         handles.push(handle);
     }
 
     // Spawn extra threads
     for (i, pt) in per_thread[baseline_threads..].iter().enumerate() {
-        let running = Arc::clone(&running);
+        let deadline_ns = Arc::clone(&deadline_ns);
         let cpu_ops = Arc::clone(&cpu_ops);
         let io_ops = Arc::clone(&io_ops);
         let io_ratio = extra_io_ratio;
@@ -267,7 +269,7 @@ pub fn measure_total_throughput_single(
 
         let handle = std::thread::spawn(move || {
             run_saturator_split(baseline_threads + i, io_ratio, cpu_iterations, io_iterations, buffer_size, io_buffer_size,
-                                cpu_ops, io_ops, running, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
+                                cpu_ops, io_ops, deadline_ns, intensity, sleep_us, pt_cpu, pt_io, pt_sleep, random_access, direct_io);
         });
         handles.push(handle);
     }
@@ -283,12 +285,13 @@ pub fn measure_total_throughput_single(
     }
 
     let snap_before = proc_metrics::take_snapshot();
-    // Measure
+    let deadline = now_ns() + duration_secs * 1_000_000_000;
+    deadline_ns.store(deadline, Ordering::Relaxed);
+    // Measure — workers self-terminate when clock passes deadline
     std::thread::sleep(Duration::from_secs(duration_secs));
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
 
-    running.store(false, Ordering::Relaxed);
     for handle in handles {
         handle.join().unwrap();
     }
@@ -317,7 +320,7 @@ pub fn run_saturator_split(
     io_buffer_size: usize,
     cpu_ops: Arc<AtomicU64>,
     io_ops: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
+    deadline_ns: Arc<AtomicU64>,
     intensity: f64,
     sleep_us: u64,
     pt_cpu: Arc<AtomicU64>,
@@ -340,7 +343,12 @@ pub fn run_saturator_split(
     let mut local_io_ops = 0u64;
     let mut local_sleep_ops = 0u64;
 
-    while running.load(Ordering::Relaxed) {
+    loop {
+        let d = deadline_ns.load(Ordering::Relaxed);
+        if d != 0 && now_ns() >= d {
+            break;
+        }
+
         rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 

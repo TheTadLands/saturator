@@ -42,6 +42,8 @@ There are no tests or lints configured.
 - `--intensity <F>` — work probability per iteration, 0.0–1.0 (default: 1.0). Idle iterations sleep for `target_us` μs.
 - `--chain` — after a proc saturation experiment finds the saturation point N, automatically run `find-saturation-intensity-proc` with N base workers.
 - `--warmup <N>` — warmup duration in seconds before each measurement (default: 1). Longer warmup useful for cold caches or heavy I/O workloads.
+- `--random-access` — use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size.
+- `--direct-io` — use `O_DIRECT | O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. Requires page-aligned buffers (handled automatically via `posix_memalign`).
 
 ### Plotting
 
@@ -53,21 +55,35 @@ Process-based experiments (`-proc` variants) produce a per-worker throughput CSV
 
 ## Architecture
 
-Four source files in `src/`:
+Source files in `src/`:
 
-- **`main.rs`** — CLI argument parsing and experiment orchestration. Parses tuning flags into `TuningParams`, runs calibration, dispatches to experiment functions. Thread experiments use `Arc<AtomicU64>` for shared counters. Process experiments use `measure_single_run_proc` which creates named shared memory, spawns child processes via `Command::new(current_exe()).arg("__worker")`, and collects throughput. The hidden `__worker` subcommand is the child process entry point. All measurements compute median and stddev across configurable sample count (default 3). Stddev is written to CSV output for visualization as error bars.
+- **`main.rs`** — CLI argument parsing, `__worker` child process dispatch, and experiment dispatch via match. Parses tuning flags into `TuningParams`, runs calibration, then delegates to experiment functions.
 
-- **`saturator.rs`** — Core workload engine and shared memory infrastructure. `TuningParams` controls calibration target, buffer size, max workers, duration, and intensity. Calibrates CPU and I/O operations using binary search (configurable target, default ~50μs). CPU work = hash computation over a configurable buffer. I/O work = read/write/seek with `O_SYNC`. `SharedRegion` is a `#[repr(C)]` struct with atomic counters laid out for cross-process mmap. Helpers `create_shared_region`/`open_shared_region`/`destroy_shared_region` use `libc::shm_open` + `libc::mmap(MAP_SHARED)`. `run_worker_process` is the child process work loop. Uses batched atomic counter updates (every 100 ops) to reduce contention.
+- **`constants.rs`** — Named constants for magic numbers used throughout: RNG parameters (PCG multiplier, seed offset), CPU work parameters (buffer stride, hash multipliers, unroll factor), calibration sample counts and tolerances, shared memory layout sizes, and batch flush threshold.
 
-- **`visualize.rs`** — CSV writer for saturation and slack result types. Saturation CSV includes `throughput_stddev` column; slack CSV includes `cpu_ops_stddev` and `io_ops_stddev` columns.
+- **`saturator.rs`** — Core workload engine and shared memory infrastructure. `TuningParams` controls calibration target, buffer size, max workers, duration, intensity, random access pattern, and direct I/O mode. Calibrates CPU and I/O operations using binary search (configurable target, default ~50μs). CPU work = hash computation over a configurable buffer (sequential stride by default, hash-derived random offsets with `--random-access`). I/O work = write with `O_SYNC` (or `O_DIRECT | O_SYNC` with `--direct-io`; uses `posix_memalign` for aligned buffers). `SharedRegion` is a `#[repr(C)]` struct with atomic counters laid out for cross-process mmap. Per-worker counter slots are cache-line-aligned (64 bytes each) to eliminate false sharing. Workers only write to their own per-worker slot during measurement; aggregate totals are summed from per-worker counters after measurement. Helpers `create_shared_region`/`open_shared_region`/`destroy_shared_region` use `libc::shm_open` + `libc::mmap(MAP_SHARED)`. `run_worker_process` is the child process work loop.
 
-- **`proc_metrics.rs`** — System metrics collector. Reads `/proc/stat` and `/proc/vmstat` snapshots to compute CPU utilization, iowait percentage, and context switch rates during measurement windows. Provides `SystemMetrics` struct and CSV output helpers.
+- **`experiments/`** — Experiment orchestration, one file per experiment type:
+  - `mod.rs` — `Mode` enum (Threads/Procs), `SaturationExperiment` and `SlackExperiment` config structs.
+  - `saturation.rs` — `run_saturation_experiment()`: incremental workers until throughput plateaus/degrades.
+  - `slack.rs` — `run_slack_experiment()`: baseline threads + extra threads at different I/O ratios.
+  - `intensity.rs` — `run_intensity_sweep_experiment()`: sweep probe worker intensity 0.0–1.0.
+  - `slack_proc.rs` — `run_slack_proc_experiment()`: process-based slack with baseline + extra workers.
+
+- **`measure/`** — Measurement infrastructure:
+  - `mod.rs` — Shared utilities: `median()`, `stddev()`, `timestamp()`, `write_params_file()`, `cleanup_scratch_files()`, `aggregate_samples()`.
+  - `thread.rs` — Thread-based measurements: `measure_single_run()`, `measure_thread_throughput()`, `measure_baseline()`, `measure_total_throughput()`, `run_saturator_split()`.
+  - `proc.rs` — Process-based measurements: `measure_single_run_proc()`, `measure_proc_throughput()`, `measure_single_run_proc_mixed_intensity()`, `measure_proc_slack()`.
+
+- **`visualize.rs`** — CSV writer for saturation result types. Saturation CSV includes `throughput_stddev` column; slack CSV includes `cpu_ops_stddev` and `io_ops_stddev` columns.
+
+- **`proc_metrics.rs`** — System metrics collector. Reads cgroup CPU/IO stats and PSI pressure to compute CPU utilization, IO bandwidth utilization, and pressure stall percentages during measurement windows. Provides `SystemMetrics` struct and CSV output helpers.
 
 ## Key Design Details
 
 - Thread-safe coordination via `Arc<AtomicU64>` counters and `Arc<AtomicBool>` shutdown signals (relaxed ordering).
-- Process-based experiments use named POSIX shared memory (`/dev/shm`) for the same atomic counter pattern across process boundaries.
+- Process-based experiments use named POSIX shared memory (`/dev/shm`) for the same atomic counter pattern across process boundaries. Per-worker slots are padded to 64 bytes (one cache line) to eliminate false sharing; workers never write to global counters during measurement.
 - Configurable warmup before each measurement (default 1s, tunable via `--warmup`); configurable measurement window (default 5s).
 - Docker compose pins to CPU cores 4-7 (`cpuset` in `compose.yaml`), 8GB memory limit, no network, raised ulimits for high process counts. Adjust `cpuset` for your hardware.
 - I/O scratch files go to `/tmp` (mapped to `./io_scratch` in Docker).
-- Rust edition 2024; dependencies: `rand`, `libc`, `serde`, `serde_json`.
+- Rust edition 2024; dependencies: `libc`.

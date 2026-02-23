@@ -4,6 +4,8 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::ffi::CString;
 
+use crate::constants::*;
+
 /// Tuning parameters that affect contention behavior
 #[derive(Debug, Clone, Copy)]
 pub struct TuningParams {
@@ -16,6 +18,8 @@ pub struct TuningParams {
     pub intensity: f64,       // probability of working vs sleeping per iteration (default: 1.0)
     pub chain: bool,          // auto-chain saturation → intensity sweep (default: false)
     pub warmup_secs: u64,     // warmup duration before measurement in seconds (default: 1)
+    pub random_access: bool,  // use random buffer access pattern to defeat prefetcher (default: false)
+    pub direct_io: bool,      // use O_DIRECT to bypass page cache for I/O ops (default: false)
 }
 
 impl Default for TuningParams {
@@ -32,6 +36,8 @@ impl Default for TuningParams {
             intensity: 1.0,
             chain: false,
             warmup_secs: 1,
+            random_access: false,
+            direct_io: false,
         }
     }
 }
@@ -59,15 +65,16 @@ impl CalibrationResult {
     }
 }
 
+/// Run multi-pass calibration to find CPU and IO iteration counts that produce matched timings.
 pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
-    println!("  Running calibration (3 passes, targeting <5% gap)...");
+    println!("  Running calibration ({} passes, targeting <5% gap)...", CALIBRATION_PASSES);
 
     let buffer_size = params.buffer_kb * 1024;
     let io_buffer_size = params.io_buffer_kb * 1024;
     let mut results = Vec::new();
 
-    for pass in 0..3 {
-        let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass(buffer_size, io_buffer_size);
+    for pass in 0..CALIBRATION_PASSES {
+        let (cpu_iters, cpu_us, io_iters, io_us) = calibrate_single_pass(buffer_size, io_buffer_size, params.random_access, params.direct_io);
         let gap_pct = if cpu_us > io_us {
             ((cpu_us - io_us) as f64 / io_us as f64) * 100.0
         } else {
@@ -80,7 +87,7 @@ pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
 
     // Take median based on CPU iterations
     results.sort_by_key(|(cpu_iters, _, _, _)| *cpu_iters);
-    let (cpu_iters, cpu_us, io_iters, io_us) = results[1]; // median
+    let (cpu_iters, cpu_us, io_iters, io_us) = results[results.len() / 2];
 
     let gap_pct = if cpu_us > io_us {
         ((cpu_us - io_us) as f64 / io_us as f64) * 100.0
@@ -102,18 +109,23 @@ pub fn calibrate_operations_full(params: &TuningParams) -> CalibrationResult {
     }
 }
 
-fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u128, usize, u128) {
+fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize, random_access: bool, direct_io: bool) -> (usize, u128, usize, u128) {
 
     // Measure a single IO operation (O_SYNC write) directly
     let (io_iters, io_actual_us) = {
         let path = "/tmp/saturator_calibrate";
         let _ = std::fs::write(path, vec![0u8; io_buffer_size]);
-        let io_buf = vec![0u8; io_buffer_size];
+        let io_buf: &[u8] = if direct_io {
+            alloc_aligned_io_buf(io_buffer_size)
+        } else {
+            // Leak a regular vec to get a &'static [u8] — calibration runs once
+            Vec::leak(vec![0u8; io_buffer_size])
+        };
 
-        let samples = 100;
+        let samples = CALIBRATION_IO_SAMPLES;
         let start = std::time::Instant::now();
         for _ in 0..samples {
-            do_io_work_counted(path, 1, &io_buf);
+            do_io_work_counted(path, 1, io_buf, direct_io);
         }
         let actual_us = (start.elapsed().as_micros() / samples as u128).max(1);
         let _ = std::fs::remove_file(path);
@@ -129,9 +141,9 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
         // First, get close with scaling
         loop {
             let start = std::time::Instant::now();
-            let samples = 200; // More samples for precision
+            let samples = CALIBRATION_CPU_SCALING_SAMPLES;
             for _ in 0..samples {
-                do_cpu_work(&buffer, iters);
+                do_cpu_work(&buffer, iters, random_access);
             }
             let actual_us = start.elapsed().as_micros() / samples as u128;
 
@@ -142,27 +154,27 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
             let scale = (target_cpu_us / actual_us.max(1)).max(2) as usize;
             iters *= scale;
 
-            if iters > 1_000_000 {
+            if iters > CALIBRATION_MAX_CPU_ITERS {
                 break;
             }
         }
 
-        // Fine-tune with binary search to get within 2%
+        // Fine-tune with binary search to get within tolerance
         let mut low = iters / 2;
         let mut high = iters * 2;
-        let lower_bound = target_cpu_us * 98 / 100;
-        let upper_bound = target_cpu_us * 102 / 100;
+        let lower_bound = target_cpu_us * (100 - CALIBRATION_TOLERANCE_PCT) / 100;
+        let upper_bound = target_cpu_us * (100 + CALIBRATION_TOLERANCE_PCT) / 100;
 
-        for _ in 0..40 {
+        for _ in 0..CALIBRATION_MAX_SEARCH_ITERS {
             let mid = (low + high) / 2;
             if mid == low || mid == high {
                 break;
             }
 
             let start = std::time::Instant::now();
-            let samples = 500;
+            let samples = CALIBRATION_CPU_SEARCH_SAMPLES;
             for _ in 0..samples {
-                do_cpu_work(&buffer, mid);
+                do_cpu_work(&buffer, mid, random_access);
             }
             let actual_us = start.elapsed().as_micros() / samples as u128;
 
@@ -179,9 +191,9 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
 
         // Final measurement with more samples for accuracy
         let start = std::time::Instant::now();
-        let samples = 1000;
+        let samples = CALIBRATION_CPU_FINAL_SAMPLES;
         for _ in 0..samples {
-            do_cpu_work(&buffer, iters);
+            do_cpu_work(&buffer, iters, random_access);
         }
         let actual_us = start.elapsed().as_micros() / samples as u128;
 
@@ -191,6 +203,7 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize) -> (usize, u
     (cpu_iters, cpu_actual_us, io_iters, io_actual_us)
 }
 
+/// Thread work loop: runs CPU and IO work at the given ratio until `running` is set to false.
 pub fn run_saturator(
     thread_id: usize,
     io_perc: f64,
@@ -206,10 +219,16 @@ pub fn run_saturator(
     pt_cpu: Arc<AtomicU64>,
     pt_io: Arc<AtomicU64>,
     pt_sleep: Arc<AtomicU64>,
+    random_access: bool,
+    direct_io: bool,
 ) {
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_{}", thread_id);
-    let io_buf = vec![0u8; io_buffer_size];
+    let io_buf: &[u8] = if direct_io {
+        alloc_aligned_io_buf(io_buffer_size)
+    } else {
+        Vec::leak(vec![0u8; io_buffer_size])
+    };
 
     // Create file for I/O
     if io_perc > 0.0 {
@@ -219,20 +238,20 @@ pub fn run_saturator(
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
     let mut local_sleep_ops = 0u64;
-    let mut rng_state = thread_id as u64 + 12345;
+    let mut rng_state = thread_id as u64 + RNG_SEED_OFFSET;
 
     while running.load(Ordering::Relaxed) {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 
         // Intensity gate: sleep instead of working with probability (1 - intensity)
         if intensity < 1.0 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
             let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
             if intensity_roll >= intensity {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
                 local_sleep_ops += 1;
-                if local_sleep_ops >= 100 {
+                if local_sleep_ops >= BATCH_FLUSH_THRESHOLD {
                     pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
                     local_sleep_ops = 0;
                 }
@@ -241,14 +260,14 @@ pub fn run_saturator(
         }
 
         if rand_f64 < io_perc {
-            do_io_work_counted(&io_path, io_iterations, &io_buf);
+            do_io_work_counted(&io_path, io_iterations, io_buf, direct_io);
             local_io_ops += io_iterations as u64;
         } else {
-            do_cpu_work(&cpu_buffer, cpu_iterations);
+            do_cpu_work(&cpu_buffer, cpu_iterations, random_access);
             local_cpu_ops += cpu_iterations as u64;
         }
 
-        if (local_cpu_ops + local_io_ops) >= 100 {
+        if (local_cpu_ops + local_io_ops) >= BATCH_FLUSH_THRESHOLD {
             cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
             io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
             pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
@@ -274,33 +293,48 @@ pub fn run_saturator(
     let _ = std::fs::remove_file(&io_path);
 }
 
-fn do_cpu_work(buffer: &[u8], iterations: usize) -> u64 {
+fn do_cpu_work(buffer: &[u8], iterations: usize, random_access: bool) -> u64 {
     let mut hash = 0u64;
     let len = buffer.len();
 
     for i in 0..iterations {
-        // Stride through the entire buffer so the full working set stays hot.
-        // With large buffers and many processes, this creates real cache pressure.
-        let offset = (i * 1000) % len;
-        let end = (offset + 1000).min(len);
+        let offset = if random_access {
+            // Use running hash to derive offset — pointer-chasing pattern defeats prefetcher
+            (hash as usize) % len.saturating_sub(CPU_BUFFER_STRIDE).max(1)
+        } else {
+            // Sequential stride — prefetcher-friendly
+            (i * CPU_BUFFER_STRIDE) % len
+        };
+        let end = (offset + CPU_BUFFER_STRIDE).min(len);
         hash = buffer[offset..end].iter().fold(hash, |acc, &b| {
-            acc.wrapping_mul(31).wrapping_add(b as u64)
+            acc.wrapping_mul(HASH_MUL_PRIMARY).wrapping_add(b as u64)
         });
 
-        for j in 0..50 {
-            hash = hash.wrapping_add(j).wrapping_mul(7);
+        for j in 0..CPU_HASH_UNROLL {
+            hash = hash.wrapping_add(j).wrapping_mul(HASH_MUL_SECONDARY);
         }
     }
 
     std::hint::black_box(hash)
 }
 
-fn do_io_work_counted(path: &str, iterations: usize, io_buf: &[u8]) {
+/// Allocate a page-aligned zero buffer (required for O_DIRECT). Never freed.
+pub fn alloc_aligned_io_buf(size: usize) -> &'static [u8] {
+    unsafe {
+        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        let ret = libc::posix_memalign(&mut ptr, 4096, size);
+        assert_eq!(ret, 0, "posix_memalign failed");
+        std::ptr::write_bytes(ptr as *mut u8, 0, size);
+        std::slice::from_raw_parts(ptr as *const u8, size)
+    }
+}
+
+fn do_io_work_counted(path: &str, iterations: usize, io_buf: &[u8], direct_io: bool) {
+    let flags = if direct_io { libc::O_DIRECT | libc::O_SYNC } else { libc::O_SYNC };
     for _ in 0..iterations {
-        // O_SYNC write — blocks until data hits disk
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .write(true)
-            .custom_flags(libc::O_SYNC)
+            .custom_flags(flags)
             .open(path)
         {
             let _ = file.write_all(io_buf);
@@ -308,11 +342,13 @@ fn do_io_work_counted(path: &str, iterations: usize, io_buf: &[u8]) {
     }
 }
 
-pub fn cpu_work_with_buffer(buffer: &[u8], iterations: usize) {
-    do_cpu_work(buffer, iterations);
+/// Public wrapper around `do_cpu_work` for use outside the workload loop.
+pub fn cpu_work_with_buffer(buffer: &[u8], iterations: usize, random_access: bool) {
+    do_cpu_work(buffer, iterations, random_access);
 }
 
-pub fn io_work_with_id(thread_id: usize, iterations: usize, io_buf: &[u8]) {
+/// Public wrapper around `do_io_work_counted` that manages a per-thread scratch file.
+pub fn io_work_with_id(thread_id: usize, iterations: usize, io_buf: &[u8], direct_io: bool) {
     let path = format!("/tmp/saturator_io_{}", thread_id);
 
     // Create file once if it doesn't exist
@@ -320,11 +356,12 @@ pub fn io_work_with_id(thread_id: usize, iterations: usize, io_buf: &[u8]) {
         let _ = std::fs::write(&path, vec![0u8; io_buf.len()]);
     }
 
-    do_io_work_counted(&path, iterations, io_buf);
+    do_io_work_counted(&path, iterations, io_buf, direct_io);
 }
 
 // --- Shared memory infrastructure for process-based experiments ---
 
+/// Cross-process shared memory region with atomic counters for throughput tracking.
 #[repr(C)]
 pub struct SharedRegion {
     pub total_ops: AtomicU64,
@@ -335,15 +372,15 @@ pub struct SharedRegion {
     _padding: [u8; 7],
 }
 
-/// Compute shared memory size: header + per-worker counters (3 x AtomicU64 each), rounded up to page size
+/// Compute shared memory size: header + per-worker counters, rounded up to page size.
 fn shm_size_for_workers(max_workers: usize) -> usize {
     let header = std::mem::size_of::<SharedRegion>();
-    let per_worker = max_workers * 24; // 3 x AtomicU64 (8 bytes each) per worker: cpu, io, sleep
+    let per_worker = max_workers * SHM_BYTES_PER_WORKER;
     let total = header + per_worker;
-    // Round up to page boundary (4096)
-    (total + 4095) & !4095
+    (total + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
+/// Create a named POSIX shared memory region for `max_workers` workers. Returns (pointer, fd).
 pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegion, i32) {
     let size = shm_size_for_workers(max_workers);
     unsafe {
@@ -378,12 +415,13 @@ pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegio
 
         // Zero-init per-worker area
         let worker_area = (ptr as *mut u8).add(std::mem::size_of::<SharedRegion>());
-        std::ptr::write_bytes(worker_area, 0, max_workers * 24);
+        std::ptr::write_bytes(worker_area, 0, max_workers * SHM_BYTES_PER_WORKER);
 
         (region, fd)
     }
 }
 
+/// Open an existing named shared memory region (used by child processes).
 pub fn open_shared_region(name: &str, max_workers: usize) -> *mut SharedRegion {
     let size = shm_size_for_workers(max_workers);
     unsafe {
@@ -406,6 +444,7 @@ pub fn open_shared_region(name: &str, max_workers: usize) -> *mut SharedRegion {
     }
 }
 
+/// Unmap and unlink a shared memory region, closing the file descriptor.
 pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_workers: usize) {
     let size = shm_size_for_workers(max_workers);
     unsafe {
@@ -424,7 +463,7 @@ pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_wo
 pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&'static AtomicU64, &'static AtomicU64, &'static AtomicU64) {
     unsafe {
         let base = (region as *mut u8).add(std::mem::size_of::<SharedRegion>());
-        let slot = base.add(worker_id * 24);
+        let slot = base.add(worker_id * SHM_BYTES_PER_WORKER);
         let cpu   = &*(slot as *const AtomicU64);
         let io    = &*((slot.add(8))  as *const AtomicU64);
         let sleep = &*((slot.add(16)) as *const AtomicU64);
@@ -444,6 +483,8 @@ pub fn run_worker_process(
     intensity: f64,
     sleep_us: u64,
     max_workers: usize,
+    random_access: bool,
+    direct_io: bool,
 ) {
     let region = open_shared_region(shm_name, max_workers);
     let region_ref = unsafe { &*region };
@@ -451,7 +492,11 @@ pub fn run_worker_process(
 
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_proc_{}", worker_id);
-    let io_buf = vec![0u8; io_buffer_size];
+    let io_buf: &[u8] = if direct_io {
+        alloc_aligned_io_buf(io_buffer_size)
+    } else {
+        Vec::leak(vec![0u8; io_buffer_size])
+    };
 
     if io_perc > 0.0 {
         let _ = std::fs::write(&io_path, vec![0u8; io_buffer_size]);
@@ -463,20 +508,20 @@ pub fn run_worker_process(
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
     let mut local_sleep_ops = 0u64;
-    let mut rng_state = worker_id as u64 + 12345;
+    let mut rng_state = worker_id as u64 + RNG_SEED_OFFSET;
 
     while region_ref.running.load(Ordering::Relaxed) {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 
         // Intensity gate: sleep instead of working with probability (1 - intensity)
         if intensity < 1.0 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
             let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
             if intensity_roll >= intensity {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
                 local_sleep_ops += 1;
-                if local_sleep_ops >= 100 {
+                if local_sleep_ops >= BATCH_FLUSH_THRESHOLD {
                     wk_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
                     local_sleep_ops = 0;
                 }
@@ -485,16 +530,14 @@ pub fn run_worker_process(
         }
 
         if rand_f64 < io_perc {
-            do_io_work_counted(&io_path, io_iterations, &io_buf);
+            do_io_work_counted(&io_path, io_iterations, io_buf, direct_io);
             local_io_ops += io_iterations as u64;
         } else {
-            do_cpu_work(&cpu_buffer, cpu_iterations);
+            do_cpu_work(&cpu_buffer, cpu_iterations, random_access);
             local_cpu_ops += cpu_iterations as u64;
         }
 
-        if (local_cpu_ops + local_io_ops) >= 100 {
-            region_ref.cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
-            region_ref.io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
+        if (local_cpu_ops + local_io_ops) >= BATCH_FLUSH_THRESHOLD {
             wk_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
             wk_io.fetch_add(local_io_ops, Ordering::Relaxed);
             local_cpu_ops = 0;
@@ -503,11 +546,9 @@ pub fn run_worker_process(
     }
 
     if local_cpu_ops > 0 {
-        region_ref.cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
         wk_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
     }
     if local_io_ops > 0 {
-        region_ref.io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
         wk_io.fetch_add(local_io_ops, Ordering::Relaxed);
     }
     if local_sleep_ops > 0 {

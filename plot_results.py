@@ -62,7 +62,7 @@ def plot_saturation(csv_path: str):
     name = Path(csv_path).stem
     folder = str(Path(csv_path).parent)
     label, mode, mode_plural, x_label = detect_experiment(name)
-    x = df['threads']
+    x = df['workers']
 
     # Support both old (throughput_ops_sec) and new (cpu_ops_sec/io_ops_sec) CSV formats
     has_split = 'cpu_ops_sec' in df.columns and 'io_ops_sec' in df.columns
@@ -84,7 +84,7 @@ def plot_saturation(csv_path: str):
 
     # 1. Throughput breakdown (CPU + IO)
     peak_idx = df[primary_col].idxmax()
-    peak_label = f'Peak: {df.loc[peak_idx, "threads"]} {mode_plural.lower()}'
+    peak_label = f'Peak: {df.loc[peak_idx, "workers"]} {mode_plural.lower()}'
     if has_split:
         has_cpu = df['cpu_ops_sec'].max() > 0
         has_io = df['io_ops_sec'].max() > 0
@@ -98,7 +98,7 @@ def plot_saturation(csv_path: str):
                             yerr=df['cpu_ops_stddev'] if has_cpu_stddev else None,
                             fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
                             capsize=3, capthick=1, label='CPU ops/s')
-            peak_x = df.loc[peak_idx, 'threads']
+            peak_x = df.loc[peak_idx, 'workers']
             ax_cpu.axvline(x=peak_x, color=C_RED, linestyle='--', alpha=0.7, label=peak_label)
             if primary_col == 'cpu_ops_sec':
                 ax_cpu.scatter([peak_x], [df.loc[peak_idx, primary_col]],
@@ -135,9 +135,9 @@ def plot_saturation(csv_path: str):
             fig, ax = plt.subplots(figsize=(8, 5))
             ax.errorbar(x, df[col], yerr=stddev, fmt='-o', color=C_BLUE,
                         linewidth=2, markersize=6, capsize=3, capthick=1, label=col_label)
-            ax.axvline(x=df.loc[peak_idx, 'threads'], color=C_RED, linestyle='--', alpha=0.7,
+            ax.axvline(x=df.loc[peak_idx, 'workers'], color=C_RED, linestyle='--', alpha=0.7,
                        label=peak_label)
-            ax.scatter([df.loc[peak_idx, 'threads']], [df.loc[peak_idx, primary_col]],
+            ax.scatter([df.loc[peak_idx, 'workers']], [df.loc[peak_idx, primary_col]],
                        color=C_RED, s=100, zorder=5)
             ax.set_xlabel(x_label)
             ax.set_ylabel(f'{col_label} (ops/sec)')
@@ -153,9 +153,9 @@ def plot_saturation(csv_path: str):
         yerr = df.get('throughput_stddev')
         ax.errorbar(x, df['total_ops'], yerr=yerr, fmt='-o', color=C_BLUE,
                     linewidth=2, markersize=6, capsize=3, capthick=1)
-        ax.axvline(x=df.loc[peak_idx, 'threads'], color=C_RED, linestyle='--', alpha=0.7,
+        ax.axvline(x=df.loc[peak_idx, 'workers'], color=C_RED, linestyle='--', alpha=0.7,
                    label=peak_label)
-        ax.scatter([df.loc[peak_idx, 'threads']], [df.loc[peak_idx, primary_col]],
+        ax.scatter([df.loc[peak_idx, 'workers']], [df.loc[peak_idx, primary_col]],
                    color=C_RED, s=100, zorder=5)
         ax.set_xlabel(x_label)
         ax.set_ylabel('Throughput (ops/sec)')
@@ -170,10 +170,10 @@ def plot_saturation(csv_path: str):
 
     # 2. Per-worker throughput
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(x, df['throughput_per_thread'], '-s', color=C_BLUE,
+    ax.plot(x, df['throughput_per_worker'], '-s', color=C_BLUE,
             linewidth=2, markersize=6)
-    first_tp = df.loc[0, 'throughput_per_thread']
-    last_tp = df.loc[len(df)-1, 'throughput_per_thread']
+    first_tp = df.loc[0, 'throughput_per_worker']
+    last_tp = df.loc[len(df)-1, 'throughput_per_worker']
     drop = (1 - last_tp / first_tp) * 100
     ax.annotate(f'{drop:.0f}% efficiency loss',
                 xy=(x.iloc[-1], last_tp),
@@ -190,7 +190,51 @@ def plot_saturation(csv_path: str):
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
     save_fig(fig, os.path.join(folder, 'throughput_per_worker.png'))
 
-    # 3. CPU & IO utilization vs workers
+    # 3. Delta throughput (marginal gain per additional worker)
+    primary = df[primary_col]
+    delta = primary.diff()
+    # First point has no delta; skip it
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = [C_BLUE if d >= 0 else C_RED for d in delta.iloc[1:]]
+    ax.bar(x.iloc[1:], delta.iloc[1:], color=colors, alpha=0.7, width=0.8)
+    ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+    # Mark where delta first goes negative (saturation onset)
+    neg_idx = delta[delta < 0].first_valid_index()
+    if neg_idx is not None:
+        ax.axvline(x=df.loc[neg_idx, 'workers'], color=C_RED, linestyle='--', alpha=0.7,
+                   label=f'First negative at {df.loc[neg_idx, "workers"]} {mode_plural.lower()}')
+        ax.legend(loc='best', fontsize=9)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(f'\u0394 {primary_label} (ops/sec)')
+    ax.set_title(f'{label} Saturation ({mode_plural}) \u2014 Marginal Throughput Gain')
+    ax.set_xlim(left=1)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(True, alpha=0.3)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    save_fig(fig, os.path.join(folder, 'delta_throughput.png'))
+
+    # 4. Scaling efficiency: T(p) / (p * T(1))
+    t1 = primary.iloc[0]
+    if t1 > 0:
+        efficiency = primary / (x * t1) * 100
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(x, efficiency, '-o', color=C_BLUE, linewidth=2, markersize=6)
+        ax.axhline(y=100, color='gray', linestyle='--', alpha=0.5, label='Ideal linear scaling')
+        ax.fill_between(x, efficiency, 100,
+                        where=(efficiency <= 100), interpolate=True, alpha=0.15, color=C_RED)
+        ax.fill_between(x, efficiency, 100,
+                        where=(efficiency > 100), interpolate=True, alpha=0.15, color=C_GREEN)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel('Scaling Efficiency (%)')
+        ax.set_title(f'{label} Saturation ({mode_plural}) \u2014 Scaling Efficiency T(p) / (p \u00d7 T(1))')
+        ax.set_ylim(bottom=0)
+        ax.set_xlim(left=1)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        save_fig(fig, os.path.join(folder, 'scaling_efficiency.png'))
+
+    # 5. CPU & IO utilization vs workers
     if 'cpu_pct' in df.columns:
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(x, df['cpu_pct'], '-o', color=C_ORANGE, linewidth=2, markersize=6, label='CPU %')
@@ -206,7 +250,7 @@ def plot_saturation(csv_path: str):
         ax.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(folder, 'utilization.png'))
 
-    # 4. Combined: primary throughput metric + CPU% on dual axes
+    # 6. Combined: primary throughput metric + CPU% on dual axes
     if 'cpu_pct' in df.columns:
         fig, ax1 = plt.subplots(figsize=(8, 5))
         line_throughput = ax1.plot(x, df[primary_col], '-o', color=C_BLUE, linewidth=2,
@@ -233,7 +277,7 @@ def plot_saturation(csv_path: str):
         ax1.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(folder, 'throughput_vs_cpu.png'))
 
-    # 5. Throughput (% of peak) vs utilization split by resource (CPU subplot + IO subplot)
+    # 7. Throughput (% of peak) vs utilization split by resource (CPU subplot + IO subplot)
     if 'cpu_pct' in df.columns:
         has_io_util = 'io_util_pct' in df.columns and df['io_util_pct'].max() > 1
 

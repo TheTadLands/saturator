@@ -1,7 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::ffi::CString;
 
 use crate::constants::*;
@@ -124,20 +122,21 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize, random_acces
     // Measure a single IO operation (O_SYNC write) directly
     let (io_iters, io_actual_us) = {
         let path = "/tmp/saturator_calibrate";
-        let _ = std::fs::write(path, vec![0u8; io_buffer_size]);
         let io_buf: &[u8] = if direct_io {
             alloc_aligned_io_buf(io_buffer_size)
         } else {
             // Leak a regular vec to get a &'static [u8] — calibration runs once
             Vec::leak(vec![0u8; io_buffer_size])
         };
+        let mut io = IoState::new(path, io_buffer_size, direct_io);
 
         let samples = CALIBRATION_IO_SAMPLES;
         let start = std::time::Instant::now();
         for _ in 0..samples {
-            do_io_work_counted(path, 1, io_buf, direct_io);
+            do_io_work(&mut io, 1, io_buf);
         }
         let actual_us = (start.elapsed().as_micros() / samples as u128).max(1);
+        drop(io);
         let _ = std::fs::remove_file(path);
         (1usize, actual_us)
     };
@@ -217,33 +216,36 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize, random_acces
 pub fn run_saturator(
     thread_id: usize,
     io_perc: f64,
-    cpu_iterations: usize,
-    io_iterations: usize,
-    buffer_size: usize,
-    io_buffer_size: usize,
     cpu_ops: Arc<AtomicU64>,
     io_ops: Arc<AtomicU64>,
     deadline_ns: Arc<AtomicU64>,
-    intensity: f64,
-    sleep_us: u64,
     pt_cpu: Arc<AtomicU64>,
     pt_io: Arc<AtomicU64>,
     pt_sleep: Arc<AtomicU64>,
-    random_access: bool,
-    direct_io: bool,
+    pt_errors: Arc<AtomicU64>,
+    params: TuningParams,
+    calibration: CalibrationResult,
 ) {
+    let buffer_size = params.buffer_kb * 1024;
+    let io_buffer_size = params.io_buffer_kb * 1024;
+    let cpu_iterations = calibration.cpu_iterations;
+    let io_iterations = calibration.io_iterations;
+    let intensity = params.intensity;
+    let sleep_us = calibration.cpu_us as u64;
+    let random_access = params.random_access;
+    let direct_io = params.direct_io;
+
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_{}", thread_id);
-    let io_buf: &[u8] = if direct_io {
-        alloc_aligned_io_buf(io_buffer_size)
-    } else {
-        Vec::leak(vec![0u8; io_buffer_size])
-    };
+    let aligned_buf = if direct_io { Some(AlignedBuf::new(io_buffer_size)) } else { None };
+    let io_vec = if direct_io { None } else { Some(vec![0u8; io_buffer_size]) };
+    let io_buf: &[u8] = if let Some(ref ab) = aligned_buf { ab.as_slice() } else { io_vec.as_ref().unwrap() };
 
-    // Create file for I/O
-    if io_perc > 0.0 {
-        let _ = std::fs::write(&io_path, vec![0u8; io_buffer_size]);
-    }
+    let mut io_state = if io_perc > 0.0 {
+        Some(IoState::new(&io_path, io_buffer_size, direct_io))
+    } else {
+        None
+    };
 
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
@@ -275,7 +277,9 @@ pub fn run_saturator(
         }
 
         if rand_f64 < io_perc {
-            do_io_work_counted(&io_path, io_iterations, io_buf, direct_io);
+            if let Some(ref mut io) = io_state {
+                do_io_work(io, io_iterations, io_buf);
+            }
             local_io_ops += io_iterations as u64;
         } else {
             do_cpu_work(&cpu_buffer, cpu_iterations, random_access);
@@ -304,7 +308,15 @@ pub fn run_saturator(
         pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
     }
 
-    // Always try to clean up
+    // Store IO error count before dropping IoState
+    if let Some(ref io) = io_state {
+        if io.errors > 0 {
+            pt_errors.fetch_add(io.errors, Ordering::Relaxed);
+        }
+    }
+
+    // Drop IoState (closes fd, warns on errors), then remove the file
+    drop(io_state);
     let _ = std::fs::remove_file(&io_path);
 }
 
@@ -333,7 +345,39 @@ fn do_cpu_work(buffer: &[u8], iterations: usize, random_access: bool) -> u64 {
     std::hint::black_box(hash)
 }
 
+/// RAII wrapper around a page-aligned buffer allocated via `posix_memalign`.
+pub struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedBuf {
+    pub fn new(size: usize) -> Self {
+        unsafe {
+            let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+            let ret = libc::posix_memalign(&mut ptr, 4096, size);
+            assert_eq!(ret, 0, "posix_memalign failed");
+            std::ptr::write_bytes(ptr as *mut u8, 0, size);
+            Self { ptr: ptr as *mut u8, len: size }
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { libc::free(self.ptr as *mut libc::c_void); }
+    }
+}
+
+// Safety: AlignedBuf owns its allocation and is not shared.
+unsafe impl Send for AlignedBuf {}
+
 /// Allocate a page-aligned zero buffer (required for O_DIRECT). Never freed.
+/// Use only where leaking is acceptable (calibration, child processes that exit immediately).
 pub fn alloc_aligned_io_buf(size: usize) -> &'static [u8] {
     unsafe {
         let mut ptr: *mut libc::c_void = std::ptr::null_mut();
@@ -344,34 +388,65 @@ pub fn alloc_aligned_io_buf(size: usize) -> &'static [u8] {
     }
 }
 
-fn do_io_work_counted(path: &str, iterations: usize, io_buf: &[u8], direct_io: bool) {
-    let flags = if direct_io { libc::O_DIRECT | libc::O_SYNC } else { libc::O_SYNC };
-    for _ in 0..iterations {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(flags)
-            .open(path)
-        {
-            let _ = file.write_all(io_buf);
+/// RAII wrapper for an IO scratch file. Opens once, preallocates, writes at advancing offsets.
+pub struct IoState {
+    fd: i32,
+    offset: usize,
+    file_size: usize,
+    block_bytes: usize,
+    pub errors: u64,
+}
+
+impl IoState {
+    pub fn new(path: &str, block_bytes: usize, direct_io: bool) -> Self {
+        if direct_io && block_bytes % 4096 != 0 {
+            panic!(
+                "O_DIRECT requires io-buffer-kb to be a multiple of 4KB, got {} bytes ({} KB). \
+                 Use --io-buffer-kb with a multiple of 4 (e.g. 4, 8, 16).",
+                block_bytes, block_bytes / 1024
+            );
         }
+
+        let file_size = IO_FILE_SIZE_BYTES.max(256 * block_bytes);
+        let mut flags = libc::O_CREAT | libc::O_RDWR | libc::O_SYNC;
+        if direct_io {
+            flags |= libc::O_DIRECT;
+        }
+
+        let c_path = CString::new(path).unwrap();
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o600) };
+        assert!(fd >= 0, "IoState: open({}) failed: {}", path, std::io::Error::last_os_error());
+
+        let ret = unsafe { libc::posix_fallocate(fd, 0, file_size as libc::off_t) };
+        assert_eq!(ret, 0, "IoState: posix_fallocate failed: {}", std::io::Error::last_os_error());
+
+        Self { fd, offset: 0, file_size, block_bytes, errors: 0 }
+    }
+
+    pub fn write_once(&mut self, buf: &[u8]) {
+        let written = unsafe {
+            libc::pwrite(self.fd, buf.as_ptr() as *const libc::c_void, self.block_bytes, self.offset as libc::off_t)
+        };
+        if written < 0 {
+            self.errors += 1;
+        }
+        self.offset = (self.offset + self.block_bytes) % self.file_size;
     }
 }
 
-/// Public wrapper around `do_cpu_work` for use outside the workload loop.
-pub fn cpu_work_with_buffer(buffer: &[u8], iterations: usize, random_access: bool) {
-    do_cpu_work(buffer, iterations, random_access);
+impl Drop for IoState {
+    fn drop(&mut self) {
+        if self.errors > 0 {
+            eprintln!("warning: IoState encountered {} IO errors", self.errors);
+        }
+        unsafe { libc::close(self.fd); }
+    }
 }
 
-/// Public wrapper around `do_io_work_counted` that manages a per-thread scratch file.
-pub fn io_work_with_id(thread_id: usize, iterations: usize, io_buf: &[u8], direct_io: bool) {
-    let path = format!("/tmp/saturator_io_{}", thread_id);
-
-    // Create file once if it doesn't exist
-    if !std::path::Path::new(&path).exists() {
-        let _ = std::fs::write(&path, vec![0u8; io_buf.len()]);
+fn do_io_work(io: &mut IoState, iterations: usize, io_buf: &[u8]) {
+    for _ in 0..iterations {
+        io.write_once(io_buf);
     }
-
-    do_io_work_counted(&path, iterations, io_buf, direct_io);
 }
 
 // --- Shared memory infrastructure for process-based experiments ---
@@ -379,7 +454,6 @@ pub fn io_work_with_id(thread_id: usize, iterations: usize, io_buf: &[u8], direc
 /// Cross-process shared memory region with atomic counters for throughput tracking.
 #[repr(C)]
 pub struct SharedRegion {
-    pub total_ops: AtomicU64,
     pub cpu_ops: AtomicU64,
     pub io_ops: AtomicU64,
     pub ready_count: AtomicU64,  // children increment when setup is complete
@@ -421,7 +495,6 @@ pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegio
 
         let region = ptr as *mut SharedRegion;
         // Initialize all fields
-        std::ptr::write(&mut (*region).total_ops, AtomicU64::new(0));
         std::ptr::write(&mut (*region).cpu_ops, AtomicU64::new(0));
         std::ptr::write(&mut (*region).io_ops, AtomicU64::new(0));
         std::ptr::write(&mut (*region).ready_count, AtomicU64::new(0));
@@ -469,19 +542,20 @@ pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_wo
     }
 }
 
-/// Get per-worker atomic counters (cpu_ops, io_ops, sleep_ops) from the shared region.
-/// Worker counters are laid out after the SharedRegion header: [AtomicU64 cpu, AtomicU64 io, AtomicU64 sleep] per worker.
+/// Get per-worker atomic counters (cpu_ops, io_ops, sleep_ops, io_errors) from the shared region.
+/// Worker counters are laid out after the SharedRegion header: [AtomicU64 cpu, AtomicU64 io, AtomicU64 sleep, AtomicU64 errors] per worker.
 ///
 /// # Safety
 /// Caller must ensure `region` points to a valid shared region with space for `worker_id` workers.
-pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&'static AtomicU64, &'static AtomicU64, &'static AtomicU64) {
+pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&'static AtomicU64, &'static AtomicU64, &'static AtomicU64, &'static AtomicU64) {
     unsafe {
         let base = (region as *mut u8).add(std::mem::size_of::<SharedRegion>());
         let slot = base.add(worker_id * SHM_BYTES_PER_WORKER);
-        let cpu   = &*(slot as *const AtomicU64);
-        let io    = &*((slot.add(8))  as *const AtomicU64);
-        let sleep = &*((slot.add(16)) as *const AtomicU64);
-        (cpu, io, sleep)
+        let cpu    = &*(slot as *const AtomicU64);
+        let io     = &*((slot.add(8))  as *const AtomicU64);
+        let sleep  = &*((slot.add(16)) as *const AtomicU64);
+        let errors = &*((slot.add(24)) as *const AtomicU64);
+        (cpu, io, sleep, errors)
     }
 }
 
@@ -502,7 +576,7 @@ pub fn run_worker_process(
 ) {
     let region = open_shared_region(shm_name, max_workers);
     let region_ref = unsafe { &*region };
-    let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region, worker_id) };
+    let (wk_cpu, wk_io, wk_sleep, wk_errors) = unsafe { worker_counters(region, worker_id) };
 
     let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
     let io_path = format!("/tmp/saturator_proc_{}", worker_id);
@@ -512,9 +586,11 @@ pub fn run_worker_process(
         Vec::leak(vec![0u8; io_buffer_size])
     };
 
-    if io_perc > 0.0 {
-        let _ = std::fs::write(&io_path, vec![0u8; io_buffer_size]);
-    }
+    let mut io_state = if io_perc > 0.0 {
+        Some(IoState::new(&io_path, io_buffer_size, direct_io))
+    } else {
+        None
+    };
 
     // Signal that setup is complete
     region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
@@ -549,7 +625,9 @@ pub fn run_worker_process(
         }
 
         if rand_f64 < io_perc {
-            do_io_work_counted(&io_path, io_iterations, io_buf, direct_io);
+            if let Some(ref mut io) = io_state {
+                do_io_work(io, io_iterations, io_buf);
+            }
             local_io_ops += io_iterations as u64;
         } else {
             do_cpu_work(&cpu_buffer, cpu_iterations, random_access);
@@ -574,5 +652,13 @@ pub fn run_worker_process(
         wk_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
     }
 
+    // Store IO error count before dropping IoState
+    if let Some(ref io) = io_state {
+        if io.errors > 0 {
+            wk_errors.fetch_add(io.errors, Ordering::Relaxed);
+        }
+    }
+
+    drop(io_state);
     let _ = std::fs::remove_file(&io_path);
 }

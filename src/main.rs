@@ -95,14 +95,14 @@ fn main() {
             label: "CPU",
             mode: Mode::Threads,
             io_perc: 0.0,
-            csv_base: "cpu_throughput_vs_threads",
+            csv_base: "cpu_throughput_vs_threads".into(),
             recommendation: Some("find-io-slack"),
         }, calibration, &params); },
         "find-io-saturation" => { run_saturation_experiment(SaturationExperiment {
             label: "I/O",
             mode: Mode::Threads,
             io_perc: 1.0,
-            csv_base: "io_throughput_vs_threads",
+            csv_base: "io_throughput_vs_threads".into(),
             recommendation: Some("find-cpu-slack"),
         }, calibration, &params); },
         "find-slack" => {
@@ -130,7 +130,7 @@ fn main() {
                 label: "CPU",
                 mode: Mode::Procs,
                 io_perc: 0.0,
-                csv_base: "proc_cpu_throughput_vs_workers",
+                csv_base: "proc_cpu_throughput_vs_workers".into(),
                 recommendation: None,
             }, calibration, &params);
             if params.chain {
@@ -145,7 +145,7 @@ fn main() {
                 label: "I/O",
                 mode: Mode::Procs,
                 io_perc: 1.0,
-                csv_base: "proc_io_throughput_vs_workers",
+                csv_base: "proc_io_throughput_vs_workers".into(),
                 recommendation: None,
             }, calibration, &params);
             if params.chain {
@@ -163,12 +163,11 @@ fn main() {
             });
             let io_perc = (io_pct.clamp(0.0, 100.0)) / 100.0;
             let io_pct_int = io_pct as u32;
-            let csv_base = format!("proc_mixed_{}pct_io_throughput_vs_workers", io_pct_int);
             let result = run_saturation_experiment(SaturationExperiment {
                 label: "Mixed",
                 mode: Mode::Procs,
                 io_perc,
-                csv_base: Box::leak(csv_base.into_boxed_str()),
+                csv_base: format!("proc_mixed_{}pct_io_throughput_vs_workers", io_pct_int),
                 recommendation: None,
             }, calibration, &params);
             if params.chain {

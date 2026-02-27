@@ -18,8 +18,6 @@ pub fn run_intensity_sweep_experiment(
     println!("{} base workers at intensity=1.0, io_pct={}%", base_workers, io_pct_int);
     println!("Sweeping 1 probe worker intensity from 0.0 to 1.0\n");
 
-    let sleep_us = calibration.cpu_us as u64;
-
     let run_dir = format!("proc_intensity_sweep_{}base_{}pct_io_{}", base_workers, io_pct_int, timestamp());
     std::fs::create_dir_all(&run_dir).unwrap();
 
@@ -32,7 +30,7 @@ pub fn run_intensity_sweep_experiment(
     let csv_path = format!("{}/proc_intensity_sweep_{}base_{}pct_io.csv", run_dir, base_workers, io_pct_int);
     let mut file = std::fs::File::create(&csv_path).unwrap();
     use std::io::Write as _;
-    writeln!(file, "probe_intensity,workers,cpu_ops_sec,io_ops_sec,total_ops_sec,cpu_ops_stddev,io_ops_stddev,{}",
+    writeln!(file, "probe_intensity,workers,cpu_ops_sec,io_ops_sec,total_ops_sec,cpu_ops_stddev,io_ops_stddev,io_errors,{}",
              proc_metrics::csv_header()).unwrap();
 
     println!("  {:>9} | {:>12} {:>12} {:>12} | {:>6} {:>6}",
@@ -42,15 +40,13 @@ pub fn run_intensity_sweep_experiment(
     let mut best_throughput = 0.0;
     let mut best_intensity = 0.0;
     let total_workers = base_workers + 1;
-    let mut per_worker_rows: Vec<(f64, Vec<(f64, f64, f64)>)> = Vec::new();
+    let mut per_worker_rows: Vec<(f64, Vec<(f64, f64, f64, u64)>)> = Vec::new();
 
     for step in 0..=INTENSITY_SWEEP_STEPS {
         let probe_intensity = step as f64 * (1.0 / INTENSITY_SWEEP_STEPS as f64);
 
         let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_worker) = measure_proc_throughput_mixed_intensity(
-            base_workers, probe_intensity, calibration.cpu_iterations, calibration.io_iterations,
-            params.duration_secs, io_perc, params.buffer_kb, params.io_buffer_kb, params.samples,
-            sleep_us, params.warmup_secs, params.random_access, params.direct_io,
+            base_workers, probe_intensity, io_perc, &calibration, params,
         );
         let total_ops = cpu_ops + io_ops;
 
@@ -58,9 +54,10 @@ pub fn run_intensity_sweep_experiment(
                  probe_intensity, cpu_ops, io_ops, total_ops,
                  metrics.cpu_pct, metrics.io_util_pct);
 
-        writeln!(file, "{:.2},{},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+        let io_errors: u64 = per_worker.iter().map(|w| w.3).sum();
+        writeln!(file, "{:.2},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{}",
                  probe_intensity, total_workers, cpu_ops, io_ops, total_ops,
-                 cpu_stddev, io_stddev, metrics.to_csv_row()).unwrap();
+                 cpu_stddev, io_stddev, io_errors, metrics.to_csv_row()).unwrap();
 
         per_worker_rows.push((probe_intensity, per_worker));
 
@@ -74,10 +71,10 @@ pub fn run_intensity_sweep_experiment(
     {
         let pw_path = format!("{}/per_worker_proc_intensity_sweep_{}base_{}pct_io.csv", run_dir, base_workers, io_pct_int);
         let mut pw_file = std::fs::File::create(&pw_path).unwrap();
-        writeln!(pw_file, "probe_intensity,workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec").unwrap();
+        writeln!(pw_file, "probe_intensity,workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec,io_errors").unwrap();
         for (intensity, per_worker) in &per_worker_rows {
-            for (wid, (wc, wi, ws)) in per_worker.iter().enumerate() {
-                writeln!(pw_file, "{:.2},{},{},{:.2},{:.2},{:.2},{:.2}", intensity, total_workers, wid, wc, wi, ws, wc + wi).unwrap();
+            for (wid, (wc, wi, ws, we)) in per_worker.iter().enumerate() {
+                writeln!(pw_file, "{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{}", intensity, total_workers, wid, wc, wi, ws, wc + wi, we).unwrap();
             }
         }
     }

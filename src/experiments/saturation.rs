@@ -38,7 +38,7 @@ pub fn run_saturation_experiment(
     let mut writer = ResultsWriter::new();
     let mut best_throughput = 0.0;
     let mut saturation_point = params.step;
-    let mut per_worker_rows: Vec<(usize, Vec<(f64, f64, f64)>)> = Vec::new();
+    let mut per_worker_rows: Vec<(usize, Vec<(f64, f64, f64, u64)>)> = Vec::new();
 
     let use_step = matches!(exp.mode, Mode::Procs);
     let mut worker_count = if use_step { params.step } else { 1 };
@@ -50,21 +50,16 @@ pub fn run_saturation_experiment(
     println!("  {}", "-".repeat(82));
 
     while worker_count <= end {
-        let sleep_us = calibration.cpu_us as u64;
         let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_worker_data) = match exp.mode {
             Mode::Threads => {
                 let (c, i, cs, is, m, pw) = measure_thread_throughput(
-                    worker_count, calibration.cpu_iterations, calibration.io_iterations,
-                    params.duration_secs, exp.io_perc, params.buffer_kb * 1024, params.io_buffer_kb * 1024, params.samples,
-                    params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
+                    worker_count, exp.io_perc, &calibration, params,
                 );
                 (c, i, cs, is, m, Some(pw))
             },
             Mode::Procs => {
                 let (c, i, cs, is, m, pw) = measure_proc_throughput(
-                    worker_count, calibration.cpu_iterations, calibration.io_iterations,
-                    params.duration_secs, exp.io_perc, params.buffer_kb, params.io_buffer_kb, params.samples,
-                    params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
+                    worker_count, exp.io_perc, &calibration, params,
                 );
                 (c, i, cs, is, m, Some(pw))
             },
@@ -76,7 +71,8 @@ pub fn run_saturation_experiment(
                  worker_count, cpu_ops, io_ops, total_ops, throughput_per_worker,
                  metrics.cpu_pct, metrics.io_util_pct);
 
-        writer.add_saturation_point(worker_count, cpu_ops, io_ops, cpu_stddev, io_stddev, metrics);
+        let io_errors: u64 = per_worker_data.as_ref().map_or(0, |pw| pw.iter().map(|w| w.3).sum());
+        writer.add_saturation_point(worker_count, cpu_ops, io_ops, cpu_stddev, io_stddev, io_errors, metrics);
 
         if let Some(pw) = per_worker_data {
             per_worker_rows.push((worker_count, pw));
@@ -111,10 +107,10 @@ pub fn run_saturation_experiment(
         use std::io::Write as _;
         let pw_path = format!("{}/per_worker_{}.csv", run_dir, exp.csv_base);
         let mut pw_file = std::fs::File::create(&pw_path).unwrap();
-        writeln!(pw_file, "workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec").unwrap();
+        writeln!(pw_file, "workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec,io_errors").unwrap();
         for (workers, per_worker) in &per_worker_rows {
-            for (wid, (wc, wi, ws)) in per_worker.iter().enumerate() {
-                writeln!(pw_file, "{},{},{:.2},{:.2},{:.2},{:.2}", workers, wid, wc, wi, ws, wc + wi).unwrap();
+            for (wid, (wc, wi, ws, we)) in per_worker.iter().enumerate() {
+                writeln!(pw_file, "{},{},{:.2},{:.2},{:.2},{:.2},{}", workers, wid, wc, wi, ws, wc + wi, we).unwrap();
             }
         }
     }

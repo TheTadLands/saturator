@@ -102,8 +102,8 @@ pub fn cleanup_scratch_files() {
 ///
 /// Selects the per-worker data from the sample whose total throughput is closest to the median.
 pub fn aggregate_samples(
-    samples: Vec<(f64, f64, crate::proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>)>,
-) -> (f64, f64, f64, f64, crate::proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
+    samples: Vec<(f64, f64, crate::proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>)>,
+) -> (f64, f64, f64, f64, crate::proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
     let cpu_vals: Vec<f64> = samples.iter().map(|s| s.0).collect();
     let io_vals: Vec<f64> = samples.iter().map(|s| s.1).collect();
 

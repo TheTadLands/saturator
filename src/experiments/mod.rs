@@ -20,7 +20,7 @@ pub struct SaturationExperiment {
     pub label: &'static str,
     pub mode: Mode,
     pub io_perc: f64,
-    pub csv_base: &'static str,
+    pub csv_base: String,
     pub recommendation: Option<&'static str>,
 }
 

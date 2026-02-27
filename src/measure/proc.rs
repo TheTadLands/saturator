@@ -1,72 +1,52 @@
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::constants::*;
-use crate::saturator::{create_shared_region, destroy_shared_region, worker_counters, now_ns};
+use crate::saturator::{CalibrationResult, TuningParams, create_shared_region, destroy_shared_region, worker_counters, now_ns};
 use crate::proc_metrics;
 use super::aggregate_samples;
 
-/// Collect multiple samples of process-based throughput and return aggregated results.
-pub fn measure_proc_throughput(
-    worker_count: usize,
-    cpu_iterations: usize,
-    io_iterations: usize,
-    duration_secs: u64,
-    io_perc: f64,
-    buffer_kb: usize,
-    io_buffer_kb: usize,
-    num_samples: usize,
-    intensity: f64,
-    sleep_us: u64,
-    warmup_secs: u64,
-    random_access: bool,
-    direct_io: bool,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
-    let samples: Vec<_> = (0..num_samples).map(|_| {
-        measure_single_run_proc(worker_count, cpu_iterations, io_iterations, duration_secs, io_perc, buffer_kb, io_buffer_kb, intensity, sleep_us, warmup_secs, random_access, direct_io)
-    }).collect();
-    aggregate_samples(samples)
+/// Per-worker configuration for a process-based measurement run.
+pub struct WorkerConfig {
+    pub io_perc: f64,
+    pub intensity: f64,
 }
 
-/// Run a single measurement with `worker_count` child processes.
-pub fn measure_single_run_proc(
-    worker_count: usize,
-    cpu_iterations: usize,
-    io_iterations: usize,
-    duration_secs: u64,
-    io_perc: f64,
-    buffer_kb: usize,
-    io_buffer_kb: usize,
-    intensity: f64,
-    sleep_us: u64,
-    warmup_secs: u64,
-    random_access: bool,
-    direct_io: bool,
-) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
-    use std::process::Command;
-
+/// Core lifecycle for process-based measurements: create shm, spawn children, warmup,
+/// measure, reap, collect per-worker counters, destroy shm.
+///
+/// Returns (SystemMetrics, per_worker_rates) where per_worker_rates is a Vec of
+/// (cpu_ops/s, io_ops/s, sleep_ops/s) per worker in spawn order.
+fn run_proc_measurement(
+    workers: &[WorkerConfig],
+    calibration: &CalibrationResult,
+    params: &TuningParams,
+) -> (proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+    let worker_count = workers.len();
     let shm_name = format!("/saturator_{}_{}", std::process::id(), worker_count);
     let (region_ptr, shm_fd) = create_shared_region(&shm_name, worker_count);
     let region = unsafe { &*region_ptr };
 
     let exe = std::env::current_exe().unwrap();
-    let mut children = Vec::new();
+    let sleep_us = calibration.cpu_us as u64;
+    let mut children = Vec::with_capacity(worker_count);
 
-    for i in 0..worker_count {
+    for (i, wc) in workers.iter().enumerate() {
         let child = Command::new(&exe)
             .arg("__worker")
             .arg(&shm_name)
             .arg(i.to_string())
-            .arg(cpu_iterations.to_string())
-            .arg(io_iterations.to_string())
-            .arg(io_perc.to_string())
-            .arg(buffer_kb.to_string())
-            .arg(io_buffer_kb.to_string())
-            .arg(intensity.to_string())
+            .arg(calibration.cpu_iterations.to_string())
+            .arg(calibration.io_iterations.to_string())
+            .arg(wc.io_perc.to_string())
+            .arg(params.buffer_kb.to_string())
+            .arg(params.io_buffer_kb.to_string())
+            .arg(wc.intensity.to_string())
             .arg(sleep_us.to_string())
             .arg(worker_count.to_string())
-            .arg(random_access.to_string())
-            .arg(direct_io.to_string())
+            .arg(params.random_access.to_string())
+            .arg(params.direct_io.to_string())
             .spawn()
             .expect("Failed to spawn worker process");
         children.push(child);
@@ -78,70 +58,75 @@ pub fn measure_single_run_proc(
     }
 
     // Warmup
-    std::thread::sleep(Duration::from_secs(warmup_secs));
+    std::thread::sleep(Duration::from_secs(params.warmup_secs));
     region.cpu_ops.store(0, Ordering::Relaxed);
     region.io_ops.store(0, Ordering::Relaxed);
-    // Reset per-worker counters after warmup
     for i in 0..worker_count {
-        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
+        let (wk_cpu, wk_io, wk_sleep, _wk_errors) = unsafe { worker_counters(region_ptr, i) };
         wk_cpu.store(0, Ordering::Relaxed);
         wk_io.store(0, Ordering::Relaxed);
         wk_sleep.store(0, Ordering::Relaxed);
+        // Don't reset errors — they're cumulative diagnostics
     }
 
     let snap_before = proc_metrics::take_snapshot();
-    let deadline = now_ns() + duration_secs * 1_000_000_000;
+    let deadline = now_ns() + params.duration_secs * 1_000_000_000;
     region.deadline_ns.store(deadline, Ordering::Relaxed);
-    // Measure — workers self-terminate when clock passes deadline
-    std::thread::sleep(Duration::from_secs(duration_secs));
+    std::thread::sleep(Duration::from_secs(params.duration_secs));
     let snap_after = proc_metrics::take_snapshot();
-    let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
+    let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, params.duration_secs as f64);
 
-    // Reap children (they already stopped themselves via deadline)
     for mut child in children {
         let _ = child.wait();
     }
 
-    // Sum per-worker counters (global counters are no longer written by workers)
-    let mut cpu = 0.0_f64;
-    let mut io = 0.0_f64;
+    // Collect per-worker rates
     let mut per_worker = Vec::with_capacity(worker_count);
     for i in 0..worker_count {
-        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
-        let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        cpu += wc;
-        io += wi;
-        per_worker.push((wc, wi, ws));
+        let (wk_cpu, wk_io, wk_sleep, wk_errors) = unsafe { worker_counters(region_ptr, i) };
+        let wc = wk_cpu.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
+        let wi = wk_io.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
+        let ws = wk_sleep.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
+        let we = wk_errors.load(Ordering::Relaxed);
+        per_worker.push((wc, wi, ws, we));
     }
 
     destroy_shared_region(&shm_name, region_ptr, shm_fd, worker_count);
 
+    (metrics, per_worker)
+}
+
+/// Run a single measurement with `worker_count` uniform processes.
+pub fn measure_single_run_proc(
+    worker_count: usize,
+    io_perc: f64,
+    calibration: &CalibrationResult,
+    params: &TuningParams,
+) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+    let workers: Vec<WorkerConfig> = (0..worker_count)
+        .map(|_| WorkerConfig { io_perc, intensity: params.intensity })
+        .collect();
+
+    let (metrics, per_worker) = run_proc_measurement(&workers, calibration, params);
+
+    let (mut cpu, mut io) = (0.0, 0.0);
+    for &(wc, wi, _, _) in &per_worker {
+        cpu += wc;
+        io += wi;
+    }
+
     (cpu, io, metrics, per_worker)
 }
 
-/// Collect multiple samples of mixed-intensity process throughput and return aggregated results.
-pub fn measure_proc_throughput_mixed_intensity(
-    base_workers: usize,
-    probe_intensity: f64,
-    cpu_iterations: usize,
-    io_iterations: usize,
-    duration_secs: u64,
+/// Collect multiple samples of process-based throughput and return aggregated results.
+pub fn measure_proc_throughput(
+    worker_count: usize,
     io_perc: f64,
-    buffer_kb: usize,
-    io_buffer_kb: usize,
-    num_samples: usize,
-    sleep_us: u64,
-    warmup_secs: u64,
-    random_access: bool,
-    direct_io: bool,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
-    let samples: Vec<_> = (0..num_samples).map(|_| {
-        measure_single_run_proc_mixed_intensity(
-            base_workers, probe_intensity, cpu_iterations, io_iterations,
-            duration_secs, io_perc, buffer_kb, io_buffer_kb, sleep_us, warmup_secs, random_access, direct_io,
-        )
+    calibration: &CalibrationResult,
+    params: &TuningParams,
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+    let samples: Vec<_> = (0..params.samples).map(|_| {
+        measure_single_run_proc(worker_count, io_perc, calibration, params)
     }).collect();
     aggregate_samples(samples)
 }
@@ -150,112 +135,40 @@ pub fn measure_proc_throughput_mixed_intensity(
 pub fn measure_single_run_proc_mixed_intensity(
     base_workers: usize,
     probe_intensity: f64,
-    cpu_iterations: usize,
-    io_iterations: usize,
-    duration_secs: u64,
     io_perc: f64,
-    buffer_kb: usize,
-    io_buffer_kb: usize,
-    sleep_us: u64,
-    warmup_secs: u64,
-    random_access: bool,
-    direct_io: bool,
-) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
-    use std::process::Command;
+    calibration: &CalibrationResult,
+    params: &TuningParams,
+) -> (f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+    let mut workers: Vec<WorkerConfig> = (0..base_workers)
+        .map(|_| WorkerConfig { io_perc, intensity: 1.0 })
+        .collect();
+    workers.push(WorkerConfig { io_perc, intensity: probe_intensity });
 
-    let total_workers = base_workers + 1;
-    let shm_name = format!("/saturator_{}_{}", std::process::id(), total_workers);
-    let (region_ptr, shm_fd) = create_shared_region(&shm_name, total_workers);
-    let region = unsafe { &*region_ptr };
+    let (metrics, per_worker) = run_proc_measurement(&workers, calibration, params);
 
-    let exe = std::env::current_exe().unwrap();
-    let mut children = Vec::new();
-
-    // Spawn base workers at intensity=1.0
-    for i in 0..base_workers {
-        let child = Command::new(&exe)
-            .arg("__worker")
-            .arg(&shm_name)
-            .arg(i.to_string())
-            .arg(cpu_iterations.to_string())
-            .arg(io_iterations.to_string())
-            .arg(io_perc.to_string())
-            .arg(buffer_kb.to_string())
-            .arg(io_buffer_kb.to_string())
-            .arg("1.0")
-            .arg(sleep_us.to_string())
-            .arg(total_workers.to_string())
-            .arg(random_access.to_string())
-            .arg(direct_io.to_string())
-            .spawn()
-            .expect("Failed to spawn base worker process");
-        children.push(child);
-    }
-
-    // Spawn 1 probe worker at probe_intensity
-    let child = Command::new(&exe)
-        .arg("__worker")
-        .arg(&shm_name)
-        .arg(base_workers.to_string())
-        .arg(cpu_iterations.to_string())
-        .arg(io_iterations.to_string())
-        .arg(io_perc.to_string())
-        .arg(buffer_kb.to_string())
-        .arg(io_buffer_kb.to_string())
-        .arg(probe_intensity.to_string())
-        .arg(sleep_us.to_string())
-        .arg(total_workers.to_string())
-        .arg(random_access.to_string())
-        .arg(direct_io.to_string())
-        .spawn()
-        .expect("Failed to spawn probe worker process");
-    children.push(child);
-
-    // Wait for all children to finish setup
-    while region.ready_count.load(Ordering::Relaxed) < total_workers as u64 {
-        std::thread::sleep(Duration::from_millis(READY_POLL_INTERVAL_MS));
-    }
-
-    // Warmup
-    std::thread::sleep(Duration::from_secs(warmup_secs));
-    region.cpu_ops.store(0, Ordering::Relaxed);
-    region.io_ops.store(0, Ordering::Relaxed);
-    // Reset per-worker counters after warmup
-    for i in 0..total_workers {
-        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
-        wk_cpu.store(0, Ordering::Relaxed);
-        wk_io.store(0, Ordering::Relaxed);
-        wk_sleep.store(0, Ordering::Relaxed);
-    }
-
-    let snap_before = proc_metrics::take_snapshot();
-    let deadline = now_ns() + duration_secs * 1_000_000_000;
-    region.deadline_ns.store(deadline, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_secs(duration_secs));
-    let snap_after = proc_metrics::take_snapshot();
-    let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
-
-    for mut child in children {
-        let _ = child.wait();
-    }
-
-    // Sum per-worker counters (global counters are no longer written by workers)
-    let mut cpu = 0.0_f64;
-    let mut io = 0.0_f64;
-    let mut per_worker = Vec::with_capacity(total_workers);
-    for i in 0..total_workers {
-        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
-        let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
+    let (mut cpu, mut io) = (0.0, 0.0);
+    for &(wc, wi, _, _) in &per_worker {
         cpu += wc;
         io += wi;
-        per_worker.push((wc, wi, ws));
     }
 
-    destroy_shared_region(&shm_name, region_ptr, shm_fd, total_workers);
-
     (cpu, io, metrics, per_worker)
+}
+
+/// Collect multiple samples of mixed-intensity process throughput and return aggregated results.
+pub fn measure_proc_throughput_mixed_intensity(
+    base_workers: usize,
+    probe_intensity: f64,
+    io_perc: f64,
+    calibration: &CalibrationResult,
+    params: &TuningParams,
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+    let samples: Vec<_> = (0..params.samples).map(|_| {
+        measure_single_run_proc_mixed_intensity(
+            base_workers, probe_intensity, io_perc, calibration, params,
+        )
+    }).collect();
+    aggregate_samples(samples)
 }
 
 /// Run a single measurement of baseline+extra workers with different I/O ratios (process mode).
@@ -264,104 +177,21 @@ pub fn measure_single_run_proc_slack(
     extra_workers: usize,
     baseline_io_perc: f64,
     extra_io_perc: f64,
-    cpu_iterations: usize,
-    io_iterations: usize,
-    duration_secs: u64,
-    buffer_kb: usize,
-    io_buffer_kb: usize,
-    intensity: f64,
-    sleep_us: u64,
-    warmup_secs: u64,
-    random_access: bool,
-    direct_io: bool,
-) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
-    use std::process::Command;
-
-    let total_workers = baseline_workers + extra_workers;
-    let shm_name = format!("/saturator_{}_{}", std::process::id(), total_workers);
-    let (region_ptr, shm_fd) = create_shared_region(&shm_name, total_workers);
-    let region = unsafe { &*region_ptr };
-
-    let exe = std::env::current_exe().unwrap();
-    let mut children = Vec::new();
-
-    for i in 0..baseline_workers {
-        let child = Command::new(&exe)
-            .arg("__worker")
-            .arg(&shm_name)
-            .arg(i.to_string())
-            .arg(cpu_iterations.to_string())
-            .arg(io_iterations.to_string())
-            .arg(baseline_io_perc.to_string())
-            .arg(buffer_kb.to_string())
-            .arg(io_buffer_kb.to_string())
-            .arg(intensity.to_string())
-            .arg(sleep_us.to_string())
-            .arg(total_workers.to_string())
-            .arg(random_access.to_string())
-            .arg(direct_io.to_string())
-            .spawn()
-            .expect("Failed to spawn baseline worker");
-        children.push(child);
+    calibration: &CalibrationResult,
+    params: &TuningParams,
+) -> (f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+    let mut workers: Vec<WorkerConfig> = (0..baseline_workers)
+        .map(|_| WorkerConfig { io_perc: baseline_io_perc, intensity: params.intensity })
+        .collect();
+    for _ in 0..extra_workers {
+        workers.push(WorkerConfig { io_perc: extra_io_perc, intensity: params.intensity });
     }
 
-    for i in 0..extra_workers {
-        let child = Command::new(&exe)
-            .arg("__worker")
-            .arg(&shm_name)
-            .arg((baseline_workers + i).to_string())
-            .arg(cpu_iterations.to_string())
-            .arg(io_iterations.to_string())
-            .arg(extra_io_perc.to_string())
-            .arg(buffer_kb.to_string())
-            .arg(io_buffer_kb.to_string())
-            .arg(intensity.to_string())
-            .arg(sleep_us.to_string())
-            .arg(total_workers.to_string())
-            .arg(random_access.to_string())
-            .arg(direct_io.to_string())
-            .spawn()
-            .expect("Failed to spawn extra worker");
-        children.push(child);
-    }
+    let (metrics, per_worker) = run_proc_measurement(&workers, calibration, params);
 
-    while region.ready_count.load(Ordering::Relaxed) < total_workers as u64 {
-        std::thread::sleep(Duration::from_millis(READY_POLL_INTERVAL_MS));
-    }
-
-    std::thread::sleep(Duration::from_secs(warmup_secs));
-    region.cpu_ops.store(0, Ordering::Relaxed);
-    region.io_ops.store(0, Ordering::Relaxed);
-    for i in 0..total_workers {
-        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
-        wk_cpu.store(0, Ordering::Relaxed);
-        wk_io.store(0, Ordering::Relaxed);
-        wk_sleep.store(0, Ordering::Relaxed);
-    }
-
-    let snap_before = proc_metrics::take_snapshot();
-    let deadline = now_ns() + duration_secs * 1_000_000_000;
-    region.deadline_ns.store(deadline, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_secs(duration_secs));
-    let snap_after = proc_metrics::take_snapshot();
-    let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, duration_secs as f64);
-
-    for mut child in children {
-        let _ = child.wait();
-    }
-
-    let mut baseline_cpu = 0.0_f64;
-    let mut baseline_io = 0.0_f64;
-    let mut extra_cpu = 0.0_f64;
-    let mut extra_io = 0.0_f64;
-    let mut per_worker = Vec::with_capacity(total_workers);
-
-    for i in 0..total_workers {
-        let (wk_cpu, wk_io, wk_sleep) = unsafe { worker_counters(region_ptr, i) };
-        let wc = wk_cpu.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        let wi = wk_io.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        let ws = wk_sleep.load(Ordering::Relaxed) as f64 / duration_secs as f64;
-        per_worker.push((wc, wi, ws));
+    let (mut baseline_cpu, mut baseline_io) = (0.0, 0.0);
+    let (mut extra_cpu, mut extra_io) = (0.0, 0.0);
+    for (i, &(wc, wi, _, _)) in per_worker.iter().enumerate() {
         if i < baseline_workers {
             baseline_cpu += wc;
             baseline_io += wi;
@@ -371,7 +201,6 @@ pub fn measure_single_run_proc_slack(
         }
     }
 
-    destroy_shared_region(&shm_name, region_ptr, shm_fd, total_workers);
     (baseline_cpu, baseline_io, extra_cpu, extra_io, metrics, per_worker)
 }
 
@@ -381,23 +210,13 @@ pub fn measure_proc_slack(
     extra_workers: usize,
     baseline_io_perc: f64,
     extra_io_perc: f64,
-    cpu_iterations: usize,
-    io_iterations: usize,
-    duration_secs: u64,
-    buffer_kb: usize,
-    io_buffer_kb: usize,
-    num_samples: usize,
-    intensity: f64,
-    sleep_us: u64,
-    warmup_secs: u64,
-    random_access: bool,
-    direct_io: bool,
-) -> (f64, f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64)>) {
-    let samples: Vec<_> = (0..num_samples).map(|_| {
+    calibration: &CalibrationResult,
+    params: &TuningParams,
+) -> (f64, f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+    let samples: Vec<_> = (0..params.samples).map(|_| {
         measure_single_run_proc_slack(
             baseline_workers, extra_workers, baseline_io_perc, extra_io_perc,
-            cpu_iterations, io_iterations, duration_secs, buffer_kb, io_buffer_kb,
-            intensity, sleep_us, warmup_secs, random_access, direct_io,
+            calibration, params,
         )
     }).collect();
 

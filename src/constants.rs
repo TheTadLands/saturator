@@ -43,7 +43,7 @@ pub const CALIBRATION_MAX_CPU_ITERS: usize = 1_000_000;
 /// Number of calibration passes; median is taken across passes.
 pub const CALIBRATION_PASSES: usize = 3;
 
-/// Bytes per worker in shared memory layout (3 x AtomicU64: cpu_ops, io_ops, sleep_ops).
+/// Bytes per worker in shared memory layout (4 x AtomicU64: cpu_ops, io_ops, sleep_ops, io_errors).
 /// Padded to 64 bytes (one cache line) to eliminate false sharing between adjacent workers.
 pub const SHM_BYTES_PER_WORKER: usize = 64;
 
@@ -55,3 +55,6 @@ pub const INTENSITY_SWEEP_STEPS: u32 = 20;
 
 /// Poll interval in milliseconds when waiting for child processes to signal ready.
 pub const READY_POLL_INTERVAL_MS: u64 = 10;
+
+/// Default IO file size in bytes for preallocated IO scratch files.
+pub const IO_FILE_SIZE_BYTES: usize = 1024 * 1024;

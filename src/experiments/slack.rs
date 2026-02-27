@@ -1,7 +1,7 @@
 use crate::saturator::{CalibrationResult, TuningParams};
 use crate::proc_metrics;
 use crate::measure::{
-    measure_baseline, measure_total_throughput,
+    measure_thread_throughput, measure_total_throughput,
     timestamp, write_params_file,
 };
 use super::SlackExperiment;
@@ -23,16 +23,9 @@ pub fn run_slack_experiment(
     println!("Baseline: {} {}-only threads", baseline_threads, exp.baseline_label);
     println!("Adding threads at: {:.0}% I/O\n", extra_io_ratio * 100.0);
 
-    let buffer_size = params.buffer_kb * 1024;
-
     println!("Measuring baseline {} throughput...", exp.baseline_label);
-    let sleep_us = calibration.cpu_us as u64;
-    let io_buffer_size = params.io_buffer_kb * 1024;
-    let (baseline_cpu, baseline_io, baseline_cpu_std, baseline_io_std, baseline_metrics, baseline_per_thread) = measure_baseline(
-        baseline_threads, exp.baseline_io_ratio,
-        calibration.cpu_iterations, calibration.io_iterations,
-        params.duration_secs, buffer_size, io_buffer_size, params.samples,
-        params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
+    let (baseline_cpu, baseline_io, baseline_cpu_std, baseline_io_std, baseline_metrics, baseline_per_thread) = measure_thread_throughput(
+        baseline_threads, exp.baseline_io_ratio, &calibration, params,
     );
     let baseline_throughput = if exp.track_io { baseline_io } else { baseline_cpu };
     println!("Baseline: {:.0} {} ops/sec (cpu: {:.0}, io: {:.0})\n",
@@ -81,9 +74,9 @@ pub fn run_slack_experiment(
     let mut pw_file = {
         use std::io::Write as _;
         let mut f = std::fs::File::create(&pw_filename).unwrap();
-        writeln!(f, "extra_threads,total_threads,thread_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec").unwrap();
-        for (tid, (wc, wi, ws)) in baseline_per_thread.iter().enumerate() {
-            writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{:.2}", 0, baseline_threads, tid, wc, wi, ws, wc + wi).unwrap();
+        writeln!(f, "extra_threads,total_threads,thread_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec,io_errors").unwrap();
+        for (tid, (wc, wi, ws, we)) in baseline_per_thread.iter().enumerate() {
+            writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{:.2},{}", 0, baseline_threads, tid, wc, wi, ws, wc + wi, we).unwrap();
         }
         f
     };
@@ -91,8 +84,7 @@ pub fn run_slack_experiment(
     for extra in 1..=max_extra {
         let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_thread) = measure_total_throughput(
             baseline_threads, extra, exp.baseline_io_ratio, extra_io_ratio,
-            calibration.cpu_iterations, calibration.io_iterations, params.duration_secs, buffer_size, io_buffer_size, params.samples,
-            params.intensity, sleep_us, params.warmup_secs, params.random_access, params.direct_io,
+            &calibration, params,
         );
 
         let total_ops = cpu_ops + io_ops;
@@ -111,9 +103,9 @@ pub fn run_slack_experiment(
                  metrics.to_csv_row()).unwrap();
 
         use std::io::Write as _;
-        for (tid, (wc, wi, ws)) in per_thread.iter().enumerate() {
-            writeln!(pw_file, "{},{},{},{:.2},{:.2},{:.2},{:.2}",
-                     extra, baseline_threads + extra, tid, wc, wi, ws, wc + wi).unwrap();
+        for (tid, (wc, wi, ws, we)) in per_thread.iter().enumerate() {
+            writeln!(pw_file, "{},{},{},{:.2},{:.2},{:.2},{:.2},{}",
+                     extra, baseline_threads + extra, tid, wc, wi, ws, wc + wi, we).unwrap();
         }
 
         if tracked_ops > best_tracked_ops {

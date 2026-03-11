@@ -79,6 +79,10 @@ Source files in `src/`:
 
 - **`proc_metrics.rs`** — System metrics collector. Reads cgroup CPU/IO stats and PSI pressure to compute CPU utilization, IO bandwidth utilization, and pressure stall percentages during measurement windows. Provides `SystemMetrics` struct and CSV output helpers.
 
+## External Submodules
+
+- **`iBench/`** — Git submodule containing an external benchmarking tool. Do not modify code in this directory unless explicitly directed to.
+
 ## Key Design Details
 
 - Thread-safe coordination via `Arc<AtomicU64>` counters and `Arc<AtomicBool>` shutdown signals (relaxed ordering).

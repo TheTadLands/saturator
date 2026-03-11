@@ -212,45 +212,29 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize, random_acces
     (cpu_iters, cpu_actual_us, io_iters, io_actual_us)
 }
 
-/// Thread work loop: runs CPU and IO work at the given ratio until wall clock passes deadline.
-pub fn run_saturator(
-    thread_id: usize,
+/// Core work loop shared by thread-based and process-based workers.
+/// Runs CPU/IO work at the given ratio, flushing counters periodically,
+/// until the deadline (read from `deadline_ns`) is reached.
+fn work_loop(
+    deadline_ns: &AtomicU64,
+    cpu_counter: &AtomicU64,
+    io_counter: &AtomicU64,
+    sleep_counter: &AtomicU64,
+    cpu_buffer: &[u8],
+    io_state: &mut Option<IoState>,
+    io_buf: &[u8],
+    cpu_iterations: usize,
+    io_iterations: usize,
     io_perc: f64,
-    cpu_ops: Arc<AtomicU64>,
-    io_ops: Arc<AtomicU64>,
-    deadline_ns: Arc<AtomicU64>,
-    pt_cpu: Arc<AtomicU64>,
-    pt_io: Arc<AtomicU64>,
-    pt_sleep: Arc<AtomicU64>,
-    pt_errors: Arc<AtomicU64>,
-    params: TuningParams,
-    calibration: CalibrationResult,
+    intensity: f64,
+    sleep_us: u64,
+    random_access: bool,
+    rng_seed: u64,
 ) {
-    let buffer_size = params.buffer_kb * 1024;
-    let io_buffer_size = params.io_buffer_kb * 1024;
-    let cpu_iterations = calibration.cpu_iterations;
-    let io_iterations = calibration.io_iterations;
-    let intensity = params.intensity;
-    let sleep_us = calibration.cpu_us as u64;
-    let random_access = params.random_access;
-    let direct_io = params.direct_io;
-
-    let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
-    let io_path = format!("/tmp/saturator_{}", thread_id);
-    let aligned_buf = if direct_io { Some(AlignedBuf::new(io_buffer_size)) } else { None };
-    let io_vec = if direct_io { None } else { Some(vec![0u8; io_buffer_size]) };
-    let io_buf: &[u8] = if let Some(ref ab) = aligned_buf { ab.as_slice() } else { io_vec.as_ref().unwrap() };
-
-    let mut io_state = if io_perc > 0.0 {
-        Some(IoState::new(&io_path, io_buffer_size, direct_io))
-    } else {
-        None
-    };
-
     let mut local_cpu_ops = 0u64;
     let mut local_io_ops = 0u64;
     let mut local_sleep_ops = 0u64;
-    let mut rng_state = thread_id as u64 + RNG_SEED_OFFSET;
+    let mut rng_state = rng_seed;
 
     loop {
         let d = deadline_ns.load(Ordering::Relaxed);
@@ -269,7 +253,7 @@ pub fn run_saturator(
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
                 local_sleep_ops += 1;
                 if local_sleep_ops >= BATCH_FLUSH_THRESHOLD {
-                    pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
+                    sleep_counter.fetch_add(local_sleep_ops, Ordering::Relaxed);
                     local_sleep_ops = 0;
                 }
                 continue;
@@ -277,45 +261,75 @@ pub fn run_saturator(
         }
 
         if rand_f64 < io_perc {
-            if let Some(ref mut io) = io_state {
+            if let Some(io) = io_state {
                 do_io_work(io, io_iterations, io_buf);
             }
             local_io_ops += io_iterations as u64;
         } else {
-            do_cpu_work(&cpu_buffer, cpu_iterations, random_access);
+            do_cpu_work(cpu_buffer, cpu_iterations, random_access);
             local_cpu_ops += cpu_iterations as u64;
         }
 
         if (local_cpu_ops + local_io_ops) >= BATCH_FLUSH_THRESHOLD {
-            cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
-            io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
-            pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
-            pt_io.fetch_add(local_io_ops, Ordering::Relaxed);
+            cpu_counter.fetch_add(local_cpu_ops, Ordering::Relaxed);
+            io_counter.fetch_add(local_io_ops, Ordering::Relaxed);
             local_cpu_ops = 0;
             local_io_ops = 0;
         }
     }
 
     if local_cpu_ops > 0 {
-        cpu_ops.fetch_add(local_cpu_ops, Ordering::Relaxed);
-        pt_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
+        cpu_counter.fetch_add(local_cpu_ops, Ordering::Relaxed);
     }
     if local_io_ops > 0 {
-        io_ops.fetch_add(local_io_ops, Ordering::Relaxed);
-        pt_io.fetch_add(local_io_ops, Ordering::Relaxed);
+        io_counter.fetch_add(local_io_ops, Ordering::Relaxed);
     }
     if local_sleep_ops > 0 {
-        pt_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
+        sleep_counter.fetch_add(local_sleep_ops, Ordering::Relaxed);
     }
+}
 
-    // Store IO error count before dropping IoState
+/// Thread work loop: sets up buffers and IO state, runs the shared work loop,
+/// then records errors and cleans up.
+pub fn run_saturator(
+    thread_id: usize,
+    io_perc: f64,
+    deadline_ns: Arc<AtomicU64>,
+    pt_cpu: Arc<AtomicU64>,
+    pt_io: Arc<AtomicU64>,
+    pt_sleep: Arc<AtomicU64>,
+    pt_errors: Arc<AtomicU64>,
+    params: TuningParams,
+    calibration: CalibrationResult,
+) {
+    let buffer_size = params.buffer_kb * 1024;
+    let io_buffer_size = params.io_buffer_kb * 1024;
+
+    let cpu_buffer: Vec<u8> = (0..buffer_size).map(|i| (i % 256) as u8).collect();
+    let io_path = format!("/tmp/saturator_{}", thread_id);
+    let aligned_buf = if params.direct_io { Some(AlignedBuf::new(io_buffer_size)) } else { None };
+    let io_vec = if params.direct_io { None } else { Some(vec![0u8; io_buffer_size]) };
+    let io_buf: &[u8] = if let Some(ref ab) = aligned_buf { ab.as_slice() } else { io_vec.as_ref().unwrap() };
+
+    let mut io_state = if io_perc > 0.0 {
+        Some(IoState::new(&io_path, io_buffer_size, params.direct_io))
+    } else {
+        None
+    };
+
+    work_loop(
+        &deadline_ns, &pt_cpu, &pt_io, &pt_sleep,
+        &cpu_buffer, &mut io_state, io_buf,
+        calibration.cpu_iterations, calibration.io_iterations,
+        io_perc, params.intensity, calibration.cpu_us as u64,
+        params.random_access, thread_id as u64 + RNG_SEED_OFFSET,
+    );
+
     if let Some(ref io) = io_state {
         if io.errors > 0 {
             pt_errors.fetch_add(io.errors, Ordering::Relaxed);
         }
     }
-
-    // Drop IoState (closes fd, warns on errors), then remove the file
     drop(io_state);
     let _ = std::fs::remove_file(&io_path);
 }
@@ -559,7 +573,8 @@ pub unsafe fn worker_counters(region: *mut SharedRegion, worker_id: usize) -> (&
     }
 }
 
-/// Child process entry point — opens shared memory and runs workload loop
+/// Child process entry point — opens shared memory, runs the shared work loop,
+/// then records errors and cleans up.
 pub fn run_worker_process(
     shm_name: &str,
     worker_id: usize,
@@ -595,70 +610,19 @@ pub fn run_worker_process(
     // Signal that setup is complete
     region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
 
-    let mut local_cpu_ops = 0u64;
-    let mut local_io_ops = 0u64;
-    let mut local_sleep_ops = 0u64;
-    let mut rng_state = worker_id as u64 + RNG_SEED_OFFSET;
+    work_loop(
+        &region_ref.deadline_ns, wk_cpu, wk_io, wk_sleep,
+        &cpu_buffer, &mut io_state, io_buf,
+        cpu_iterations, io_iterations,
+        io_perc, intensity, sleep_us,
+        random_access, worker_id as u64 + RNG_SEED_OFFSET,
+    );
 
-    loop {
-        let d = region_ref.deadline_ns.load(Ordering::Relaxed);
-        if d != 0 && now_ns() >= d {
-            break;
-        }
-
-        rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
-        let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
-
-        // Intensity gate: sleep instead of working with probability (1 - intensity)
-        if intensity < 1.0 {
-            rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
-            let intensity_roll = (rng_state >> 32) as f64 / u32::MAX as f64;
-            if intensity_roll >= intensity {
-                std::thread::sleep(std::time::Duration::from_micros(sleep_us));
-                local_sleep_ops += 1;
-                if local_sleep_ops >= BATCH_FLUSH_THRESHOLD {
-                    wk_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
-                    local_sleep_ops = 0;
-                }
-                continue;
-            }
-        }
-
-        if rand_f64 < io_perc {
-            if let Some(ref mut io) = io_state {
-                do_io_work(io, io_iterations, io_buf);
-            }
-            local_io_ops += io_iterations as u64;
-        } else {
-            do_cpu_work(&cpu_buffer, cpu_iterations, random_access);
-            local_cpu_ops += cpu_iterations as u64;
-        }
-
-        if (local_cpu_ops + local_io_ops) >= BATCH_FLUSH_THRESHOLD {
-            wk_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
-            wk_io.fetch_add(local_io_ops, Ordering::Relaxed);
-            local_cpu_ops = 0;
-            local_io_ops = 0;
-        }
-    }
-
-    if local_cpu_ops > 0 {
-        wk_cpu.fetch_add(local_cpu_ops, Ordering::Relaxed);
-    }
-    if local_io_ops > 0 {
-        wk_io.fetch_add(local_io_ops, Ordering::Relaxed);
-    }
-    if local_sleep_ops > 0 {
-        wk_sleep.fetch_add(local_sleep_ops, Ordering::Relaxed);
-    }
-
-    // Store IO error count before dropping IoState
     if let Some(ref io) = io_state {
         if io.errors > 0 {
             wk_errors.fetch_add(io.errors, Ordering::Relaxed);
         }
     }
-
     drop(io_state);
     let _ = std::fs::remove_file(&io_path);
 }

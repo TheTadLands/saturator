@@ -15,7 +15,7 @@ services:
 
     # Additional isolation
     network_mode: none
-    
+
     # Throttle I/O to simulate spinning disk speeds
     blkio_config:
       device_read_bps:
@@ -30,3 +30,28 @@ services:
       - ./output:/app/output
       - ./io_scratch:/tmp
     working_dir: /app/output
+
+  ibench:
+    build:
+      context: ./iBench
+      dockerfile: Dockerfile
+    cpuset: "4-7"  # Same cores as saturator for fair comparison
+    cpu_shares: 1024
+    mem_limit: 8g
+    mem_reservation: 4g
+    privileged: true
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 16384
+    network_mode: none
+    blkio_config:
+      device_read_bps:
+        - path: /dev/nvme0n1
+          rate: '100mb'
+      device_write_bps:
+        - path: /dev/nvme0n1
+          rate: '100mb'
+    volumes:
+      - ./output:/app/output
+    # entrypoint set in Dockerfile (with umask 0000 for file permissions)

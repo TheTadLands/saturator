@@ -24,6 +24,12 @@ services:
       device_write_bps:
         - path: /dev/nvme0n1
           rate: '100mb'
+      device_read_iops:
+        - path: /dev/nvme0n1
+          rate: 200
+      device_write_iops:
+        - path: /dev/nvme0n1
+          rate: 200
 
     # Use real disk for I/O operations
     volumes:

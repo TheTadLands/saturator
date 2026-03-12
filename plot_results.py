@@ -24,6 +24,7 @@ C_ORANGE = '#E69F00'
 C_GREEN = '#009E73'
 C_RED = '#D55E00'
 C_CYAN = '#56B4E9'
+C_PURPLE = '#CC79A7'
 
 
 def format_number(x):
@@ -239,7 +240,9 @@ def plot_saturation(csv_path: str):
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(x, df['cpu_pct'], '-o', color=C_ORANGE, linewidth=2, markersize=6, label='CPU %')
         if 'io_util_pct' in df.columns:
-            ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO %')
+            ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO BW %')
+        if 'io_iops_util_pct' in df.columns:
+            ax.plot(x, df['io_iops_util_pct'], '-^', color=C_CYAN, linewidth=2, markersize=6, label='IO IOPS %')
         ax.set_xlabel(x_label)
         ax.set_ylabel('Utilization (%)')
         ax.set_title(f'{label} Saturation ({mode_plural}) — Resource Utilization')
@@ -280,6 +283,7 @@ def plot_saturation(csv_path: str):
     # 7. Throughput (% of peak) vs utilization split by resource (CPU subplot + IO subplot)
     if 'cpu_pct' in df.columns:
         has_io_util = 'io_util_pct' in df.columns and df['io_util_pct'].max() > 1
+        has_iops_util = 'io_iops_util_pct' in df.columns and df['io_iops_util_pct'].max() > 1
 
         if has_split:
             cpu_tp = df['cpu_ops_sec']
@@ -292,7 +296,7 @@ def plot_saturation(csv_path: str):
             has_cpu_tp = cpu_tp.max() > 0
             has_io_tp = False
 
-        nplots = (1 if has_cpu_tp else 0) + (1 if (has_io_tp or has_io_util) else 0)
+        nplots = (1 if has_cpu_tp else 0) + (1 if (has_io_tp or has_io_util or has_iops_util) else 0)
         if nplots > 0:
             fig, axes = plt.subplots(nplots, 1, figsize=(10, 3 * nplots), sharex=True,
                                      layout='constrained')
@@ -315,7 +319,7 @@ def plot_saturation(csv_path: str):
                 ax_cpu.legend(loc='best', fontsize=9)
                 ax_cpu.set_title(f'{label} Saturation ({mode_plural}) — CPU')
 
-            if has_io_tp or has_io_util:
+            if has_io_tp or has_io_util or has_iops_util:
                 ax_io = axes[ax_idx]
                 if has_io_tp:
                     io_pct_peak = io_tp / io_tp.max() * 100
@@ -323,7 +327,10 @@ def plot_saturation(csv_path: str):
                                markersize=5, label='IO throughput (% of peak)')
                 if has_io_util:
                     ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
-                               markersize=4, alpha=0.8, label='IO utilization %')
+                               markersize=4, alpha=0.8, label='IO BW util %')
+                if has_iops_util:
+                    ax_io.plot(x, df['io_iops_util_pct'], '--^', color=C_PURPLE, linewidth=1.5,
+                               markersize=4, alpha=0.8, label='IO IOPS util %')
                 ax_io.set_ylabel('IO %')
                 ax_io.set_ylim(0, 105)
                 ax_io.set_xlim(left=1)
@@ -399,7 +406,9 @@ def plot_slack(csv_path: str):
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(x, df['cpu_pct'], '-o', color=C_ORANGE, linewidth=2, markersize=6, label='CPU %')
         if 'io_util_pct' in df.columns:
-            ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO %')
+            ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO BW %')
+        if 'io_iops_util_pct' in df.columns:
+            ax.plot(x, df['io_iops_util_pct'], '-^', color=C_CYAN, linewidth=2, markersize=6, label='IO IOPS %')
         ax.set_xlabel('Extra Threads')
         ax.set_ylabel('Utilization (%)')
         ax.set_title(f'{baseline_type} Slack — Resource Utilization')
@@ -412,10 +421,11 @@ def plot_slack(csv_path: str):
     # 4. Throughput (% of peak) vs utilization split by resource
     if 'cpu_pct' in df.columns:
         has_io_util = 'io_util_pct' in df.columns and df['io_util_pct'].max() > 1
+        has_iops_util = 'io_iops_util_pct' in df.columns and df['io_iops_util_pct'].max() > 1
         has_cpu_tp = df['cpu_ops'].max() > 0
         has_io_tp = df['io_ops'].max() > 0
 
-        nplots = (1 if has_cpu_tp else 0) + (1 if (has_io_tp or has_io_util) else 0)
+        nplots = (1 if has_cpu_tp else 0) + (1 if (has_io_tp or has_io_util or has_iops_util) else 0)
         if nplots > 0:
             fig, axes = plt.subplots(nplots, 1, figsize=(10, 3 * nplots), sharex=True,
                                      layout='constrained')
@@ -437,7 +447,7 @@ def plot_slack(csv_path: str):
                 ax_cpu.legend(loc='best', fontsize=9)
                 ax_cpu.set_title(f'{baseline_type} Slack — CPU')
 
-            if has_io_tp or has_io_util:
+            if has_io_tp or has_io_util or has_iops_util:
                 ax_io = axes[ax_idx]
                 if has_io_tp:
                     io_pct_peak = df['io_ops'] / df['io_ops'].max() * 100
@@ -445,7 +455,10 @@ def plot_slack(csv_path: str):
                                markersize=5, label='IO throughput (% of peak)')
                 if has_io_util:
                     ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
-                               markersize=4, alpha=0.8, label='IO utilization %')
+                               markersize=4, alpha=0.8, label='IO BW util %')
+                if has_iops_util:
+                    ax_io.plot(x, df['io_iops_util_pct'], '--^', color=C_PURPLE, linewidth=1.5,
+                               markersize=4, alpha=0.8, label='IO IOPS util %')
                 ax_io.set_ylabel('IO %')
                 ax_io.set_ylim(0, 105)
                 ax_io.grid(True, alpha=0.3)
@@ -592,7 +605,9 @@ def plot_proc_slack(csv_path: str):
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(x, df['cpu_pct'], '-o', color=C_ORANGE, linewidth=2, markersize=6, label='CPU %')
         if 'io_util_pct' in df.columns:
-            ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO %')
+            ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO BW %')
+        if 'io_iops_util_pct' in df.columns:
+            ax.plot(x, df['io_iops_util_pct'], '-^', color=C_CYAN, linewidth=2, markersize=6, label='IO IOPS %')
         ax.set_xlabel('Extra Worker Processes')
         ax.set_ylabel('Utilization (%)')
         ax.set_title(f'Proc Slack — Resource Utilization')
@@ -605,10 +620,11 @@ def plot_proc_slack(csv_path: str):
     # 4. Throughput (% of peak) vs utilization split by resource
     if 'cpu_pct' in df.columns:
         has_io_util = 'io_util_pct' in df.columns and df['io_util_pct'].max() > 1
+        has_iops_util = 'io_iops_util_pct' in df.columns and df['io_iops_util_pct'].max() > 1
         has_any_cpu = df['baseline_cpu_ops'].max() > 0 or df['extra_cpu_ops'].max() > 0
         has_any_io = df['baseline_io_ops'].max() > 0 or df['extra_io_ops'].max() > 0
 
-        nplots = (1 if has_any_cpu else 0) + (1 if (has_any_io or has_io_util) else 0)
+        nplots = (1 if has_any_cpu else 0) + (1 if (has_any_io or has_io_util or has_iops_util) else 0)
         if nplots > 0:
             fig, axes = plt.subplots(nplots, 1, figsize=(10, 3 * nplots), sharex=True,
                                      layout='constrained')
@@ -637,7 +653,7 @@ def plot_proc_slack(csv_path: str):
                 ax_cpu.legend(loc='best', fontsize=9)
                 ax_cpu.set_title(f'Proc Slack ({baseline_label} baseline, {baseline_workers} procs) — CPU')
 
-            if has_any_io or has_io_util:
+            if has_any_io or has_io_util or has_iops_util:
                 ax_io = axes[ax_idx]
                 total_io = df['baseline_io_ops'] + df['extra_io_ops']
                 io_peak = total_io.max()
@@ -650,7 +666,10 @@ def plot_proc_slack(csv_path: str):
                                    linewidth=1.5, markersize=4, alpha=0.8, label='Extra IO (% of peak)')
                 if has_io_util:
                     ax_io.plot(x, df['io_util_pct'], '--s', color=C_CYAN, linewidth=1.5,
-                               markersize=4, alpha=0.8, label='IO utilization %')
+                               markersize=4, alpha=0.8, label='IO BW util %')
+                if has_iops_util:
+                    ax_io.plot(x, df['io_iops_util_pct'], '--^', color=C_PURPLE, linewidth=1.5,
+                               markersize=4, alpha=0.8, label='IO IOPS util %')
                 ax_io.set_ylabel('IO %')
                 ax_io.set_ylim(0, 105)
                 ax_io.grid(True, alpha=0.3)

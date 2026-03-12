@@ -10,9 +10,15 @@ pub struct ProcSnapshot {
     // IO bytes from cgroup io.stat (summed across all devices)
     io_rbytes: u64,
     io_wbytes: u64,
+    // IO operations from cgroup io.stat (summed across all devices)
+    io_rios: u64,
+    io_wios: u64,
     // IO bandwidth limit from cgroup io.max (bytes/sec, summed read+write across devices)
     // None if no limit is configured
     io_max_bps: Option<u64>,
+    // IO operations limit from cgroup io.max (ops/sec, summed read+write across devices)
+    // None if no limit is configured
+    io_max_iops: Option<u64>,
     // PSI cumulative microseconds (cgroup-scoped)
     psi_cpu_some_us: u64,
     psi_io_some_us: u64,
@@ -25,6 +31,7 @@ pub struct SystemMetrics {
     pub cpu_pct: f64,
     pub system_pct: f64,
     pub io_util_pct: f64,
+    pub io_iops_util_pct: f64,
     pub io_psi_pct: f64,
     pub psi_cpu_some_us: u64,
     pub psi_io_some_us: u64,
@@ -38,8 +45,8 @@ pub fn take_snapshot() -> ProcSnapshot {
     let num_cpus = read_cpuset_cpus()
         .unwrap_or_else(|| count_proc_stat_cpus());
 
-    let (io_rbytes, io_wbytes) = read_io_stat();
-    let io_max_bps = read_io_max();
+    let (io_rbytes, io_wbytes, io_rios, io_wios) = read_io_stat();
+    let (io_max_bps, io_max_iops) = read_io_max();
 
     // PSI: prefer cgroup-scoped, fall back to system-wide
     let psi_cpu_some_us = read_psi_total("/sys/fs/cgroup/cpu.pressure", "some")
@@ -54,7 +61,8 @@ pub fn take_snapshot() -> ProcSnapshot {
 
     ProcSnapshot {
         usage_usec, system_usec, num_cpus,
-        io_rbytes, io_wbytes, io_max_bps,
+        io_rbytes, io_wbytes, io_rios, io_wios,
+        io_max_bps, io_max_iops,
         psi_cpu_some_us, psi_io_some_us, psi_io_full_us,
     }
 }
@@ -106,34 +114,46 @@ fn count_proc_stat_cpus() -> usize {
     if count > 0 { count } else { 1 }
 }
 
-/// Read cumulative IO bytes from cgroup io.stat, summed across all devices.
+/// Read cumulative IO bytes and operations from cgroup io.stat, summed across all devices.
 /// Format: "MAJ:MIN rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N"
-fn read_io_stat() -> (u64, u64) {
+fn read_io_stat() -> (u64, u64, u64, u64) {
     let content = read_to_string("/sys/fs/cgroup/io.stat").unwrap_or_default();
     let mut total_rbytes = 0u64;
     let mut total_wbytes = 0u64;
+    let mut total_rios = 0u64;
+    let mut total_wios = 0u64;
     for line in content.lines() {
         for part in line.split_whitespace() {
             if let Some(val) = part.strip_prefix("rbytes=") {
                 total_rbytes += val.parse::<u64>().unwrap_or(0);
             } else if let Some(val) = part.strip_prefix("wbytes=") {
                 total_wbytes += val.parse::<u64>().unwrap_or(0);
+            } else if let Some(val) = part.strip_prefix("rios=") {
+                total_rios += val.parse::<u64>().unwrap_or(0);
+            } else if let Some(val) = part.strip_prefix("wios=") {
+                total_wios += val.parse::<u64>().unwrap_or(0);
             }
         }
     }
-    (total_rbytes, total_wbytes)
+    (total_rbytes, total_wbytes, total_rios, total_wios)
 }
 
-/// Read IO bandwidth limit from cgroup io.max.
+/// Read IO bandwidth and IOPS limits from cgroup io.max.
 /// Format: "MAJ:MIN rbps=N wbps=N riops=N wiops=N"
-/// Returns the minimum of all configured rbps+wbps limits (uses the tightest constraint).
+/// Returns (bps_limit, iops_limit) — the minimum of all configured limits per device.
 /// "max" means unlimited for that field.
-fn read_io_max() -> Option<u64> {
-    let content = read_to_string("/sys/fs/cgroup/io.max").ok()?;
-    let mut limit: Option<u64> = None;
+fn read_io_max() -> (Option<u64>, Option<u64>) {
+    let content = match read_to_string("/sys/fs/cgroup/io.max") {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let mut bps_limit: Option<u64> = None;
+    let mut iops_limit: Option<u64> = None;
     for line in content.lines() {
         let mut rbps: Option<u64> = None;
         let mut wbps: Option<u64> = None;
+        let mut riops: Option<u64> = None;
+        let mut wiops: Option<u64> = None;
         for part in line.split_whitespace() {
             if let Some(val) = part.strip_prefix("rbps=") {
                 if val != "max" {
@@ -143,21 +163,38 @@ fn read_io_max() -> Option<u64> {
                 if val != "max" {
                     wbps = val.parse().ok();
                 }
+            } else if let Some(val) = part.strip_prefix("riops=") {
+                if val != "max" {
+                    riops = val.parse().ok();
+                }
+            } else if let Some(val) = part.strip_prefix("wiops=") {
+                if val != "max" {
+                    wiops = val.parse().ok();
+                }
             }
         }
         // Use the average of read+write limits if both are set,
-        // or whichever one is set, as the effective bandwidth cap
-        let device_limit = match (rbps, wbps) {
+        // or whichever one is set, as the effective cap
+        let device_bps = match (rbps, wbps) {
             (Some(r), Some(w)) => Some((r + w) / 2),
             (Some(r), None) => Some(r),
             (None, Some(w)) => Some(w),
             (None, None) => None,
         };
-        if let Some(dl) = device_limit {
-            limit = Some(limit.map_or(dl, |l: u64| l.min(dl)));
+        let device_iops = match (riops, wiops) {
+            (Some(r), Some(w)) => Some((r + w) / 2),
+            (Some(r), None) => Some(r),
+            (None, Some(w)) => Some(w),
+            (None, None) => None,
+        };
+        if let Some(dl) = device_bps {
+            bps_limit = Some(bps_limit.map_or(dl, |l: u64| l.min(dl)));
+        }
+        if let Some(dl) = device_iops {
+            iops_limit = Some(iops_limit.map_or(dl, |l: u64| l.min(dl)));
         }
     }
-    limit
+    (bps_limit, iops_limit)
 }
 
 fn read_psi_total(path: &str, kind: &str) -> Option<u64> {
@@ -209,6 +246,21 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
         0.0
     };
 
+    // IO operations utilization: delta ops / duration / max_iops
+    let d_rios = after.io_rios.saturating_sub(before.io_rios);
+    let d_wios = after.io_wios.saturating_sub(before.io_wios);
+    let d_ios = d_rios + d_wios;
+    let io_iops_util_pct = if let Some(max_iops) = after.io_max_iops {
+        if max_iops > 0 && duration_secs > 0.0 {
+            let actual_iops = d_ios as f64 / duration_secs;
+            (actual_iops / max_iops as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
     let d_psi_io_some = after.psi_io_some_us.saturating_sub(before.psi_io_some_us);
     let wall_us = duration_secs * 1_000_000.0;
     let io_psi_pct = if wall_us > 0.0 {
@@ -221,6 +273,7 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
         cpu_pct,
         system_pct,
         io_util_pct,
+        io_iops_util_pct,
         io_psi_pct,
         psi_cpu_some_us: after.psi_cpu_some_us.saturating_sub(before.psi_cpu_some_us),
         psi_io_some_us: d_psi_io_some,
@@ -230,13 +283,13 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
 
 /// Return the CSV column header string for system metrics.
 pub fn csv_header() -> &'static str {
-    "cpu_pct,system_pct,io_util_pct,io_psi_pct,psi_cpu_some_us,psi_io_some_us,psi_io_full_us"
+    "cpu_pct,system_pct,io_util_pct,io_iops_util_pct,io_psi_pct,psi_cpu_some_us,psi_io_some_us,psi_io_full_us"
 }
 
 impl SystemMetrics {
     pub fn to_csv_row(&self) -> String {
-        format!("{:.2},{:.2},{:.2},{:.2},{},{},{}",
-            self.cpu_pct, self.system_pct, self.io_util_pct, self.io_psi_pct,
+        format!("{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{}",
+            self.cpu_pct, self.system_pct, self.io_util_pct, self.io_iops_util_pct, self.io_psi_pct,
             self.psi_cpu_some_us, self.psi_io_some_us, self.psi_io_full_us)
     }
 }
@@ -262,6 +315,7 @@ pub fn median_metrics(samples: &[SystemMetrics]) -> SystemMetrics {
     let mut cpu_pct: Vec<f64> = samples.iter().map(|s| s.cpu_pct).collect();
     let mut system_pct: Vec<f64> = samples.iter().map(|s| s.system_pct).collect();
     let mut io_util_pct: Vec<f64> = samples.iter().map(|s| s.io_util_pct).collect();
+    let mut io_iops_util_pct: Vec<f64> = samples.iter().map(|s| s.io_iops_util_pct).collect();
     let mut io_psi_pct: Vec<f64> = samples.iter().map(|s| s.io_psi_pct).collect();
     let mut psi_cpu_some_us: Vec<u64> = samples.iter().map(|s| s.psi_cpu_some_us).collect();
     let mut psi_io_some_us: Vec<u64> = samples.iter().map(|s| s.psi_io_some_us).collect();
@@ -271,6 +325,7 @@ pub fn median_metrics(samples: &[SystemMetrics]) -> SystemMetrics {
         cpu_pct: median_f64(&mut cpu_pct),
         system_pct: median_f64(&mut system_pct),
         io_util_pct: median_f64(&mut io_util_pct),
+        io_iops_util_pct: median_f64(&mut io_iops_util_pct),
         io_psi_pct: median_f64(&mut io_psi_pct),
         psi_cpu_some_us: median_u64(&mut psi_cpu_some_us),
         psi_io_some_us: median_u64(&mut psi_io_some_us),
@@ -284,6 +339,7 @@ pub fn empty() -> SystemMetrics {
         cpu_pct: 0.0,
         system_pct: 0.0,
         io_util_pct: 0.0,
+        io_iops_util_pct: 0.0,
         io_psi_pct: 0.0,
         psi_cpu_some_us: 0,
         psi_io_some_us: 0,

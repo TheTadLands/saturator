@@ -4,6 +4,7 @@ mod visualize;
 mod proc_metrics;
 mod experiments;
 mod measure;
+mod soi;
 
 use saturator::{
     calibrate_operations_full, TuningParams,
@@ -13,6 +14,7 @@ use experiments::{
     SaturationExperiment, SlackExperiment, Mode,
     run_saturation_experiment, run_slack_experiment,
     run_intensity_sweep_experiment, run_slack_proc_experiment,
+    run_soi_experiments,
 };
 use measure::cleanup_scratch_files;
 
@@ -32,6 +34,7 @@ fn main() {
         println!("  find-saturation-intensity-proc <N> <io_pct> - N base procs + 1 probe, sweep probe intensity");
         println!("  find-slack-proc <N> <extra_io%>    - N CPU baseline procs, add procs at extra_io%");
         println!("  find-io-slack-proc <N> <extra_io%> - N I/O baseline procs, add procs at extra_io%");
+        println!("  find-soi-saturation <soi|all> <victim_workers> [victim_io%] - SoI interference profiling");
         println!("");
         println!("Options (for -proc variants):");
         println!("  --buffer-kb <N>      CPU work buffer size in KB (default: 100)");
@@ -51,6 +54,8 @@ fn main() {
         println!("  find-saturation-proc --buffer-kb 1024 --max-workers 100 --samples 7");
         println!("  find-mixed-saturation-proc 50 --max-workers 32");
         println!("  find-saturation-intensity-proc 6 50 --duration 2");
+        println!("  find-soi-saturation l3 4 0 --max-workers 8");
+        println!("  find-soi-saturation all 4 50 --duration 5 --samples 3");
         return;
     }
 
@@ -73,6 +78,19 @@ fn main() {
         let direct_io: bool = args[13].parse().unwrap();
 
         run_worker_process(shm_name, worker_id, cpu_iters, io_iters, io_perc, buffer_kb * 1024, io_buffer_kb * 1024, intensity, sleep_us, max_workers, random_access, direct_io);
+        return;
+    }
+
+    // Hidden SoI worker subcommand — child process entry point
+    if experiment == "__soi_worker" {
+        // Args: __soi_worker <shm_name> <worker_id> <max_workers> <soi_type> <buffer_size>
+        let shm_name = &args[2];
+        let worker_id: usize = args[3].parse().unwrap();
+        let max_workers: usize = args[4].parse().unwrap();
+        let soi_type = soi::SoiType::from_str(&args[5]).expect("Invalid SoI type");
+        let buffer_size: usize = args[6].parse().unwrap();
+
+        soi::run_soi_worker_process(shm_name, worker_id, max_workers, soi_type, buffer_size);
         return;
     }
 
@@ -214,6 +232,29 @@ fn main() {
             });
             run_slack_proc_experiment("I/O", 1.0, true, baseline, extra_io_pct / 100.0, calibration, &params);
         },
+        "find-soi-saturation" => {
+            let soi_str = args.get(2).unwrap_or_else(|| {
+                eprintln!("Usage: saturator find-soi-saturation <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
+                eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, ioops, all");
+                std::process::exit(1);
+            });
+            let soi_types = soi::parse_soi_list(soi_str).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            });
+            let victim_workers = args.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(|| {
+                eprintln!("Usage: saturator find-soi-saturation <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
+                std::process::exit(1);
+            });
+            let victim_io_pct = args.get(4).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let victim_io_perc = victim_io_pct.clamp(0.0, 100.0) / 100.0;
+
+            let cache_sizes = soi::detect_cache_sizes();
+            println!("Detected cache sizes: L1d={}KB, L2={}KB, L3={}KB",
+                     cache_sizes.l1d / 1024, cache_sizes.l2 / 1024, cache_sizes.l3 / 1024);
+
+            run_soi_experiments(&soi_types, victim_workers, victim_io_perc, &cache_sizes, calibration, &params);
+        },
         _ => println!("Unknown experiment: {}", experiment),
     }
 
@@ -226,7 +267,7 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
     // For -proc variants, use higher default max_workers
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(4);
-    if args.len() >= 2 && args[1].ends_with("-proc") {
+    if args.len() >= 2 && (args[1].ends_with("-proc") || args[1] == "find-soi-saturation") {
         params.max_workers = parallelism * 16;
     }
 

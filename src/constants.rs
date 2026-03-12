@@ -58,3 +58,32 @@ pub const READY_POLL_INTERVAL_MS: u64 = 10;
 
 /// Default IO file size in bytes for preallocated IO scratch files.
 pub const IO_FILE_SIZE_BYTES: usize = 1024 * 1024;
+
+// --- SoI (Source of Interference) constants ---
+
+/// Memory bandwidth SoI buffer size (16MB — exceeds LLC, forces DRAM traffic).
+pub const SOI_MEMBW_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+/// IO bandwidth SoI block size (128KB sequential writes).
+pub const SOI_IOBW_BLOCK_BYTES: usize = 128 * 1024;
+
+/// IO ops SoI block size (4KB random writes).
+pub const SOI_IOOPS_BLOCK_BYTES: usize = 4096;
+
+/// IO SoI scratch file size (64MB preallocated).
+pub const SOI_IO_FILE_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Fraction of cgroup memory limit used by MemCap SoI.
+pub const SOI_MEMCAP_FRACTION: f64 = 0.75;
+
+/// Number of integer ops per counted operation in CPU SoI.
+pub const SOI_CPU_BATCH_ITERS: u64 = 10_000;
+
+/// Fallback L1d cache size if sysfs detection fails.
+pub const SOI_FALLBACK_L1D_BYTES: usize = 32 * 1024;
+
+/// Fallback L2 cache size if sysfs detection fails.
+pub const SOI_FALLBACK_L2_BYTES: usize = 256 * 1024;
+
+/// Fallback L3 cache size if sysfs detection fails.
+pub const SOI_FALLBACK_L3_BYTES: usize = 8 * 1024 * 1024;

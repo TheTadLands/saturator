@@ -45,9 +45,9 @@ pub fn run_saturation_experiment(
     let end = params.max_workers;
 
     let wlabel = if use_step { "procs" } else { "threads" };
-    println!("  {:>7} | {:>12} {:>12} {:>12} | {:>10} | {:>6} {:>6}",
-             wlabel, "cpu ops/s", "io ops/s", "total ops/s", "per worker", "cpu%", "io%");
-    println!("  {}", "-".repeat(82));
+    println!("  {:>7} | {:>12} {:>12} {:>12} | {:>10} | {:>6} {:>6} {:>6}",
+             wlabel, "cpu ops/s", "io ops/s", "total ops/s", "per worker", "cpu%", "io%", "iops%");
+    println!("  {}", "-".repeat(89));
 
     while worker_count <= end {
         let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_worker_data) = match exp.mode {
@@ -67,9 +67,9 @@ pub fn run_saturation_experiment(
         let total_ops = cpu_ops + io_ops;
         let throughput_per_worker = total_ops / worker_count as f64;
 
-        println!("  {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>10.0} | {:>5.1}% {:>5.1}%",
+        println!("  {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>10.0} | {:>5.1}% {:>5.1}% {:>5.1}%",
                  worker_count, cpu_ops, io_ops, total_ops, throughput_per_worker,
-                 metrics.cpu_pct, metrics.io_util_pct);
+                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
 
         let io_errors: u64 = per_worker_data.as_ref().map_or(0, |pw| pw.iter().map(|w| w.3).sum());
         writer.add_saturation_point(worker_count, cpu_ops, io_ops, cpu_stddev, io_stddev, io_errors, metrics);

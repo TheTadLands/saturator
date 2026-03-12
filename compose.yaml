@@ -26,10 +26,10 @@ services:
           rate: '100mb'
       device_read_iops:
         - path: /dev/nvme0n1
-          rate: 200
+          rate: 10000
       device_write_iops:
         - path: /dev/nvme0n1
-          rate: 200
+          rate: 10000
 
     # Use real disk for I/O operations
     volumes:
@@ -60,4 +60,5 @@ services:
           rate: '100mb'
     volumes:
       - ./output:/app/output
-    # entrypoint set in Dockerfile (with umask 0000 for file permissions)
+      - ./run_ibench.sh:/ibench/run_ibench.sh:ro
+    entrypoint: ["/bin/sh", "-c", "umask 0000 && /bin/bash /ibench/run_ibench.sh \"$@\"", "--"]

@@ -34,7 +34,7 @@ fn main() {
         println!("  find-saturation-intensity-proc <N> <io_pct> - N base procs + 1 probe, sweep probe intensity");
         println!("  find-slack-proc <N> <extra_io%>    - N CPU baseline procs, add procs at extra_io%");
         println!("  find-io-slack-proc <N> <extra_io%> - N I/O baseline procs, add procs at extra_io%");
-        println!("  find-soi-saturation <soi|all> <victim_workers> [victim_io%] - SoI interference profiling");
+        println!("  find-soi-slack <soi|all> <victim_workers> [victim_io%] - SoI interference profiling");
         println!("");
         println!("Options (for -proc variants):");
         println!("  --buffer-kb <N>      CPU work buffer size in KB (default: 100)");
@@ -54,8 +54,8 @@ fn main() {
         println!("  find-saturation-proc --buffer-kb 1024 --max-workers 100 --samples 7");
         println!("  find-mixed-saturation-proc 50 --max-workers 32");
         println!("  find-saturation-intensity-proc 6 50 --duration 2");
-        println!("  find-soi-saturation l3 4 0 --max-workers 8");
-        println!("  find-soi-saturation all 4 50 --duration 5 --samples 3");
+        println!("  find-soi-slack l3 4 0 --max-workers 8");
+        println!("  find-soi-slack all 4 50 --duration 5 --samples 3");
         return;
     }
 
@@ -232,9 +232,9 @@ fn main() {
             });
             run_slack_proc_experiment("I/O", 1.0, true, baseline, extra_io_pct / 100.0, calibration, &params);
         },
-        "find-soi-saturation" => {
+        "find-soi-slack" => {
             let soi_str = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: saturator find-soi-saturation <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
+                eprintln!("Usage: saturator find-soi-slack <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
                 eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, ioops, all");
                 std::process::exit(1);
             });
@@ -243,7 +243,7 @@ fn main() {
                 std::process::exit(1);
             });
             let victim_workers = args.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(|| {
-                eprintln!("Usage: saturator find-soi-saturation <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
+                eprintln!("Usage: saturator find-soi-slack <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
                 std::process::exit(1);
             });
             let victim_io_pct = args.get(4).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
@@ -267,7 +267,7 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
     // For -proc variants, use higher default max_workers
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(4);
-    if args.len() >= 2 && (args[1].ends_with("-proc") || args[1] == "find-soi-saturation") {
+    if args.len() >= 2 && (args[1].ends_with("-proc") || args[1] == "find-soi-slack") {
         params.max_workers = parallelism * 16;
     }
 

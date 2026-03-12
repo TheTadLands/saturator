@@ -65,9 +65,9 @@ pub fn run_slack_experiment(
              baseline_cpu_std, baseline_io_std,
              baseline_metrics.to_csv_row()).unwrap();
 
-    println!("  {:>5} {:>7} | {:>12} {:>12} {:>12} | {:>8} | {:>6} {:>6}",
-             "extra", "total", "cpu ops/s", "io ops/s", "total ops/s", "vs base", "cpu%", "io%");
-    println!("  {}", "-".repeat(90));
+    println!("  {:>5} {:>7} | {:>12} {:>12} {:>12} | {:>8} | {:>6} {:>6} {:>6}",
+             "extra", "total", "cpu ops/s", "io ops/s", "total ops/s", "vs base", "cpu%", "io%", "iops%");
+    println!("  {}", "-".repeat(97));
 
     // Per-thread CSV: seed with extra=0 baseline data
     let pw_filename = format!("{}/per_worker_{}.csv", run_dir, csv_base);
@@ -91,9 +91,9 @@ pub fn run_slack_experiment(
         let tracked_ops = if exp.track_io { io_ops } else { cpu_ops };
         let baseline_change = (tracked_ops - baseline_throughput) / baseline_throughput * 100.0;
 
-        println!("  {:>5} {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>+7.1}% | {:>5.1}% {:>5.1}%",
+        println!("  {:>5} {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>+7.1}% | {:>5.1}% {:>5.1}% {:>5.1}%",
                  extra, baseline_threads + extra, cpu_ops, io_ops, total_ops, baseline_change,
-                 metrics.cpu_pct, metrics.io_util_pct);
+                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
 
         writeln!(file, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
                  extra, baseline_threads + extra,

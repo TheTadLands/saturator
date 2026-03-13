@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Documentation
+
+- **`readme.md`** — User-facing documentation with experiment descriptions, CLI usage, CSV column references, and configuration details. Keep in sync when adding/changing experiments or flags.
+
 ## What This Is
 
 Saturator is a Rust benchmarking tool that measures CPU and I/O saturation points in containerized environments. It supports both thread-based and process-based experiments. Thread-based experiments show throughput plateaus; process-based experiments (with tunable work unit size and buffer size) demonstrate actual throughput degradation due to context switch overhead, TLB thrashing, and cache contention.
@@ -36,12 +40,12 @@ There are no tests or lints configured.
 - `--buffer-kb <N>` — CPU work buffer size in KB (default: 100). Larger = more cache pressure.
 - `--io-buffer-kb <N>` — IO read/write buffer size in KB (default: 4). Larger = more bytes per IO op, higher bandwidth utilization.
 - `--max-workers <N>` — max worker count (default: parallelism*4 for threads, parallelism*16 for procs)
-- `--duration <N>` — measurement duration per data point in seconds (default: 5)
+- `--duration <N>` — measurement duration per data point in seconds (default: 30)
 - `--samples <N>` — samples per data point; median and stddev computed (default: 5)
 - `--step <N>` — worker count increment per data point (default: 1)
 - `--intensity <F>` — work probability per iteration, 0.0–1.0 (default: 1.0). Idle iterations sleep for `target_us` μs.
 - `--chain` — after a proc saturation experiment finds the saturation point N, automatically run `find-saturation-intensity-proc` with N base workers.
-- `--warmup <N>` — warmup duration in seconds before each measurement (default: 1). Longer warmup useful for cold caches or heavy I/O workloads.
+- `--warmup <N>` — warmup duration in seconds before each measurement (default: 10). Longer warmup useful for cold caches or heavy I/O workloads.
 - `--random-access` — use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size.
 - `--direct-io` — use `O_DIRECT | O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. Requires page-aligned buffers (handled automatically via `posix_memalign`).
 

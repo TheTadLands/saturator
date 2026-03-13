@@ -26,4 +26,5 @@ target
 /target
 /output
 /io_scratch
-/old_out
+/completed_output
+/2013.iiswc.ibench.pdf

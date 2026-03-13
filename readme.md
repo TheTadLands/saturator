@@ -137,6 +137,29 @@ docker compose run --build --remove-orphans saturator find-io-slack-proc <N> <ex
 
 **Output:** `proc_slack_<N>ioproc_adding_<io%>pct_io.csv`, `per_worker_proc_slack_<N>ioproc_adding_<io%>pct_io.csv`
 
+#### Find SoI Slack (Source of Interference)
+Holds a fixed number of victim workers running a real workload, then incrementally adds SoI (Source of Interference) workers that stress a specific shared resource. Measures how victim throughput degrades as interference increases.
+
+```bash
+docker compose run --build --remove-orphans saturator find-soi-slack <soi|all> <victim_workers> [victim_io%] [OPTIONS]
+```
+
+Arguments:
+- `soi` — SoI type to sweep: `l1d`, `l2`, `l3`, `membw`, `memcap`, `cpu`, `iobw`, `ioops`, or `all` to run every type
+- `victim_workers` — Number of fixed victim workers
+- `victim_io%` — IO percentage for victim workers (default: 0, i.e. CPU-only)
+
+Examples:
+```bash
+# 32 I/O victim workers, sweep IOPS interference
+docker compose run --build --remove-orphans saturator find-soi-slack ioops 32 100 --max-workers 16
+
+# 4 CPU victim workers, sweep all SoI types
+docker compose run --build --remove-orphans saturator find-soi-slack all 4 0 --duration 5 --samples 3
+```
+
+**Output:** `soi_<type>_<N>_victims_<io%>pct_io_<timestamp>/soi_<type>_throughput.csv`, `per_worker_soi_<type>.csv`
+
 ### Tuning Options
 
 All experiments accept optional flags to control workload parameters.
@@ -146,11 +169,11 @@ All experiments accept optional flags to control workload parameters.
 | `--buffer-kb <N>` | 100 | CPU work buffer size in KB. Larger values (e.g. 1024-10240) cause L3 cache contention at high worker counts. |
 | `--io-buffer-kb <N>` | 4 | IO read/write buffer size in KB. Larger values (e.g. 64-1024) increase bytes per IO operation, driving higher bandwidth utilization. |
 | `--max-workers <N>` | parallelism * 16 | Maximum number of workers to test. For proc slack experiments, controls the maximum number of extra workers added. |
-| `--duration <N>` | 5 | Measurement duration per data point in seconds. |
+| `--duration <N>` | 30 | Measurement duration per data point in seconds. |
 | `--samples <N>` | 5 | Samples per data point. Median and stddev are computed; stddev is written to CSV for error bar visualization. |
 | `--step <N>` | 1 | Worker count increment per data point. |
 | `--intensity <F>` | 1.0 | Work probability per iteration (0.0–1.0). Each idle iteration sleeps instead of working. Simulates partially-loaded workers. |
-| `--warmup <N>` | 1 | Warmup duration in seconds before each measurement. |
+| `--warmup <N>` | 10 | Warmup duration in seconds before each measurement. |
 | `--random-access` | — | Use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size. |
 | `--direct-io` | — | Use `O_DIRECT \| O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. |
 | `--chain` | — | After a proc saturation experiment finds the saturation point N, automatically runs `find-saturation-intensity-proc` with N base workers. |
@@ -193,7 +216,9 @@ Produced by `find-saturation`, `find-io-saturation`, `find-saturation-proc`, `fi
 | `io_ops_stddev` | Standard deviation of IO ops across samples |
 | `cpu_pct` | Container CPU utilization (cgroup-scoped, 100% = all assigned cores busy) |
 | `system_pct` | Kernel/system CPU time as percentage of available CPU |
+| `io_errors` | Count of failed IO operations across all workers |
 | `io_util_pct` | IO bandwidth utilization as percentage of cgroup limit (from `io.stat` / `io.max`) |
+| `io_iops_util_pct` | IO operations utilization as percentage of cgroup IOPS limit (from `io.stat` / `io.max`) |
 | `io_psi_pct` | IO pressure — percentage of wall time at least one task was stalled on IO |
 | `psi_cpu_some_us` | PSI CPU "some" stall time in microseconds |
 | `psi_io_some_us` | PSI IO "some" stall time in microseconds |
@@ -280,7 +305,7 @@ Generates PNG visualizations alongside each CSV. Each run gets its own timestamp
 The `compose.yaml` includes isolation settings:
 - `cpuset`: Pin to specific CPU cores (adjust to match your system)
 - `mem_limit` / `mem_reservation`: Fixed memory allocation (8GB limit, 4GB reserved)
-- `blkio_config`: I/O throughput throttle (100 MB/s read/write) to simulate spinning disk speeds. Device path is hardware-specific — adjust for your system.
+- `blkio_config`: I/O throttle — 100 MB/s bandwidth and 10,000 IOPS read/write. Device path is hardware-specific — adjust for your system.
 - `volumes`: `./io_scratch:/tmp` for I/O operations
 - `network_mode: none`: No network interference
 - `privileged: true`: Required for shared memory operations

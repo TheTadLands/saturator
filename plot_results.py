@@ -779,6 +779,321 @@ def plot_per_worker_intensity_sweep(csv_path: str):
     save_fig(fig, os.path.join(folder, 'per_worker_intensity.png'))
 
 
+def plot_soi(csv_path: str):
+    """Generate graphs for SoI (Service of Interest) sweep CSVs."""
+    df = pd.read_csv(csv_path)
+    name = Path(csv_path).stem
+    folder = str(Path(csv_path).parent)
+
+    soi_type = df['soi_type'].iloc[0]
+    if soi_type == 'ioops':
+        soi_type = 'iops'
+    victim_workers = int(df['victim_workers'].iloc[0])
+    x = df['soi_workers']
+
+    has_cpu_stddev = 'victim_cpu_stddev' in df.columns
+    has_io_stddev = 'victim_io_stddev' in df.columns
+
+    print(f"  -> {folder}/")
+
+    # 1. Victim throughput vs SoI workers (stacked CPU + IO subplots)
+    has_cpu = df['victim_cpu_ops'].max() > 0
+    has_io = df['victim_io_ops'].max() > 0
+    nplots = (1 if has_cpu else 0) + (1 if has_io else 0)
+    if nplots == 0:
+        nplots = 1
+
+    if nplots == 2:
+        fig, (ax_cpu, ax_io) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
+                                             layout='constrained')
+        ax_cpu.errorbar(x, df['victim_cpu_ops'],
+                        yerr=df['victim_cpu_stddev'] if has_cpu_stddev else None,
+                        fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
+                        capsize=3, capthick=1, label='Victim CPU ops/s')
+        ax_cpu.set_ylabel('CPU ops/sec')
+        ax_cpu.set_ylim(bottom=0)
+        ax_cpu.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        ax_cpu.legend(loc='best', fontsize=9)
+        ax_cpu.set_title(f'SoI Sweep ({soi_type}) — Victim Throughput ({victim_workers} victims)')
+        ax_cpu.grid(True, alpha=0.3)
+
+        ax_io.errorbar(x, df['victim_io_ops'],
+                       yerr=df['victim_io_stddev'] if has_io_stddev else None,
+                       fmt='-s', color=C_GREEN, linewidth=2, markersize=6,
+                       capsize=3, capthick=1, label='Victim IO ops/s')
+        ax_io.set_xlabel('SoI Workers')
+        ax_io.set_ylabel('IO ops/sec')
+        ax_io.set_ylim(bottom=0)
+        ax_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        ax_io.legend(loc='best', fontsize=9)
+        ax_io.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax_io.grid(True, alpha=0.3)
+    else:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        col = 'victim_cpu_ops' if has_cpu else 'victim_io_ops'
+        col_label = 'Victim CPU ops/s' if has_cpu else 'Victim IO ops/s'
+        stddev = df['victim_cpu_stddev'] if (has_cpu and has_cpu_stddev) else (df['victim_io_stddev'] if has_io_stddev else None)
+        ax.errorbar(x, df[col], yerr=stddev, fmt='-o', color=C_BLUE,
+                    linewidth=2, markersize=6, capsize=3, capthick=1, label=col_label)
+        ax.set_xlabel('SoI Workers')
+        ax.set_ylabel(f'{col_label} (ops/sec)')
+        ax.set_title(f'SoI Sweep ({soi_type}) — Victim Throughput ({victim_workers} victims)')
+        ax.set_ylim(bottom=0)
+        ax.set_xlim(left=0)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    save_fig(fig, os.path.join(folder, 'victim_throughput.png'))
+
+    # 2. Victim degradation percentage
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(x, df['victim_change_pct'], '-o', color=C_RED, linewidth=2, markersize=5)
+    ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+    ax.fill_between(x, df['victim_change_pct'], 0,
+                    where=(df['victim_change_pct'] >= 0), interpolate=True, alpha=0.2, color=C_GREEN)
+    ax.fill_between(x, df['victim_change_pct'], 0,
+                    where=(df['victim_change_pct'] < 0), interpolate=True, alpha=0.2, color=C_RED)
+    ax.set_xlabel('SoI Workers')
+    ax.set_ylabel('Victim Throughput Change (%)')
+    ax.set_title(f'SoI Sweep ({soi_type}) — Victim Degradation ({victim_workers} victims)')
+    ax.set_xlim(left=0)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(folder, 'victim_degradation.png'))
+
+    # 3. SoI throughput
+    if df['soi_ops'].max() > 0:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(x, df['soi_ops'], '-^', color=C_ORANGE, linewidth=2, markersize=6, label='SoI ops/s')
+        ax.set_xlabel('SoI Workers')
+        ax.set_ylabel('SoI Throughput (ops/sec)')
+        ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput')
+        ax.set_ylim(bottom=0)
+        ax.set_xlim(left=0)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        save_fig(fig, os.path.join(folder, 'soi_throughput.png'))
+
+    # 4. Combined: victim throughput + degradation on dual axes
+    primary_col = 'victim_io_ops' if has_io else 'victim_cpu_ops'
+    primary_label = 'Victim IO ops/s' if has_io else 'Victim CPU ops/s'
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    line_tp = ax1.plot(x, df[primary_col], '-o', color=C_BLUE, linewidth=2,
+                       markersize=6, label=primary_label)
+    ax1.set_xlabel('SoI Workers')
+    ax1.set_ylabel(f'{primary_label} (ops/sec)', color=C_BLUE)
+    ax1.tick_params(axis='y', labelcolor=C_BLUE)
+    ax1.set_ylim(bottom=0)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+
+    ax2 = ax1.twinx()
+    line_deg = ax2.plot(x, df['victim_change_pct'], '-s', color=C_RED, linewidth=2,
+                        markersize=5, label='Victim change %')
+    ax2.set_ylabel('Victim Change (%)', color=C_RED)
+    ax2.tick_params(axis='y', labelcolor=C_RED)
+
+    lines = line_tp + line_deg
+    ax1.legend(lines, [l.get_label() for l in lines], loc='best')
+    ax1.set_title(f'SoI Sweep ({soi_type}) — Throughput vs Degradation')
+    ax1.set_xlim(left=0)
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(folder, 'throughput_vs_degradation.png'))
+
+    # 5. Resource utilization
+    if 'cpu_pct' in df.columns:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(x, df['cpu_pct'], '-o', color=C_ORANGE, linewidth=2, markersize=6, label='CPU %')
+        if 'io_util_pct' in df.columns:
+            ax.plot(x, df['io_util_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO BW %')
+        if 'io_iops_util_pct' in df.columns:
+            ax.plot(x, df['io_iops_util_pct'], '-^', color=C_CYAN, linewidth=2, markersize=6, label='IO IOPS %')
+        ax.set_xlabel('SoI Workers')
+        ax.set_ylabel('Utilization (%)')
+        ax.set_title(f'SoI Sweep ({soi_type}) — Resource Utilization')
+        ax.set_ylim(0, 100)
+        ax.set_xlim(left=0)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        save_fig(fig, os.path.join(folder, 'utilization.png'))
+
+    # 6. PSI pressure
+    has_psi = 'psi_cpu_some_us' in df.columns
+    if has_psi:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        if 'io_psi_pct' in df.columns:
+            ax.plot(x, df['io_psi_pct'], '-s', color=C_GREEN, linewidth=2, markersize=6, label='IO PSI %')
+        ax.set_xlabel('SoI Workers')
+        ax.set_ylabel('PSI Pressure (%)')
+        ax.set_title(f'SoI Sweep ({soi_type}) — Pressure Stall Information')
+        ax.set_ylim(bottom=0)
+        ax.set_xlim(left=0)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        save_fig(fig, os.path.join(folder, 'psi_pressure.png'))
+
+
+def plot_per_worker_soi(csv_path: str):
+    """Box plot of victim worker throughput distribution as SoI workers increase."""
+    df = pd.read_csv(csv_path)
+    folder = str(Path(csv_path).parent)
+
+    soi_counts = sorted(df['soi_workers'].unique())
+    victim_df = df[~df['is_soi']]
+
+    print(f"  -> {folder}/")
+
+    box_width = (soi_counts[1] - soi_counts[0]) * 0.6 if len(soi_counts) > 1 else 0.6
+
+    # 1. Box plot of victim worker throughput distribution
+    fig, ax = plt.subplots(figsize=(max(8, len(soi_counts) * 0.5), 5))
+    data = [victim_df[victim_df['soi_workers'] == s]['total_ops_sec'].values for s in soi_counts]
+    ax.boxplot(data, positions=soi_counts, widths=box_width * 0.7, patch_artist=True,
+               boxprops=dict(facecolor=C_CYAN, alpha=0.7),
+               medianprops=dict(color=C_BLUE, linewidth=2), manage_ticks=False)
+    ax.set_xticks(soi_counts)
+    ax.set_xticklabels(soi_counts)
+    ax.set_xlabel('SoI Workers')
+    ax.set_ylabel('Per-Worker Throughput (ops/sec)')
+    ax.set_title('SoI Sweep — Victim Worker Distribution')
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    save_fig(fig, os.path.join(folder, 'per_worker_distribution.png'))
+
+    # 2. Victim total throughput + CV% (fairness)
+    totals = [victim_df[victim_df['soi_workers'] == s]['total_ops_sec'].sum() for s in soi_counts]
+    cvs = []
+    for s in soi_counts:
+        vals = victim_df[victim_df['soi_workers'] == s]['total_ops_sec'].values
+        mean = vals.mean()
+        cvs.append(vals.std() / mean * 100 if mean > 0 else 0)
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    line_tp = ax1.plot(soi_counts, totals, '-o', color=C_BLUE, linewidth=2, markersize=6, label='Victim total throughput')
+    ax1.set_xlabel('SoI Workers')
+    ax1.set_ylabel('Victim Total Throughput (ops/sec)', color=C_BLUE)
+    ax1.tick_params(axis='y', labelcolor=C_BLUE)
+    ax1.set_ylim(bottom=0)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+
+    ax2 = ax1.twinx()
+    line_cv = ax2.plot(soi_counts, cvs, '-s', color=C_RED, linewidth=2, markersize=5, label='Victim fairness CV%')
+    ax2.set_ylabel('Coefficient of Variation (%)', color=C_RED)
+    ax2.tick_params(axis='y', labelcolor=C_RED)
+    ax2.set_ylim(bottom=0)
+
+    lines = line_tp + line_cv
+    ax1.legend(lines, [l.get_label() for l in lines], loc='best')
+    ax1.set_title('SoI Sweep — Victim Throughput vs Fairness')
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(folder, 'per_worker_fairness.png'))
+
+
+def plot_soi_comparison(soi_csvs: list):
+    """Generate comparison plots across multiple SoI types."""
+    if len(soi_csvs) < 2:
+        return
+
+    # Sort by SoI type name for consistent ordering
+    soi_csvs = sorted(soi_csvs, key=lambda p: pd.read_csv(p, nrows=1)['soi_type'].iloc[0])
+
+    # Severity ordering for legend (most impactful last so it's visually on top)
+    SOI_COLORS = {
+        'cpu': C_BLUE, 'l1d': C_CYAN, 'l2': C_PURPLE, 'l3': C_GREEN,
+        'membw': C_ORANGE, 'memcap': '#999999', 'iobw': C_RED, 'iops': '#8B4513',
+    }
+    SOI_MARKERS = {
+        'cpu': 'o', 'l1d': 's', 'l2': '^', 'l3': 'D',
+        'membw': 'v', 'memcap': 'x', 'iobw': 'P', 'iops': '*',
+    }
+
+    # Load all data
+    entries = []
+    for csv_path in soi_csvs:
+        df = pd.read_csv(csv_path)
+        soi_type = df['soi_type'].iloc[0]
+        if soi_type == 'ioops':
+            soi_type = 'iops'
+        entries.append((soi_type, df, csv_path))
+
+    # Use the parent of the first CSV's parent as output dir
+    out_dir = str(Path(soi_csvs[0]).parent.parent)
+    victim_workers = int(entries[0][1]['victim_workers'].iloc[0])
+
+    print(f"  SoI comparison -> {out_dir}/")
+
+    # 1. Victim degradation comparison (all types on one plot)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for soi_type, df, _ in entries:
+        color = SOI_COLORS.get(soi_type, 'gray')
+        marker = SOI_MARKERS.get(soi_type, 'o')
+        ax.plot(df['soi_workers'], df['victim_change_pct'], f'-{marker}',
+                color=color, linewidth=2, markersize=6, label=soi_type)
+    ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+    ax.set_xlabel('SoI Workers')
+    ax.set_ylabel('Victim Throughput Change (%)')
+    ax.set_title(f'SoI Comparison — Victim Degradation ({victim_workers} IO victims)')
+    ax.set_xlim(left=0)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend(loc='best', ncol=2, fontsize=9)
+    ax.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(out_dir, 'soi_comparison_degradation.png'))
+
+    # 2. Bar chart of final degradation at max SoI workers
+    fig, ax = plt.subplots(figsize=(10, 5))
+    types = []
+    final_degs = []
+    colors = []
+    for soi_type, df, _ in entries:
+        types.append(soi_type)
+        final_degs.append(df['victim_change_pct'].iloc[-1])
+        colors.append(SOI_COLORS.get(soi_type, 'gray'))
+    # Sort by degradation severity
+    order = sorted(range(len(final_degs)), key=lambda i: final_degs[i])
+    types = [types[i] for i in order]
+    final_degs = [final_degs[i] for i in order]
+    colors = [colors[i] for i in order]
+
+    bars = ax.bar(types, final_degs, color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
+    ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+    for bar, val in zip(bars, final_degs):
+        ax.text(bar.get_x() + bar.get_width() / 2, val - 1.5,
+                f'{val:.1f}%', ha='center', va='top', fontsize=9, fontweight='bold')
+    ax.set_xlabel('SoI Type')
+    ax.set_ylabel('Victim Throughput Change (%)')
+    ax.set_title(f'SoI Impact at Maximum Load ({victim_workers} IO victims)')
+    ax.grid(True, alpha=0.3, axis='y')
+    save_fig(fig, os.path.join(out_dir, 'soi_comparison_bar.png'))
+
+    # 3. Victim throughput (normalized % of baseline) comparison
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for soi_type, df, _ in entries:
+        color = SOI_COLORS.get(soi_type, 'gray')
+        marker = SOI_MARKERS.get(soi_type, 'o')
+        baseline = df['victim_total_ops'].iloc[0]
+        if baseline > 0:
+            normalized = df['victim_total_ops'] / baseline * 100
+            ax.plot(df['soi_workers'], normalized, f'-{marker}',
+                    color=color, linewidth=2, markersize=6, label=soi_type)
+    ax.axhline(y=100, color='gray', linestyle='--', alpha=0.5, label='Baseline')
+    ax.set_xlabel('SoI Workers')
+    ax.set_ylabel('Victim Throughput (% of baseline)')
+    ax.set_title(f'SoI Comparison — Normalized Victim Throughput ({victim_workers} IO victims)')
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend(loc='best', ncol=2, fontsize=9)
+    ax.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(out_dir, 'soi_comparison_normalized.png'))
+
+
 def find_csvs(paths):
     """Find CSV files from given paths (files or directories)."""
     csv_files = []
@@ -813,8 +1128,12 @@ def main():
                     plot_per_worker_intensity_sweep(csv_path)
                 elif 'proc_slack' in name:
                     plot_per_worker_proc_slack(csv_path)
+                elif name.startswith('per_worker_soi_'):
+                    plot_per_worker_soi(csv_path)
                 else:
                     plot_per_worker_saturation(csv_path)
+            elif name.startswith('soi_') and name.endswith('_throughput'):
+                plot_soi(csv_path)
             elif 'throughput_vs_threads' in name or 'throughput_vs_workers' in name:
                 plot_saturation(csv_path)
             elif name.startswith('slack_'):
@@ -825,6 +1144,19 @@ def main():
                 print(f"  Skipping unknown format: {name}")
         except Exception as e:
             print(f"  Error: {e}")
+
+    # Group SoI throughput CSVs by parent directory for comparison plots
+    soi_groups = {}
+    for csv_path in sorted(csv_files):
+        name = Path(csv_path).stem
+        if name.startswith('soi_') and name.endswith('_throughput'):
+            parent = str(Path(csv_path).parent.parent)
+            soi_groups.setdefault(parent, []).append(csv_path)
+    for group_csvs in soi_groups.values():
+        try:
+            plot_soi_comparison(group_csvs)
+        except Exception as e:
+            print(f"  Error in SoI comparison: {e}")
 
     print("\nDone!")
 

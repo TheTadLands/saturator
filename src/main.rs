@@ -235,7 +235,7 @@ fn main() {
         "find-soi-slack" => {
             let soi_str = args.get(2).unwrap_or_else(|| {
                 eprintln!("Usage: saturator find-soi-slack <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
-                eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, ioops, all");
+                eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, iops, all");
                 std::process::exit(1);
             });
             let soi_types = soi::parse_soi_list(soi_str).unwrap_or_else(|e| {

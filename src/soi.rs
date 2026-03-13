@@ -28,7 +28,7 @@ impl SoiType {
             "memcap" | "mem-cap" => Some(Self::MemCap),
             "cpu" => Some(Self::Cpu),
             "iobw" | "io-bw" => Some(Self::IoBw),
-            "ioops" | "io-ops" => Some(Self::IoOps),
+            "iops" | "ioops" | "io-ops" => Some(Self::IoOps),
             _ => None,
         }
     }
@@ -51,7 +51,7 @@ impl SoiType {
             Self::MemCap => "memcap",
             Self::Cpu => "cpu",
             Self::IoBw => "iobw",
-            Self::IoOps => "ioops",
+            Self::IoOps => "iops",
         }
     }
 
@@ -64,7 +64,7 @@ impl SoiType {
             Self::MemCap => "Memory capacity",
             Self::Cpu => "CPU integer units",
             Self::IoBw => "Storage bandwidth",
-            Self::IoOps => "Storage IOPs",
+            Self::IoOps => "Storage IOPS",
         }
     }
 }
@@ -85,7 +85,7 @@ pub fn parse_soi_list(s: &str) -> Result<Vec<SoiType>, String> {
         let trimmed = part.trim();
         match SoiType::from_str(trimmed) {
             Some(t) => types.push(t),
-            None => return Err(format!("Unknown SoI type: '{}'. Valid: l1d, l2, l3, membw, memcap, cpu, iobw, ioops, all", trimmed)),
+            None => return Err(format!("Unknown SoI type: '{}'. Valid: l1d, l2, l3, membw, memcap, cpu, iobw, iops, all", trimmed)),
         }
     }
     if types.is_empty() {

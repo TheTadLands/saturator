@@ -37,7 +37,7 @@ pub fn run_soi_sweep_experiment(
 
     let csv_path = format!("{}/soi_{}_throughput.csv", run_dir, soi_type.name());
     let mut csv_file = std::fs::File::create(&csv_path).unwrap();
-    writeln!(csv_file, "soi_workers,total_workers,victim_workers,soi_type,victim_cpu_ops,victim_io_ops,victim_total_ops,victim_change_pct,soi_ops,victim_cpu_stddev,victim_io_stddev,{}",
+    writeln!(csv_file, "soi_workers,total_workers,victim_workers,soi_type,victim_cpu_ops,victim_io_ops,victim_total_ops,victim_cpu_change_pct,victim_io_change_pct,victim_change_pct,soi_ops,victim_cpu_stddev,victim_io_stddev,{}",
              proc_metrics::csv_header()).unwrap();
 
     let pw_csv_path = format!("{}/per_worker_soi_{}.csv", run_dir, soi_type.name());
@@ -60,9 +60,9 @@ pub fn run_soi_sweep_experiment(
              0, victim_workers, base_cpu, base_io, baseline_total, 0.0, "-",
              base_metrics.cpu_pct, base_metrics.io_util_pct, base_metrics.io_iops_util_pct);
 
-    writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+    writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
              0, victim_workers, victim_workers, soi_type.name(),
-             base_cpu, base_io, baseline_total, 0.0, 0.0,
+             base_cpu, base_io, baseline_total, 0.0, 0.0, 0.0, 0.0,
              base_cpu_sd, base_io_sd, base_metrics.to_csv_row()).unwrap();
 
     for (wid, &(wc, wi, ws, we)) in base_pw.iter().enumerate() {
@@ -83,6 +83,16 @@ pub fn run_soi_sweep_experiment(
                 &calibration, params,
             );
         let victim_total = v_cpu + v_io;
+        let cpu_change_pct = if base_cpu > 0.0 {
+            (v_cpu - base_cpu) / base_cpu * 100.0
+        } else {
+            0.0
+        };
+        let io_change_pct = if base_io > 0.0 {
+            (v_io - base_io) / base_io * 100.0
+        } else {
+            0.0
+        };
         let change_pct = if baseline_total > 0.0 {
             (victim_total - baseline_total) / baseline_total * 100.0
         } else {
@@ -93,9 +103,9 @@ pub fn run_soi_sweep_experiment(
                  soi_count, total_workers, v_cpu, v_io, victim_total, change_pct, soi_ops,
                  metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
 
-        writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+        writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
                  soi_count, total_workers, victim_workers, soi_type.name(),
-                 v_cpu, v_io, victim_total, change_pct, soi_ops,
+                 v_cpu, v_io, victim_total, cpu_change_pct, io_change_pct, change_pct, soi_ops,
                  v_cpu_sd, v_io_sd, metrics.to_csv_row()).unwrap();
 
         for (wid, &(wc, wi, ws, we)) in per_worker.iter().enumerate() {

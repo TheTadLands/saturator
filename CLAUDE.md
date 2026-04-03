@@ -48,6 +48,7 @@ There are no tests or lints configured.
 - `--warmup <N>` — warmup duration in seconds before each measurement (default: 10). Longer warmup useful for cold caches or heavy I/O workloads.
 - `--random-access` — use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size.
 - `--direct-io` — use `O_DIRECT | O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. Requires page-aligned buffers (handled automatically via `posix_memalign`).
+- `--sample-interval <ms>` — enable time-series sampling during measurement windows (default: off, minimum: 100ms). When set, the parent process periodically reads per-worker atomic counters and cgroup metrics mid-flight, producing a `timeseries_soi_*.csv` alongside the aggregate CSV. Useful for observing phase-dependent interference effects in workloads with time-varying CPU/IO ratios.
 
 ### Plotting
 
@@ -75,9 +76,9 @@ Source files in `src/`:
   - `slack_proc.rs` — `run_slack_proc_experiment()`: process-based slack with baseline + extra workers.
 
 - **`measure/`** — Measurement infrastructure:
-  - `mod.rs` — Shared utilities: `median()`, `stddev()`, `timestamp()`, `write_params_file()`, `cleanup_scratch_files()`, `aggregate_samples()`.
+  - `mod.rs` — Shared utilities: `median()`, `stddev()`, `timestamp()`, `write_params_file()`, `cleanup_scratch_files()`, `aggregate_samples()`, `TimeSeriesSample` struct.
   - `thread.rs` — Thread-based measurements: `measure_single_run()`, `measure_thread_throughput()`, `measure_baseline()`, `measure_total_throughput()`, `run_saturator_split()`.
-  - `proc.rs` — Process-based measurements: `measure_single_run_proc()`, `measure_proc_throughput()`, `measure_single_run_proc_mixed_intensity()`, `measure_proc_slack()`.
+  - `proc.rs` — Process-based measurements: `measure_single_run_proc()`, `measure_proc_throughput()`, `measure_single_run_proc_mixed_intensity()`, `measure_proc_slack()`. When `sample_interval_ms` is set, `run_mixed_proc_measurement()` replaces its single sleep with a polling loop that reads per-worker atomics and cgroup snapshots at each interval.
 
 - **`visualize.rs`** — CSV writer for saturation result types. Saturation CSV includes `throughput_stddev` column; slack CSV includes `cpu_ops_stddev` and `io_ops_stddev` columns.
 

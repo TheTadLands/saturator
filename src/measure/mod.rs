@@ -4,6 +4,15 @@ pub mod proc;
 pub use thread::*;
 pub use self::proc::*;
 
+/// A single time-series sample collected during a measurement window.
+pub struct TimeSeriesSample {
+    pub elapsed_ms: u64,
+    pub victim_cpu_ops_sec: f64,
+    pub victim_io_ops_sec: f64,
+    pub soi_ops_sec: f64,
+    pub metrics: crate::proc_metrics::SystemMetrics,
+}
+
 /// Compute the median of a slice of f64 values.
 pub fn median(samples: &[f64]) -> f64 {
     let mut sorted = samples.to_vec();
@@ -74,6 +83,9 @@ pub fn write_params_file(
     writeln!(f, "warmup_secs: {}", params.warmup_secs).unwrap();
     writeln!(f, "random_access: {}", params.random_access).unwrap();
     writeln!(f, "direct_io: {}", params.direct_io).unwrap();
+    if let Some(interval) = params.sample_interval_ms {
+        writeln!(f, "sample_interval_ms: {}", interval).unwrap();
+    }
     writeln!(f, "cpu_iterations: {}", calibration.cpu_iterations).unwrap();
     writeln!(f, "io_iterations: {}", calibration.io_iterations).unwrap();
     writeln!(f, "cpu_us: {}", calibration.cpu_us).unwrap();

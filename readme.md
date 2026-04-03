@@ -177,6 +177,7 @@ All experiments accept optional flags to control workload parameters.
 | `--random-access` | — | Use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size. |
 | `--direct-io` | — | Use `O_DIRECT \| O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. |
 | `--chain` | — | After a proc saturation experiment finds the saturation point N, automatically runs `find-saturation-intensity-proc` with N base workers. |
+| `--sample-interval <ms>` | off | Enable time-series sampling during measurement windows (minimum: 100ms). Produces a `timeseries_soi_*.csv` with per-interval throughput and utilization traces. See [Time-Series CSV columns](#time-series-csv-columns). |
 
 Examples:
 ```bash
@@ -270,6 +271,26 @@ Process-based experiments produce a `per_worker_*.csv` alongside the aggregate C
 | Saturation (`-proc`) | `workers, worker_id, cpu_ops_sec, io_ops_sec, sleep_ops_sec, total_ops_sec` |
 | Intensity sweep | `probe_intensity, workers, worker_id, cpu_ops_sec, io_ops_sec, sleep_ops_sec, total_ops_sec` |
 | Proc slack | `extra_workers, total_workers, baseline_workers, worker_id, cpu_ops_sec, io_ops_sec, sleep_ops_sec, total_ops_sec` |
+
+### Time-Series CSV columns
+
+Produced by SoI sweep experiments when `--sample-interval` is set. One row per sampling interval per sweep step. File: `timeseries_soi_<type>.csv`.
+
+| Column | Description |
+|--------|-------------|
+| `soi_workers` | Number of SoI workers active during this sweep step |
+| `elapsed_ms` | Milliseconds since start of the measurement window |
+| `victim_cpu_ops_sec` | Victim CPU operations per second during this interval |
+| `victim_io_ops_sec` | Victim IO operations per second during this interval |
+| `soi_ops_sec` | SoI worker operations per second during this interval |
+| `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV, computed over the interval |
+
+Example:
+```bash
+# 1-second sampling with 10s measurement windows
+docker compose run --build --remove-orphans saturator find-soi-slack cpu 4 50 \
+    --sample-interval 1000 --duration 10 --samples 1
+```
 
 ### Plotting
 

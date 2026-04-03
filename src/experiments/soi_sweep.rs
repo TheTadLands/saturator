@@ -6,6 +6,7 @@ use crate::proc_metrics;
 use crate::measure::{
     measure_soi_throughput,
     timestamp, write_params_file,
+    TimeSeriesSample,
 };
 
 /// Run a single SoI sweep: fixed victim workers, incrementally add SoI workers of one type.
@@ -48,13 +49,26 @@ pub fn run_soi_sweep_experiment(
              "soi", "total", "victim cpu", "victim io", "victim tot", "change%", "soi ops/s", "cpu%", "io%", "iops%");
     println!("  {}", "-".repeat(107));
 
+    // Time-series CSV (only created when --sample-interval is set)
+    let mut ts_file = if params.sample_interval_ms.is_some() {
+        let ts_path = format!("{}/timeseries_soi_{}.csv", run_dir, soi_type.name());
+        let mut f = std::fs::File::create(&ts_path).unwrap();
+        writeln!(f, "soi_workers,elapsed_ms,victim_cpu_ops_sec,victim_io_ops_sec,soi_ops_sec,{}",
+                 proc_metrics::csv_header()).unwrap();
+        Some(f)
+    } else {
+        None
+    };
+
     // Measure baseline (0 SoI workers)
-    let (base_cpu, base_io, base_cpu_sd, base_io_sd, _soi_ops, base_metrics, base_pw) =
+    let (base_cpu, base_io, base_cpu_sd, base_io_sd, _soi_ops, base_metrics, base_pw, base_ts) =
         measure_soi_throughput(
             victim_workers, victim_io_perc, 0, soi_type, 0,
             &calibration, params,
         );
     let baseline_total = base_cpu + base_io;
+
+    write_timeseries(&mut ts_file, 0, &base_ts);
 
     println!("  {:>7} {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>7.1}% | {:>10} | {:>5.1}% {:>5.1}% {:>5.1}%",
              0, victim_workers, base_cpu, base_io, baseline_total, 0.0, "-",
@@ -77,7 +91,7 @@ pub fn run_soi_sweep_experiment(
         let buf_size = soi_buffer_size(soi_type, cache_sizes, soi_count);
         let total_workers = victim_workers + soi_count;
 
-        let (v_cpu, v_io, v_cpu_sd, v_io_sd, soi_ops, metrics, per_worker) =
+        let (v_cpu, v_io, v_cpu_sd, v_io_sd, soi_ops, metrics, per_worker, ts_data) =
             measure_soi_throughput(
                 victim_workers, victim_io_perc, soi_count, soi_type, buf_size,
                 &calibration, params,
@@ -114,10 +128,31 @@ pub fn run_soi_sweep_experiment(
                      soi_count, total_workers, wid, is_soi, wc, wi, ws, wc + wi, we).unwrap();
         }
 
+        write_timeseries(&mut ts_file, soi_count, &ts_data);
+
         soi_count += params.step;
     }
 
+    if ts_file.is_some() {
+        println!("Time-series written to: {}/timeseries_soi_{}.csv", run_dir, soi_type.name());
+    }
     println!("\nResults written to: {}", csv_path);
+}
+
+/// Write time-series samples to the CSV file (no-op if sampling is disabled).
+fn write_timeseries(
+    ts_file: &mut Option<std::fs::File>,
+    soi_workers: usize,
+    ts_data: &Option<Vec<TimeSeriesSample>>,
+) {
+    if let (Some(f), Some(samples)) = (ts_file.as_mut(), ts_data.as_ref()) {
+        for s in samples {
+            writeln!(f, "{},{},{:.2},{:.2},{:.2},{}",
+                     soi_workers, s.elapsed_ms,
+                     s.victim_cpu_ops_sec, s.victim_io_ops_sec, s.soi_ops_sec,
+                     s.metrics.to_csv_row()).unwrap();
+        }
+    }
 }
 
 /// Run SoI sweep experiments for multiple SoI types.

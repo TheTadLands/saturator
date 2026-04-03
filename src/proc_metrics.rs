@@ -1,6 +1,7 @@
 use std::fs::read_to_string;
 
 /// Snapshot of cgroup/proc metrics at a point in time, used to compute deltas.
+#[derive(Clone)]
 pub struct ProcSnapshot {
     // Cgroup CPU accounting (microseconds)
     usage_usec: u64,

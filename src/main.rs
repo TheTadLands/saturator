@@ -48,6 +48,7 @@ fn main() {
         println!("  --warmup <N>         Warmup duration in seconds before measurement (default: 10)");
         println!("  --random-access      Use random buffer access pattern to defeat hardware prefetcher");
         println!("  --direct-io          Use O_DIRECT to bypass page cache for I/O ops");
+        println!("  --sample-interval <ms> Time-series sampling interval in ms (default: off)");
         println!("");
         println!("Examples:");
         println!("  find-slack 4 100     - 4 CPU baseline, add 100% I/O threads");
@@ -329,6 +330,12 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
                 i += 1;
                 if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
                     params.warmup_secs = v;
+                }
+            }
+            "--sample-interval" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse::<u64>().ok()) {
+                    params.sample_interval_ms = Some(v.max(100));
                 }
             }
             _ => {}

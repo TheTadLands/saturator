@@ -160,6 +160,69 @@ docker compose run --build --remove-orphans saturator find-soi-slack all 4 0 --d
 
 **Output:** `soi_<type>_<N>_victims_<io%>pct_io_<timestamp>/soi_<type>_throughput.csv`, `per_worker_soi_<type>.csv`
 
+### External Workload
+
+#### Find SoI Slack with External Victim
+Runs an external workload (e.g. RocksDB's `db_bench`) as the victim, then incrementally adds SoI workers to measure interference. The external workload reports throughput via a simple file-based protocol.
+
+```bash
+docker compose run --build --remove-orphans saturator find-soi-slack-ext <soi|all> --cmd '<command>' [OPTIONS]
+```
+
+Arguments:
+- `soi` — SoI type to sweep (same as `find-soi-slack`)
+- `--cmd '<command>'` — shell command to run the external workload (required). The `SATURATOR_THROUGHPUT_FILE` env var is set automatically.
+- `--throughput-file <path>` — path for throughput protocol file (default: `/tmp/saturator_ext_throughput.txt`)
+
+The external workload (or its wrapper script) writes throughput samples to the protocol file:
+```
+<timestamp_ms> <ops_per_sec>
+```
+One line per sample. A wrapper script for RocksDB's `db_bench` is provided at `scripts/run_db_bench.sh`.
+
+Examples:
+```bash
+# RocksDB readrandom benchmark vs CPU interference
+docker compose run --build --remove-orphans saturator find-soi-slack-ext cpu \
+    --cmd 'run_db_bench.sh --benchmarks=readrandom --num=10000000 --threads=4' \
+    --duration 30 --samples 3 --max-workers 8
+
+# With time-series sampling to capture phase-dependent effects
+docker compose run --build --remove-orphans saturator find-soi-slack-ext all \
+    --cmd 'run_db_bench.sh --benchmarks=readwhilewriting --threads=4' \
+    --sample-interval 1000 --duration 30 --max-workers 8
+```
+
+**Output:** `ext_soi_<type>_<timestamp>/ext_soi_<type>_throughput.csv`, `per_worker_ext_soi_<type>.csv`, optional `timeseries_ext_soi_<type>.csv`
+
+#### Find External Workload Saturation
+Scales an external workload's concurrency parameter (via `{N}` template substitution in the command) to find its saturation point — the concurrency level that produces peak throughput. Optionally chains into an SoI sweep at the saturation point.
+
+```bash
+docker compose run --build --remove-orphans saturator find-soi-saturation-ext <soi|all> --cmd '<command with {N}>' [OPTIONS]
+```
+
+Arguments:
+- `soi` — SoI type for the chained sweep (used only with `--chain`)
+- `--cmd '<command>'` — shell command with `{N}` placeholder for concurrency (required). `{N}` is replaced with the current concurrency level at each sweep step.
+- `--chain` — after finding saturation point N, automatically run `find-soi-slack-ext` with `{N}` substituted to the saturation value
+- `--throughput-file <path>` — path for throughput protocol file (default: `/tmp/saturator_ext_throughput.txt`)
+
+Examples:
+```bash
+# Find saturation point of db_bench by scaling thread count
+docker compose run --build --remove-orphans saturator find-soi-saturation-ext cpu \
+    --cmd 'run_db_bench.sh --benchmarks=readrandom --num=10000000 --threads={N}' \
+    --duration 30 --samples 3 --max-workers 16
+
+# Find saturation, then automatically sweep CPU interference at the saturation point
+docker compose run --build --remove-orphans saturator find-soi-saturation-ext cpu \
+    --cmd 'run_db_bench.sh --benchmarks=readrandom --threads={N}' \
+    --duration 30 --samples 3 --max-workers 16 --chain
+```
+
+**Output:** `ext_saturation_<timestamp>/ext_saturation.csv`. With `--chain`: also produces `ext_soi_<type>_<timestamp>/` directories from the SoI sweep.
+
 ### Tuning Options
 
 All experiments accept optional flags to control workload parameters.
@@ -178,6 +241,8 @@ All experiments accept optional flags to control workload parameters.
 | `--direct-io` | — | Use `O_DIRECT \| O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. |
 | `--chain` | — | After a proc saturation experiment finds the saturation point N, automatically runs `find-saturation-intensity-proc` with N base workers. |
 | `--sample-interval <ms>` | off | Enable time-series sampling during measurement windows (minimum: 100ms). Produces a `timeseries_soi_*.csv` with per-interval throughput and utilization traces. See [Time-Series CSV columns](#time-series-csv-columns). |
+| `--cmd <command>` | — | External workload command (for `find-soi-slack-ext`). Launched via `sh -c`. |
+| `--throughput-file <path>` | `/tmp/saturator_ext_throughput.txt` | Path for external workload throughput protocol file. |
 
 Examples:
 ```bash
@@ -271,6 +336,32 @@ Process-based experiments produce a `per_worker_*.csv` alongside the aggregate C
 | Saturation (`-proc`) | `workers, worker_id, cpu_ops_sec, io_ops_sec, sleep_ops_sec, total_ops_sec` |
 | Intensity sweep | `probe_intensity, workers, worker_id, cpu_ops_sec, io_ops_sec, sleep_ops_sec, total_ops_sec` |
 | Proc slack | `extra_workers, total_workers, baseline_workers, worker_id, cpu_ops_sec, io_ops_sec, sleep_ops_sec, total_ops_sec` |
+| External SoI sweep | `soi_workers, worker_id, cpu_ops_sec, io_ops_sec, sleep_ops_sec, total_ops_sec, io_errors` (SoI workers only) |
+
+### External Workload CSV columns
+
+Produced by `find-soi-slack-ext`. The external workload reports a single throughput number rather than split CPU/IO ops.
+
+| Column | Description |
+|--------|-------------|
+| `soi_workers` | Number of SoI workers |
+| `ext_ops_sec` | External workload throughput (ops/sec from protocol file) |
+| `ext_change_pct` | Percentage change vs baseline (0 SoI workers) |
+| `soi_ops` | SoI worker operations per second |
+| `ext_ops_stddev` | Standard deviation of external ops across samples |
+| `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV |
+
+### External Saturation CSV columns
+
+Produced by `find-soi-saturation-ext`. One row per concurrency level tested.
+
+| Column | Description |
+|--------|-------------|
+| `concurrency` | Concurrency parameter (value of `{N}`) |
+| `ext_ops_sec` | External workload throughput (ops/sec from protocol file) |
+| `ext_ops_stddev` | Standard deviation of external ops across samples |
+| `throughput_per_unit` | Throughput divided by concurrency level (efficiency) |
+| `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV |
 
 ### Time-Series CSV columns
 

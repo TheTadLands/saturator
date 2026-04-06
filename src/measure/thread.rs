@@ -62,7 +62,7 @@ fn measure_single_run(
         let pt_io     = Arc::clone(&pt[1]);
         let pt_sleep  = Arc::clone(&pt[2]);
         let pt_errors = Arc::clone(&pt[3]);
-        let params = *params;
+        let params = params.clone();
         let calibration = *calibration;
 
         let handle = std::thread::spawn(move || {
@@ -78,7 +78,7 @@ fn measure_single_run(
         let pt_io     = Arc::clone(&pt[1]);
         let pt_sleep  = Arc::clone(&pt[2]);
         let pt_errors = Arc::clone(&pt[3]);
-        let params = *params;
+        let params = params.clone();
         let calibration = *calibration;
 
         let handle = std::thread::spawn(move || {

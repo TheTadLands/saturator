@@ -8,6 +8,26 @@ use crate::proc_metrics;
 use crate::soi::SoiType;
 use super::{aggregate_samples, TimeSeriesSample};
 
+/// Spawn a single SoI worker process that uses the given shared memory region.
+pub fn spawn_soi_worker(
+    shm_name: &str,
+    worker_id: usize,
+    max_workers: usize,
+    soi_type: SoiType,
+    buffer_size: usize,
+) -> std::process::Child {
+    let exe = std::env::current_exe().unwrap();
+    Command::new(&exe)
+        .arg("__soi_worker")
+        .arg(shm_name)
+        .arg(worker_id.to_string())
+        .arg(max_workers.to_string())
+        .arg(soi_type.name())
+        .arg(buffer_size.to_string())
+        .spawn()
+        .expect("Failed to spawn SoI worker process")
+}
+
 /// Per-worker configuration for a process-based measurement run.
 pub struct WorkerConfig {
     pub io_perc: f64,
@@ -254,15 +274,7 @@ fn run_mixed_proc_measurement(
                     .expect("Failed to spawn worker process")
             }
             WorkerKind::Soi { soi_type, buffer_size } => {
-                Command::new(&exe)
-                    .arg("__soi_worker")
-                    .arg(&shm_name)
-                    .arg(i.to_string())
-                    .arg(worker_count.to_string())
-                    .arg(soi_type.name())
-                    .arg(buffer_size.to_string())
-                    .spawn()
-                    .expect("Failed to spawn SoI worker process")
+                spawn_soi_worker(&shm_name, i, worker_count, *soi_type, *buffer_size)
             }
         };
         children.push(child);

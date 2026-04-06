@@ -15,7 +15,7 @@ pub fn now_ns() -> u64 {
 }
 
 /// Tuning parameters that affect contention behavior
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TuningParams {
     pub buffer_kb: usize,     // CPU work buffer size in KB (default: 100)
     pub io_buffer_kb: usize,  // IO read/write buffer size in KB (default: 4)
@@ -29,6 +29,8 @@ pub struct TuningParams {
     pub random_access: bool,  // use random buffer access pattern to defeat prefetcher (default: false)
     pub direct_io: bool,      // use O_DIRECT to bypass page cache for I/O ops (default: false)
     pub sample_interval_ms: Option<u64>, // time-series sampling interval in ms (default: None = disabled)
+    pub ext_cmd: Option<String>,           // external workload command (default: None)
+    pub ext_throughput_file: Option<String>, // throughput protocol file path (default: None)
 }
 
 impl Default for TuningParams {
@@ -48,6 +50,8 @@ impl Default for TuningParams {
             random_access: false,
             direct_io: false,
             sample_interval_ms: None,
+            ext_cmd: None,
+            ext_throughput_file: None,
         }
     }
 }

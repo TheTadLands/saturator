@@ -54,9 +54,9 @@ pub fn run_soi_sweep_ext_experiment(
         None
     };
 
-    println!("\n  {:>7} | {:>12} | {:>8} | {:>10} | {:>6} {:>6} {:>6}",
-             "soi", "ext ops/s", "change%", "soi ops/s", "cpu%", "io%", "iops%");
-    println!("  {}", "-".repeat(75));
+    println!("\n  {:>7} | {:>12} | {:>8} | {:>10} | {:>6} {:>6} {:>6} {:>6}",
+             "soi", "ext ops/s", "change%", "soi ops/s", "cpu%", "io%", "iops%", "mem%");
+    println!("  {}", "-".repeat(82));
 
     // Baseline: external workload alone (0 SoI workers)
     let (base_ext, base_sd, _base_soi, base_metrics, _base_pw, base_ts) =
@@ -66,9 +66,9 @@ pub fn run_soi_sweep_ext_experiment(
         eprintln!("WARNING: external workload reported 0 ops/sec. Check that the throughput file is being written.");
     }
 
-    println!("  {:>7} | {:>12.0} | {:>7.1}% | {:>10} | {:>5.1}% {:>5.1}% {:>5.1}%",
+    println!("  {:>7} | {:>12.0} | {:>7.1}% | {:>10} | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
              0, base_ext, 0.0, "-",
-             base_metrics.cpu_pct, base_metrics.io_util_pct, base_metrics.io_iops_util_pct);
+             base_metrics.cpu_pct, base_metrics.io_util_pct, base_metrics.io_iops_util_pct, base_metrics.mem_usage_pct);
 
     writeln!(csv_file, "{},{:.2},{:.2},{:.2},{:.2},{}",
              0, base_ext, 0.0, 0.0, base_sd, base_metrics.to_csv_row()).unwrap();
@@ -89,9 +89,9 @@ pub fn run_soi_sweep_ext_experiment(
             0.0
         };
 
-        println!("  {:>7} | {:>12.0} | {:>7.1}% | {:>10.0} | {:>5.1}% {:>5.1}% {:>5.1}%",
+        println!("  {:>7} | {:>12.0} | {:>7.1}% | {:>10.0} | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
                  soi_count, ext_ops, change_pct, soi_ops,
-                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
+                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct, metrics.mem_usage_pct);
 
         writeln!(csv_file, "{},{:.2},{:.2},{:.2},{:.2},{}",
                  soi_count, ext_ops, change_pct, soi_ops, ext_sd, metrics.to_csv_row()).unwrap();
@@ -110,6 +110,22 @@ pub fn run_soi_sweep_ext_experiment(
         println!("Time-series written to: {}/timeseries_ext_soi_{}.csv", run_dir, soi_type.name());
     }
     println!("\nResults written to: {}", csv_path);
+}
+
+/// Write time-series samples for saturation experiments (keyed by concurrency).
+fn write_saturation_timeseries(
+    ts_file: &mut Option<std::fs::File>,
+    concurrency: usize,
+    ts_data: &Option<Vec<ExtTimeSeriesSample>>,
+) {
+    if let (Some(f), Some(samples)) = (ts_file.as_mut(), ts_data.as_ref()) {
+        for s in samples {
+            writeln!(f, "{},{},{:.2},{:.2},{}",
+                     concurrency, s.elapsed_ms,
+                     s.ext_ops_sec, s.soi_ops_sec,
+                     s.metrics.to_csv_row()).unwrap();
+        }
+    }
 }
 
 /// Write time-series samples to the CSV file (no-op if sampling is disabled).
@@ -159,9 +175,20 @@ pub fn run_ext_saturation_experiment(
     writeln!(csv_file, "concurrency,ext_ops_sec,ext_ops_stddev,throughput_per_unit,{}",
              proc_metrics::csv_header()).unwrap();
 
-    println!("\n  {:>7} | {:>12} | {:>12} | {:>6} {:>6} {:>6}",
-             "N", "ext ops/s", "per unit", "cpu%", "io%", "iops%");
-    println!("  {}", "-".repeat(65));
+    // Time-series CSV
+    let mut ts_file = if params.sample_interval_ms.is_some() {
+        let ts_path = format!("{}/timeseries_ext_saturation.csv", run_dir);
+        let mut f = std::fs::File::create(&ts_path).unwrap();
+        writeln!(f, "concurrency,elapsed_ms,ext_ops_sec,soi_ops_sec,{}",
+                 proc_metrics::csv_header()).unwrap();
+        Some(f)
+    } else {
+        None
+    };
+
+    println!("\n  {:>7} | {:>12} | {:>12} | {:>6} {:>6} {:>6} {:>6}",
+             "N", "ext ops/s", "per unit", "cpu%", "io%", "iops%", "mem%");
+    println!("  {}", "-".repeat(72));
 
     let mut best_throughput = 0.0_f64;
     let mut saturation_point = params.step;
@@ -171,17 +198,19 @@ pub fn run_ext_saturation_experiment(
         let cmd = substitute_template(ext_cmd_template, n);
 
         // soi_count=0: no SoI workers, just measure the external workload
-        let (ext_ops, ext_sd, _soi_ops, metrics, _per_worker, _ts_data) =
+        let (ext_ops, ext_sd, _soi_ops, metrics, _per_worker, ts_data) =
             measure_ext_throughput(&cmd, throughput_file, 0, SoiType::Cpu, 0, params);
 
         let per_unit = ext_ops / n as f64;
 
-        println!("  {:>7} | {:>12.0} | {:>12.0} | {:>5.1}% {:>5.1}% {:>5.1}%",
+        println!("  {:>7} | {:>12.0} | {:>12.0} | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
                  n, ext_ops, per_unit,
-                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
+                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct, metrics.mem_usage_pct);
 
         writeln!(csv_file, "{},{:.2},{:.2},{:.2},{}",
                  n, ext_ops, ext_sd, per_unit, metrics.to_csv_row()).unwrap();
+
+        write_saturation_timeseries(&mut ts_file, n, &ts_data);
 
         if ext_ops > best_throughput {
             best_throughput = ext_ops;
@@ -191,6 +220,9 @@ pub fn run_ext_saturation_experiment(
         n += params.step;
     }
 
+    if ts_file.is_some() {
+        println!("Time-series written to: {}/timeseries_ext_saturation.csv", run_dir);
+    }
     println!("\n=== RESULTS ===");
     println!("Saturation point: N={}", saturation_point);
     println!("Best throughput: {:.0} ops/sec", best_throughput);

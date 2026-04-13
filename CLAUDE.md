@@ -37,7 +37,7 @@ There are no tests or lints configured.
 - `find-saturation-intensity-proc <N> <io_pct>` — N base processes at intensity=1.0 + 1 probe process, sweep probe intensity 0.0–1.0 to find saturation tipping point
 
 **External workload** (real application as victim, SoI workers apply interference):
-- `find-soi-slack-ext <soi|all> --cmd '<command>' [OPTIONS]` — run an external workload (e.g. RocksDB's db_bench) as the victim, sweep SoI workers to measure interference. The external workload reports throughput via a file-based protocol (`<timestamp_ms> <ops_per_sec>\n`). Wrapper scripts adapt specific workloads to this protocol (see `scripts/run_db_bench.sh` for RocksDB).
+- `find-soi-slack-ext <soi|all> --cmd '<command>' [OPTIONS]` — run an external workload (e.g. RocksDB's db_bench) as the victim, sweep SoI workers to measure interference. The external workload reports throughput via a cumulative file-based protocol (`<timestamp_ms> <cumulative_ops>\n`). Saturator computes rates from deltas between consecutive reports. Wrapper scripts adapt specific workloads to this protocol (see `scripts/run_db_bench.sh` for RocksDB).
 - `find-soi-saturation-ext <soi|all> --cmd '<cmd {N}>' [OPTIONS]` — find the saturation point of an external workload by sweeping the `{N}` template parameter (e.g. thread count). Optionally chain into SoI sweep at the saturation point with `--chain`.
 
 **Tuning flags** (work with all experiments):
@@ -87,7 +87,7 @@ Source files in `src/`:
   - `thread.rs` — Thread-based measurements: `measure_single_run()`, `measure_thread_throughput()`, `measure_baseline()`, `measure_total_throughput()`, `run_saturator_split()`.
   - `proc.rs` — Process-based measurements: `measure_single_run_proc()`, `measure_proc_throughput()`, `measure_single_run_proc_mixed_intensity()`, `measure_proc_slack()`, `spawn_soi_worker()`. When `sample_interval_ms` is set, `run_mixed_proc_measurement()` replaces its single sleep with a polling loop that reads per-worker atomics and cgroup snapshots at each interval.
   - `ext.rs` — External workload measurements: `run_ext_measurement()`, `measure_ext_throughput()`. Launches an external command as the victim alongside SoI workers. SoI workers use shared memory; external workload reports throughput via file protocol.
-  - `ext_throughput.rs` — `ThroughputReader`: reads the external workload throughput protocol file. Designed to be swappable for different throughput reporting mechanisms.
+  - `ext_throughput.rs` — `ThroughputReader`: reads the external workload cumulative throughput protocol file and computes instantaneous rates from deltas. Tracks cumulative state across calls; `reset()` seeds state from the last warmup line. Designed to be swappable for different throughput reporting mechanisms.
 
 - **`visualize.rs`** — CSV writer for saturation result types. Saturation CSV includes `throughput_stddev` column; slack CSV includes `cpu_ops_stddev` and `io_ops_stddev` columns.
 

@@ -45,9 +45,9 @@ pub fn run_soi_sweep_experiment(
     let mut pw_file = std::fs::File::create(&pw_csv_path).unwrap();
     writeln!(pw_file, "soi_workers,total_workers,worker_id,is_soi,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec,io_errors").unwrap();
 
-    println!("\n  {:>7} {:>7} | {:>12} {:>12} {:>12} | {:>8} | {:>10} | {:>6} {:>6} {:>6}",
-             "soi", "total", "victim cpu", "victim io", "victim tot", "change%", "soi ops/s", "cpu%", "io%", "iops%");
-    println!("  {}", "-".repeat(107));
+    println!("\n  {:>7} {:>7} | {:>12} {:>12} {:>12} | {:>8} | {:>10} | {:>6} {:>6} {:>6} {:>6}",
+             "soi", "total", "victim cpu", "victim io", "victim tot", "change%", "soi ops/s", "cpu%", "io%", "iops%", "mem%");
+    println!("  {}", "-".repeat(114));
 
     // Time-series CSV (only created when --sample-interval is set)
     let mut ts_file = if params.sample_interval_ms.is_some() {
@@ -70,9 +70,9 @@ pub fn run_soi_sweep_experiment(
 
     write_timeseries(&mut ts_file, 0, &base_ts);
 
-    println!("  {:>7} {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>7.1}% | {:>10} | {:>5.1}% {:>5.1}% {:>5.1}%",
+    println!("  {:>7} {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>7.1}% | {:>10} | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
              0, victim_workers, base_cpu, base_io, baseline_total, 0.0, "-",
-             base_metrics.cpu_pct, base_metrics.io_util_pct, base_metrics.io_iops_util_pct);
+             base_metrics.cpu_pct, base_metrics.io_util_pct, base_metrics.io_iops_util_pct, base_metrics.mem_usage_pct);
 
     writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
              0, victim_workers, victim_workers, soi_type.name(),
@@ -113,9 +113,9 @@ pub fn run_soi_sweep_experiment(
             0.0
         };
 
-        println!("  {:>7} {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>7.1}% | {:>10.0} | {:>5.1}% {:>5.1}% {:>5.1}%",
+        println!("  {:>7} {:>7} | {:>12.0} {:>12.0} {:>12.0} | {:>7.1}% | {:>10.0} | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
                  soi_count, total_workers, v_cpu, v_io, victim_total, change_pct, soi_ops,
-                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
+                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct, metrics.mem_usage_pct);
 
         writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
                  soi_count, total_workers, victim_workers, soi_type.name(),

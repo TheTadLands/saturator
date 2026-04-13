@@ -174,11 +174,11 @@ Arguments:
 - `--cmd '<command>'` — shell command to run the external workload (required). The `SATURATOR_THROUGHPUT_FILE` env var is set automatically.
 - `--throughput-file <path>` — path for throughput protocol file (default: `/tmp/saturator_ext_throughput.txt`)
 
-The external workload (or its wrapper script) writes throughput samples to the protocol file:
+The external workload (or its wrapper script) writes cumulative throughput samples to the protocol file:
 ```
-<timestamp_ms> <ops_per_sec>
+<timestamp_ms> <cumulative_ops>
 ```
-One line per sample. A wrapper script for RocksDB's `db_bench` is provided at `scripts/run_db_bench.sh`.
+One line per sample. Values must be monotonically increasing. Saturator computes instantaneous rates from deltas between consecutive reports, making the protocol robust to timing mismatches between the reporting frequency and the sampling interval. A wrapper script for RocksDB's `db_bench` is provided at `scripts/run_db_bench.sh`.
 
 Examples:
 ```bash

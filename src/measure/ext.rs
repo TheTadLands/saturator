@@ -111,14 +111,17 @@ pub fn run_ext_measurement(
         let mut prev_soi_counters = read_soi_counters(&soi_state, soi_count);
         let mut prev_snap = snap_before.clone();
         let mut elapsed_ms: u64 = 0;
+        let mut last_ext_ops = 0.0_f64;
 
         loop {
             std::thread::sleep(Duration::from_millis(interval_ms));
             elapsed_ms += interval_ms;
 
-            // Read external throughput
+            // Read external throughput (rates computed from cumulative deltas)
             let new_tp = tp_reader.read_new_samples();
-            let ext_ops = ThroughputReader::average_ops(&new_tp);
+            if !new_tp.is_empty() {
+                last_ext_ops = ThroughputReader::average_ops(&new_tp);
+            }
             all_tp_samples.extend_from_slice(&new_tp);
 
             // Read SoI counters
@@ -134,7 +137,7 @@ pub fn run_ext_measurement(
 
             ts_samples.push(ExtTimeSeriesSample {
                 elapsed_ms,
-                ext_ops_sec: ext_ops,
+                ext_ops_sec: last_ext_ops,
                 soi_ops_sec: soi_delta as f64 / interval_secs,
                 metrics: delta_metrics,
             });

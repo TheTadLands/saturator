@@ -1088,6 +1088,158 @@ def plot_per_worker_soi(csv_path: str):
     save_fig(fig, os.path.join(folder, 'per_worker_fairness.png'))
 
 
+def _ext_subdir(folder, subdir):
+    """Return `folder/subdir`, creating it if needed. Used to group ext-workload
+    plots into timeseries/, per_sample/, utilization/, per_worker/ rather than
+    letting ~20 PNGs pile up at the top level."""
+    out = os.path.join(folder, subdir)
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def _plot_combined_per_group(df, groups, group_col, folder, title_prefix, group_label, out_template):
+    """For each value in `groups`, render one figure with throughput on the left
+    axis and CPU/IO/IOPS/memory utilizations overlaid on a shared right axis.
+    Lets you see within-window phase correlations that stacked small-multiples hide.
+    """
+    has_cpu = 'cpu_pct' in df.columns
+    has_io_bw = 'io_util_pct' in df.columns
+    has_io_iops = 'io_iops_util_pct' in df.columns
+    has_mem = 'mem_usage_pct' in df.columns
+
+    for g in groups:
+        sub = df[df[group_col] == g].sort_values('elapsed_ms')
+        if sub.empty:
+            continue
+
+        fig, ax_tp = plt.subplots(figsize=(11, 5))
+        t = sub['elapsed_ms'] / 1000
+
+        line_tp, = ax_tp.plot(t, sub['ext_ops_sec'], '-', color=C_BLUE,
+                              linewidth=2.2, label='Throughput')
+        ax_tp.set_xlabel('Elapsed (seconds)')
+        ax_tp.set_ylabel('External Throughput (ops/sec)', color=C_BLUE)
+        ax_tp.tick_params(axis='y', labelcolor=C_BLUE)
+        ax_tp.set_ylim(bottom=0)
+        ax_tp.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        ax_tp.grid(True, alpha=0.3)
+
+        ax_util = ax_tp.twinx()
+        lines = [line_tp]
+        if has_cpu:
+            l, = ax_util.plot(t, sub['cpu_pct'], '-', color=C_ORANGE,
+                              linewidth=1.2, alpha=0.8, label='CPU%')
+            lines.append(l)
+        if has_io_bw:
+            l, = ax_util.plot(t, sub['io_util_pct'], '-', color=C_GREEN,
+                              linewidth=1.2, alpha=0.8, label='IO BW%')
+            lines.append(l)
+        if has_io_iops:
+            l, = ax_util.plot(t, sub['io_iops_util_pct'], '-', color=C_PURPLE,
+                              linewidth=1.2, alpha=0.8, label='IO IOPS%')
+            lines.append(l)
+        if has_mem:
+            l, = ax_util.plot(t, sub['mem_usage_pct'], '-', color=C_RED,
+                              linewidth=1.2, alpha=0.8, label='Mem%')
+            lines.append(l)
+        ax_util.set_ylabel('Utilization (%)')
+        ax_util.set_ylim(0, 105)
+
+        ax_tp.set_title(f'{title_prefix} — {group_label}={int(g)}')
+        ax_tp.legend(lines, [l.get_label() for l in lines], loc='upper right', fontsize=9)
+        fig.tight_layout()
+        save_fig(fig, os.path.join(_ext_subdir(folder, 'timeseries'), out_template.format(int(g))))
+
+
+def plot_per_sample_ext_soi(csv_path: str):
+    """Scatter + per-sample curves from the long-format per-sample SoI sweep CSV."""
+    df = pd.read_csv(csv_path)
+    folder = str(Path(csv_path).parent)
+    name = Path(csv_path).stem
+    soi_type = name.replace('per_sample_ext_soi_', '')
+
+    # Baseline mean for degradation %
+    base = df[df['soi_workers'] == 0]['ext_ops_sec']
+    base_mean = base.mean() if len(base) else 0
+
+    # Scatter: one dot per sample at each N + mean line
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.scatter(df['soi_workers'], df['ext_ops_sec'], s=40, alpha=0.55,
+               color=C_BLUE, edgecolors='white', linewidths=0.5, label='Sample')
+    means = df.groupby('soi_workers')['ext_ops_sec'].mean().reset_index()
+    ax.plot(means['soi_workers'], means['ext_ops_sec'], '-o', color=C_RED,
+            linewidth=2, markersize=6, label='Mean')
+    ax.set_xlabel('SoI Workers')
+    ax.set_ylabel('External Throughput (ops/sec)')
+    ax.set_title(f'SoI Sweep ({soi_type}) — Per-Sample Throughput')
+    ax.set_ylim(bottom=0)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(_ext_subdir(folder, 'per_sample'), 'scatter.png'))
+
+    # Per-sample curves: one line per sample_idx across N
+    fig, ax = plt.subplots(figsize=(10, 5))
+    cmap = plt.cm.viridis
+    sample_ids = sorted(df['sample_idx'].unique())
+    for i, sid in enumerate(sample_ids):
+        sub = df[df['sample_idx'] == sid].sort_values('soi_workers')
+        color = cmap(i / max(len(sample_ids) - 1, 1))
+        ax.plot(sub['soi_workers'], sub['ext_ops_sec'], '-o', color=color,
+                linewidth=1.5, markersize=5, alpha=0.85, label=f'Sample {int(sid)}')
+    ax.set_xlabel('SoI Workers')
+    ax.set_ylabel('External Throughput (ops/sec)')
+    ax.set_title(f'SoI Sweep ({soi_type}) — Per-Sample Curves')
+    ax.set_ylim(bottom=0)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(_ext_subdir(folder, 'per_sample'), 'curves.png'))
+
+    # Degradation % per sample — exposes whether variance is uniform or N-dependent
+    if base_mean > 0:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        df_deg = df.copy()
+        df_deg['deg_pct'] = (df_deg['ext_ops_sec'] - base_mean) / base_mean * 100
+        ax.scatter(df_deg['soi_workers'], df_deg['deg_pct'], s=40, alpha=0.55,
+                   color=C_BLUE, edgecolors='white', linewidths=0.5, label='Sample')
+        means = df_deg.groupby('soi_workers')['deg_pct'].mean().reset_index()
+        ax.plot(means['soi_workers'], means['deg_pct'], '-o', color=C_RED,
+                linewidth=2, markersize=6, label='Mean')
+        ax.axhline(0, color='black', linewidth=0.8, alpha=0.4)
+        ax.set_xlabel('SoI Workers')
+        ax.set_ylabel('Throughput Change (%)')
+        ax.set_title(f'SoI Sweep ({soi_type}) — Per-Sample Degradation')
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+        save_fig(fig, os.path.join(_ext_subdir(folder, 'per_sample'), 'degradation.png'))
+
+
+def plot_per_sample_ext_saturation(csv_path: str):
+    """Scatter + per-sample curves for external saturation per-sample CSV."""
+    df = pd.read_csv(csv_path)
+    folder = str(Path(csv_path).parent)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.scatter(df['concurrency'], df['ext_ops_sec'], s=40, alpha=0.55,
+               color=C_BLUE, edgecolors='white', linewidths=0.5, label='Sample')
+    means = df.groupby('concurrency')['ext_ops_sec'].mean().reset_index()
+    ax.plot(means['concurrency'], means['ext_ops_sec'], '-o', color=C_RED,
+            linewidth=2, markersize=6, label='Mean')
+    ax.set_xlabel('Concurrency (N)')
+    ax.set_ylabel('External Throughput (ops/sec)')
+    ax.set_title('External Workload Saturation — Per-Sample Throughput')
+    ax.set_ylim(bottom=0)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    save_fig(fig, os.path.join(_ext_subdir(folder, 'per_sample'), 'scatter.png'))
+
+
 def plot_ext_timeseries(csv_path: str):
     """Generate time-series plots for external workload SoI sweep."""
     df = pd.read_csv(csv_path)
@@ -1116,14 +1268,14 @@ def plot_ext_timeseries(csv_path: str):
     ax.legend(loc='best', fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
-    save_fig(fig, os.path.join(folder, 'timeseries_ext_throughput.png'))
+    save_fig(fig, os.path.join(_ext_subdir(folder, 'timeseries'), 'ext_throughput.png'))
 
     # 2. Heatmap: external throughput over time × SoI workers
     if len(soi_counts) > 1:
         # Pivot to 2D grid
         pivot = df.pivot_table(index='soi_workers', columns='elapsed_ms', values='ext_ops_sec')
         fig, ax = plt.subplots(figsize=(12, 5))
-        im = ax.imshow(pivot.values, aspect='auto', cmap='RdYlGn',
+        im = ax.imshow(pivot.values, aspect='auto', cmap='viridis',
                        extent=[pivot.columns.min() / 1000, pivot.columns.max() / 1000,
                                pivot.index.max() + 0.5, pivot.index.min() - 0.5])
         ax.set_xlabel('Elapsed (seconds)')
@@ -1133,88 +1285,18 @@ def plot_ext_timeseries(csv_path: str):
         cbar = fig.colorbar(im, ax=ax, label='External ops/sec')
         cbar.formatter = plt.FuncFormatter(lambda v, p: format_number(v))
         cbar.update_ticks()
-        save_fig(fig, os.path.join(folder, 'timeseries_heatmap.png'))
+        save_fig(fig, os.path.join(_ext_subdir(folder, 'timeseries'), 'heatmap.png'))
 
-    # 3. CPU utilization over time — small multiples (one row per SoI count)
-    if 'cpu_pct' in df.columns:
-        n = len(soi_counts)
-        fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True)
-        if n == 1:
-            axes = [axes]
-        for i, (ax, s) in enumerate(zip(axes, soi_counts)):
-            sub = df[df['soi_workers'] == s]
-            color = cmap(i / max(n - 1, 1))
-            ax.plot(sub['elapsed_ms'] / 1000, sub['cpu_pct'], '-', color=color,
-                    linewidth=1.0, alpha=0.8)
-            ax.set_ylabel(f'{int(s)} SoI', fontsize=9, rotation=0, labelpad=35, va='center')
-            ax.set_ylim(0, 105)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='y', labelsize=7)
-        axes[-1].set_xlabel('Elapsed (seconds)')
-        fig.suptitle(f'SoI Sweep ({soi_type}) — CPU Utilization Time Series', fontsize=12)
-        fig.tight_layout()
-        save_fig(fig, os.path.join(folder, 'timeseries_cpu.png'))
-
-    # 3b. IO BW utilization over time — small multiples (one row per SoI count)
-    if 'io_util_pct' in df.columns:
-        n = len(soi_counts)
-        fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True)
-        if n == 1:
-            axes = [axes]
-        for i, (ax, s) in enumerate(zip(axes, soi_counts)):
-            sub = df[df['soi_workers'] == s]
-            color = cmap(i / max(n - 1, 1))
-            ax.plot(sub['elapsed_ms'] / 1000, sub['io_util_pct'], '-', color=color,
-                    linewidth=1.0, alpha=0.8)
-            ax.set_ylabel(f'{int(s)} SoI', fontsize=9, rotation=0, labelpad=35, va='center')
-            ax.set_ylim(0, 105)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='y', labelsize=7)
-        axes[-1].set_xlabel('Elapsed (seconds)')
-        fig.suptitle(f'SoI Sweep ({soi_type}) — IO BW Utilization Time Series', fontsize=12)
-        fig.tight_layout()
-        save_fig(fig, os.path.join(folder, 'timeseries_io_bw.png'))
-
-    # 3c. IO IOPS utilization over time — small multiples (one row per SoI count)
-    if 'io_iops_util_pct' in df.columns:
-        n = len(soi_counts)
-        y_max = max(df['io_iops_util_pct'].max() * 1.1, 10)
-        fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True)
-        if n == 1:
-            axes = [axes]
-        for i, (ax, s) in enumerate(zip(axes, soi_counts)):
-            sub = df[df['soi_workers'] == s]
-            color = cmap(i / max(n - 1, 1))
-            ax.plot(sub['elapsed_ms'] / 1000, sub['io_iops_util_pct'], '-', color=color,
-                    linewidth=1.0, alpha=0.8)
-            ax.set_ylabel(f'{int(s)} SoI', fontsize=9, rotation=0, labelpad=35, va='center')
-            ax.set_ylim(0, y_max)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='y', labelsize=7)
-        axes[-1].set_xlabel('Elapsed (seconds)')
-        fig.suptitle(f'SoI Sweep ({soi_type}) — IO IOPS Utilization Time Series', fontsize=12)
-        fig.tight_layout()
-        save_fig(fig, os.path.join(folder, 'timeseries_io_iops.png'))
-
-    # 3d. Memory utilization over time — small multiples (one row per SoI count)
-    if 'mem_usage_pct' in df.columns:
-        n = len(soi_counts)
-        fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True)
-        if n == 1:
-            axes = [axes]
-        for i, (ax, s) in enumerate(zip(axes, soi_counts)):
-            sub = df[df['soi_workers'] == s]
-            color = cmap(i / max(n - 1, 1))
-            ax.plot(sub['elapsed_ms'] / 1000, sub['mem_usage_pct'], '-', color=color,
-                    linewidth=1.0, alpha=0.8)
-            ax.set_ylabel(f'{int(s)} SoI', fontsize=9, rotation=0, labelpad=35, va='center')
-            ax.set_ylim(0, 105)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='y', labelsize=7)
-        axes[-1].set_xlabel('Elapsed (seconds)')
-        fig.suptitle(f'SoI Sweep ({soi_type}) — Memory Utilization Time Series', fontsize=12)
-        fig.tight_layout()
-        save_fig(fig, os.path.join(folder, 'timeseries_mem.png'))
+    # 3. Per-SoI-count combined panels: one figure per worker count with
+    #    throughput (left axis) overlaid with CPU/IO/mem utilizations (right axis).
+    #    Reveals within-window phase correlations — e.g. does throughput dip when
+    #    IO% spikes? Much easier to read than stacked small-multiples.
+    _plot_combined_per_group(
+        df, soi_counts, 'soi_workers', folder,
+        title_prefix=f'SoI Sweep ({soi_type})',
+        group_label='SoI',
+        out_template='timeseries_per_soi_{:02d}.png',
+    )
 
     # 4. Peak utilization summary: peak, P95, median for CPU and IO at each SoI count
     if 'cpu_pct' in df.columns and 'io_util_pct' in df.columns:
@@ -1267,7 +1349,7 @@ def plot_ext_timeseries(csv_path: str):
         ax_io.legend(loc='best', fontsize=9)
         ax_io.grid(True, alpha=0.3)
         ax_io.xaxis.set_major_locator(MaxNLocator(integer=True))
-        save_fig(fig, os.path.join(folder, 'utilization_distribution.png'))
+        save_fig(fig, os.path.join(_ext_subdir(folder, 'utilization'), 'distribution.png'))
 
     # 5. Utilization CDF at baseline (0 SoI) — shows what fraction of time each resource
     #    spends at various utilization levels
@@ -1287,7 +1369,7 @@ def plot_ext_timeseries(csv_path: str):
             ax.set_ylim(0, 100)
             ax.legend(loc='best', fontsize=9)
             ax.grid(True, alpha=0.3)
-            save_fig(fig, os.path.join(folder, 'utilization_cdf_baseline.png'))
+            save_fig(fig, os.path.join(_ext_subdir(folder, 'utilization'), 'cdf_baseline.png'))
 
 
 def plot_ext_saturation_timeseries(csv_path: str):
@@ -1314,13 +1396,13 @@ def plot_ext_saturation_timeseries(csv_path: str):
     ax.legend(loc='best', fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
-    save_fig(fig, os.path.join(folder, 'timeseries_ext_throughput.png'))
+    save_fig(fig, os.path.join(_ext_subdir(folder, 'timeseries'), 'ext_throughput.png'))
 
     # 2. Heatmap: external throughput over time × concurrency
     if len(concurrencies) > 1:
         pivot = df.pivot_table(index='concurrency', columns='elapsed_ms', values='ext_ops_sec')
         fig, ax = plt.subplots(figsize=(12, 5))
-        im = ax.imshow(pivot.values, aspect='auto', cmap='RdYlGn',
+        im = ax.imshow(pivot.values, aspect='auto', cmap='viridis',
                        extent=[pivot.columns.min() / 1000, pivot.columns.max() / 1000,
                                pivot.index.max() + 0.5, pivot.index.min() - 0.5])
         ax.set_xlabel('Elapsed (seconds)')
@@ -1330,67 +1412,15 @@ def plot_ext_saturation_timeseries(csv_path: str):
         cbar = fig.colorbar(im, ax=ax, label='External ops/sec')
         cbar.formatter = plt.FuncFormatter(lambda v, p: format_number(v))
         cbar.update_ticks()
-        save_fig(fig, os.path.join(folder, 'timeseries_heatmap.png'))
+        save_fig(fig, os.path.join(_ext_subdir(folder, 'timeseries'), 'heatmap.png'))
 
-    # 3. CPU utilization over time — small multiples
-    if 'cpu_pct' in df.columns:
-        n = len(concurrencies)
-        fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True)
-        if n == 1:
-            axes = [axes]
-        for i, (ax, c) in enumerate(zip(axes, concurrencies)):
-            sub = df[df['concurrency'] == c]
-            color = cmap(i / max(n - 1, 1))
-            ax.plot(sub['elapsed_ms'] / 1000, sub['cpu_pct'], '-', color=color,
-                    linewidth=1.0, alpha=0.8)
-            ax.set_ylabel(f'N={int(c)}', fontsize=9, rotation=0, labelpad=35, va='center')
-            ax.set_ylim(0, 105)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='y', labelsize=7)
-        axes[-1].set_xlabel('Elapsed (seconds)')
-        fig.suptitle('External Workload Saturation — CPU Utilization Time Series', fontsize=12)
-        fig.tight_layout()
-        save_fig(fig, os.path.join(folder, 'timeseries_cpu.png'))
-
-    # 4. IO BW utilization over time — small multiples
-    if 'io_util_pct' in df.columns:
-        n = len(concurrencies)
-        fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True)
-        if n == 1:
-            axes = [axes]
-        for i, (ax, c) in enumerate(zip(axes, concurrencies)):
-            sub = df[df['concurrency'] == c]
-            color = cmap(i / max(n - 1, 1))
-            ax.plot(sub['elapsed_ms'] / 1000, sub['io_util_pct'], '-', color=color,
-                    linewidth=1.0, alpha=0.8)
-            ax.set_ylabel(f'N={int(c)}', fontsize=9, rotation=0, labelpad=35, va='center')
-            ax.set_ylim(0, 105)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='y', labelsize=7)
-        axes[-1].set_xlabel('Elapsed (seconds)')
-        fig.suptitle('External Workload Saturation — IO BW Utilization Time Series', fontsize=12)
-        fig.tight_layout()
-        save_fig(fig, os.path.join(folder, 'timeseries_io_bw.png'))
-
-    # 5. Memory utilization over time — small multiples
-    if 'mem_usage_pct' in df.columns:
-        n = len(concurrencies)
-        fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True)
-        if n == 1:
-            axes = [axes]
-        for i, (ax, c) in enumerate(zip(axes, concurrencies)):
-            sub = df[df['concurrency'] == c]
-            color = cmap(i / max(n - 1, 1))
-            ax.plot(sub['elapsed_ms'] / 1000, sub['mem_usage_pct'], '-', color=color,
-                    linewidth=1.0, alpha=0.8)
-            ax.set_ylabel(f'N={int(c)}', fontsize=9, rotation=0, labelpad=35, va='center')
-            ax.set_ylim(0, 105)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='y', labelsize=7)
-        axes[-1].set_xlabel('Elapsed (seconds)')
-        fig.suptitle('External Workload Saturation — Memory Utilization Time Series', fontsize=12)
-        fig.tight_layout()
-        save_fig(fig, os.path.join(folder, 'timeseries_mem.png'))
+    # 3. Per-N combined panels: throughput + all utilizations overlaid, one figure per N.
+    _plot_combined_per_group(
+        df, concurrencies, 'concurrency', folder,
+        title_prefix='External Workload Saturation',
+        group_label='N',
+        out_template='timeseries_per_n_{:02d}.png',
+    )
 
 
 def plot_ext_saturation(csv_path: str):
@@ -1400,6 +1430,7 @@ def plot_ext_saturation(csv_path: str):
     x = df['concurrency']
 
     has_stddev = 'ext_ops_stddev' in df.columns
+    has_pcts = {'ops_sec_p10', 'ops_sec_p50', 'ops_sec_p90'}.issubset(df.columns)
 
     print(f"  -> {folder}/")
 
@@ -1409,10 +1440,17 @@ def plot_ext_saturation(csv_path: str):
 
     # 1. Throughput vs concurrency
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.errorbar(x, df['ext_ops_sec'],
-                yerr=df['ext_ops_stddev'] if has_stddev else None,
-                fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
-                capsize=3, capthick=1, label='External ops/s')
+    if has_pcts:
+        ax.fill_between(x, df['ops_sec_p10'], df['ops_sec_p90'],
+                        alpha=0.2, color=C_BLUE, label='p10–p90')
+        ax.plot(x, df['ops_sec_p50'], '--', color=C_BLUE, alpha=0.6, label='p50')
+        ax.plot(x, df['ext_ops_sec'], '-o', color=C_BLUE, linewidth=2,
+                markersize=6, label='Mean ops/s')
+    else:
+        ax.errorbar(x, df['ext_ops_sec'],
+                    yerr=df['ext_ops_stddev'] if has_stddev else None,
+                    fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
+                    capsize=3, capthick=1, label='External ops/s')
     ax.axvline(x=peak_n, color=C_RED, linestyle='--', alpha=0.7,
                label=f'Peak: N={int(peak_n)}')
     ax.scatter([peak_n], [peak_ops], color=C_RED, s=100, zorder=5)
@@ -1458,7 +1496,7 @@ def plot_ext_saturation(csv_path: str):
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.legend()
         ax.grid(True, alpha=0.3)
-        save_fig(fig, os.path.join(folder, 'utilization.png'))
+        save_fig(fig, os.path.join(_ext_subdir(folder, 'utilization'), 'utilization.png'))
 
 
 def plot_ext_soi(csv_path: str):
@@ -1472,15 +1510,23 @@ def plot_ext_soi(csv_path: str):
     soi_type = name.replace('ext_soi_', '').replace('_throughput', '')
 
     has_stddev = 'ext_ops_stddev' in df.columns
+    has_pcts = {'ops_sec_p10', 'ops_sec_p50', 'ops_sec_p90'}.issubset(df.columns)
 
     print(f"  -> {folder}/")
 
     # 1. External workload throughput vs SoI workers
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.errorbar(x, df['ext_ops_sec'],
-                yerr=df['ext_ops_stddev'] if has_stddev else None,
-                fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
-                capsize=3, capthick=1, label='External ops/s')
+    if has_pcts:
+        ax.fill_between(x, df['ops_sec_p10'], df['ops_sec_p90'],
+                        alpha=0.2, color=C_BLUE, label='p10–p90')
+        ax.plot(x, df['ops_sec_p50'], '--', color=C_BLUE, alpha=0.6, label='p50')
+        ax.plot(x, df['ext_ops_sec'], '-o', color=C_BLUE, linewidth=2,
+                markersize=6, label='Mean ops/s')
+    else:
+        ax.errorbar(x, df['ext_ops_sec'],
+                    yerr=df['ext_ops_stddev'] if has_stddev else None,
+                    fmt='-o', color=C_BLUE, linewidth=2, markersize=6,
+                    capsize=3, capthick=1, label='External ops/s')
     ax.set_xlabel('SoI Workers')
     ax.set_ylabel('External Throughput (ops/sec)')
     ax.set_title(f'SoI Sweep ({soi_type}) — External Workload Throughput')
@@ -1564,7 +1610,7 @@ def plot_ext_soi(csv_path: str):
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.legend()
         ax.grid(True, alpha=0.3)
-        save_fig(fig, os.path.join(folder, 'utilization.png'))
+        save_fig(fig, os.path.join(_ext_subdir(folder, 'utilization'), 'utilization.png'))
 
 
 def plot_per_worker_ext_soi(csv_path: str):
@@ -1592,7 +1638,7 @@ def plot_per_worker_ext_soi(csv_path: str):
     ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
-    save_fig(fig, os.path.join(folder, 'per_worker_distribution.png'))
+    save_fig(fig, os.path.join(_ext_subdir(folder, 'per_worker'), 'distribution.png'))
 
 
 def plot_soi_comparison(soi_csvs: list):
@@ -1881,7 +1927,11 @@ def main():
         print(f"Processing: {name}")
 
         try:
-            if name.startswith('per_worker_'):
+            if name.startswith('per_sample_ext_soi_'):
+                plot_per_sample_ext_soi(csv_path)
+            elif name == 'per_sample_ext_saturation':
+                plot_per_sample_ext_saturation(csv_path)
+            elif name.startswith('per_worker_'):
                 if 'intensity_sweep' in name:
                     plot_per_worker_intensity_sweep(csv_path)
                 elif 'proc_slack' in name:

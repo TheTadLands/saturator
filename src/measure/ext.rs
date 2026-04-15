@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -11,6 +12,16 @@ use super::spawn_soi_worker;
 /// Result of a single external workload measurement run.
 pub struct ExtMeasurementResult {
     pub ext_ops_per_sec: f64,
+    /// Total ops completed by the external workload during the measurement
+    /// window (cumulative_end - cumulative_start from the throughput protocol).
+    pub total_ops: f64,
+    /// Elapsed seconds spanned by total_ops (may differ slightly from
+    /// params.duration_secs due to sampling alignment).
+    pub total_ops_secs: f64,
+    /// Raw per-second rate samples over the measurement window. Retained so
+    /// aggregation across samples can pool rates before percentiling instead of
+    /// collapsing each run to its own percentile first.
+    pub rate_samples: Vec<f64>,
     pub soi_ops: f64,
     pub metrics: proc_metrics::SystemMetrics,
     pub soi_per_worker: Vec<(f64, f64, f64, u64)>,
@@ -48,11 +59,16 @@ pub fn run_ext_measurement(
     // Clean up stale throughput file
     let _ = std::fs::remove_file(throughput_file);
 
-    // Launch external workload
+    // Launch external workload in its own process group so we can signal the
+    // whole group (including any backgrounded children like db_bench) at teardown.
+    // sh does not propagate signals to backgrounded children by default, so
+    // without a group-wide signal db_bench survives wrapper teardown, reparents
+    // to init, and corrupts the shared throughput file across subsequent samples.
     let mut ext_child = Command::new("sh")
         .arg("-c")
         .arg(ext_cmd)
         .env("SATURATOR_THROUGHPUT_FILE", throughput_file)
+        .process_group(0)
         .spawn()
         .expect("Failed to spawn external workload");
 
@@ -158,14 +174,15 @@ pub fn run_ext_measurement(
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, params.duration_secs as f64);
 
-    // Terminate external workload: SIGTERM, then SIGKILL after 2s
-    let ext_pid = ext_child.id();
-    unsafe { libc::kill(ext_pid as i32, libc::SIGTERM); }
+    // Terminate external workload: SIGTERM the whole process group, then SIGKILL
+    // the group after 2s. Negative PID targets the group (kill(2)).
+    let ext_pid = ext_child.id() as i32;
+    unsafe { libc::kill(-ext_pid, libc::SIGTERM); }
     match ext_child.try_wait() {
         Ok(Some(_)) => {}
         _ => {
             std::thread::sleep(Duration::from_secs(2));
-            let _ = ext_child.kill();
+            unsafe { libc::kill(-ext_pid, libc::SIGKILL); }
             let _ = ext_child.wait();
         }
     }
@@ -190,9 +207,14 @@ pub fn run_ext_measurement(
     }
 
     let ext_ops_per_sec = ThroughputReader::average_ops(&all_tp_samples);
+    let (total_ops, total_ops_secs) = tp_reader.total_ops().unwrap_or((0.0, 0.0));
+    let rate_samples: Vec<f64> = all_tp_samples.iter().map(|(_, r)| *r).collect();
 
     ExtMeasurementResult {
         ext_ops_per_sec,
+        total_ops,
+        total_ops_secs,
+        rate_samples,
         soi_ops: soi_ops_total,
         metrics,
         soi_per_worker,
@@ -200,8 +222,30 @@ pub fn run_ext_measurement(
     }
 }
 
-/// Run multiple measurement samples and return aggregated results.
-/// Returns: (median_ext_ops, ext_stddev, median_soi_ops, median_metrics, soi_per_worker, timeseries)
+/// Aggregated result of multiple measurement samples for an external-workload run.
+pub struct ExtAggregateResult {
+    pub median_ext_ops: f64,
+    pub ext_stddev: f64,
+    /// Sum of total_ops across samples and the total elapsed seconds they
+    /// cover. `total_ops / total_secs` gives the pooled mean rate, which for a
+    /// bimodal victim is a more defensible summary than the median of rates.
+    pub total_ops: f64,
+    pub total_ops_secs: f64,
+    /// Percentiles computed over per-second rates pooled across all samples.
+    pub p10_ops_sec: f64,
+    pub p50_ops_sec: f64,
+    pub p90_ops_sec: f64,
+    pub median_soi_ops: f64,
+    pub metrics: proc_metrics::SystemMetrics,
+    pub soi_per_worker: Vec<(f64, f64, f64, u64)>,
+    pub timeseries: Option<Vec<ExtTimeSeriesSample>>,
+    pub per_sample_ext_ops: Vec<f64>,
+    pub per_sample_soi_ops: Vec<f64>,
+}
+
+/// Run multiple measurement samples and return aggregated results plus the
+/// raw per-sample `(ext_ops, soi_ops)` values (in sample order) so callers can
+/// emit long-format per-sample CSVs.
 pub fn measure_ext_throughput(
     ext_cmd: &str,
     throughput_file: &str,
@@ -209,8 +253,13 @@ pub fn measure_ext_throughput(
     soi_type: SoiType,
     soi_buffer_size: usize,
     params: &TuningParams,
-) -> (f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Option<Vec<ExtTimeSeriesSample>>) {
-    let results: Vec<ExtMeasurementResult> = (0..params.samples).map(|_| {
+) -> ExtAggregateResult {
+    let results: Vec<ExtMeasurementResult> = (0..params.samples).enumerate().map(|(i, _)| {
+        // Idle gap between samples so post-kill compaction drains and the
+        // system reaches a consistent starting state before the next warmup.
+        if i > 0 && params.cooldown_secs > 0 {
+            std::thread::sleep(Duration::from_secs(params.cooldown_secs));
+        }
         run_ext_measurement(ext_cmd, throughput_file, soi_count, soi_type, soi_buffer_size, params)
     }).collect();
 
@@ -221,6 +270,14 @@ pub fn measure_ext_throughput(
     let median_ext = super::median(&ext_vals);
     let ext_stddev = super::stddev(&ext_vals);
     let median_soi = super::median(&soi_vals);
+
+    let total_ops: f64 = results.iter().map(|r| r.total_ops).sum();
+    let total_ops_secs: f64 = results.iter().map(|r| r.total_ops_secs).sum();
+    let pooled: Vec<(u64, f64)> = results.iter()
+        .flat_map(|r| r.rate_samples.iter().map(|v| (0u64, *v)))
+        .collect();
+    let pcts = super::ext_throughput::ThroughputReader::percentiles(&pooled, &[0.10, 0.50, 0.90]);
+    let (p10, p50, p90) = (pcts[0], pcts[1], pcts[2]);
 
     // Select per-worker data and timeseries from the sample closest to median
     let median_idx = results.iter().enumerate()
@@ -234,7 +291,21 @@ pub fn measure_ext_throughput(
     let soi_per_worker = results[median_idx].soi_per_worker.clone();
     let timeseries = results.into_iter().nth(median_idx).and_then(|r| r.timeseries);
 
-    (median_ext, ext_stddev, median_soi, proc_metrics::median_metrics(&metrics_list), soi_per_worker, timeseries)
+    ExtAggregateResult {
+        median_ext_ops: median_ext,
+        ext_stddev,
+        total_ops,
+        total_ops_secs,
+        p10_ops_sec: p10,
+        p50_ops_sec: p50,
+        p90_ops_sec: p90,
+        median_soi_ops: median_soi,
+        metrics: proc_metrics::median_metrics(&metrics_list),
+        soi_per_worker,
+        timeseries,
+        per_sample_ext_ops: ext_vals,
+        per_sample_soi_ops: soi_vals,
+    }
 }
 
 /// Read SoI worker counters from shared memory (if SoI workers are active).

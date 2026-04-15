@@ -48,6 +48,7 @@ fn main() {
         println!("  --intensity <F>      Work probability per iteration, 0.0-1.0 (default: 1.0)");
         println!("  --chain              Auto-run intensity sweep at saturation point (proc only)");
         println!("  --warmup <N>         Warmup duration in seconds before measurement (default: 10)");
+        println!("  --cooldown <N>       Idle gap in seconds between samples to let state settle (default: 0)");
         println!("  --random-access      Use random buffer access pattern to defeat hardware prefetcher");
         println!("  --direct-io          Use O_DIRECT to bypass page cache for I/O ops");
         println!("  --sample-interval <ms> Time-series sampling interval in ms (default: off)");
@@ -396,6 +397,12 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
                 i += 1;
                 if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
                     params.warmup_secs = v;
+                }
+            }
+            "--cooldown" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
+                    params.cooldown_secs = v;
                 }
             }
             "--sample-interval" => {

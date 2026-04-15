@@ -26,6 +26,7 @@ pub struct TuningParams {
     pub intensity: f64,       // probability of working vs sleeping per iteration (default: 1.0)
     pub chain: bool,          // auto-chain saturation → intensity sweep (default: false)
     pub warmup_secs: u64,     // warmup duration before measurement in seconds (default: 10)
+    pub cooldown_secs: u64,   // idle gap between samples to let system state settle (default: 0)
     pub random_access: bool,  // use random buffer access pattern to defeat prefetcher (default: false)
     pub direct_io: bool,      // use O_DIRECT to bypass page cache for I/O ops (default: false)
     pub sample_interval_ms: Option<u64>, // time-series sampling interval in ms (default: None = disabled)
@@ -47,6 +48,7 @@ impl Default for TuningParams {
             intensity: 1.0,
             chain: false,
             warmup_secs: 10,
+            cooldown_secs: 0,
             random_access: false,
             direct_io: false,
             sample_interval_ms: None,

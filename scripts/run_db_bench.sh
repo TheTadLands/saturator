@@ -44,6 +44,24 @@ START_MS=$(date +%s%3N)
 db_bench --report_interval_seconds=1 --report_file="$REPORT_FILE" "$@" > /dev/null 2>&1 &
 DB_BENCH_PID=$!
 
+# Ensure db_bench dies if we (the wrapper) get signaled. sh does not
+# propagate signals to backgrounded children by default, so without this
+# trap saturator's SIGTERM kills the wrapper but leaves db_bench orphaned,
+# reparented to init, and still writing to the shared throughput file —
+# corrupting downstream samples.
+cleanup() {
+    kill -TERM "$DB_BENCH_PID" 2>/dev/null || true
+    # Give db_bench a moment to exit cleanly, then force.
+    for _ in 1 2 3 4; do
+        kill -0 "$DB_BENCH_PID" 2>/dev/null || break
+        sleep 0.25
+    done
+    kill -KILL "$DB_BENCH_PID" 2>/dev/null || true
+    rm -f "$REPORT_FILE"
+}
+trap 'cleanup; exit 130' INT TERM HUP
+trap cleanup EXIT
+
 # Poll the report file, convert interval QPS rows to cumulative ops, and
 # append to the throughput file. Each report row is: secs_elapsed,interval_qps
 last_lines=0

@@ -83,6 +83,7 @@ pub fn write_params_file(
     writeln!(f, "step: {}", params.step).unwrap();
     writeln!(f, "intensity: {}", params.intensity).unwrap();
     writeln!(f, "warmup_secs: {}", params.warmup_secs).unwrap();
+    writeln!(f, "cooldown_secs: {}", params.cooldown_secs).unwrap();
     writeln!(f, "random_access: {}", params.random_access).unwrap();
     writeln!(f, "direct_io: {}", params.direct_io).unwrap();
     if let Some(interval) = params.sample_interval_ms {

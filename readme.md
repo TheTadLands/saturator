@@ -345,10 +345,13 @@ Produced by `find-soi-slack-ext`. The external workload reports a single through
 | Column | Description |
 |--------|-------------|
 | `soi_workers` | Number of SoI workers |
-| `ext_ops_sec` | External workload throughput (ops/sec from protocol file) |
-| `ext_change_pct` | Percentage change vs baseline (0 SoI workers) |
+| `ext_ops_sec` | Pooled mean rate (`total_ops / total_ops_secs`). More robust than the median when the victim has phases (e.g. RocksDB compactions). |
+| `ext_change_pct` | Percentage change in `ext_ops_sec` vs baseline (0 SoI workers) |
 | `soi_ops` | SoI worker operations per second |
-| `ext_ops_stddev` | Standard deviation of external ops across samples |
+| `ext_ops_stddev` | Standard deviation of per-sample mean rates across runs |
+| `total_ops` | Total external ops completed during the measurement window, summed across samples |
+| `total_ops_secs` | Elapsed seconds covered by `total_ops` |
+| `ops_sec_p10` / `ops_sec_p50` / `ops_sec_p90` | Percentiles of per-second rates pooled across all samples. Width of the p10–p90 band exposes bimodality (e.g. write-phase vs compaction-phase). |
 | `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV |
 
 ### External Saturation CSV columns
@@ -358,9 +361,10 @@ Produced by `find-soi-saturation-ext`. One row per concurrency level tested.
 | Column | Description |
 |--------|-------------|
 | `concurrency` | Concurrency parameter (value of `{N}`) |
-| `ext_ops_sec` | External workload throughput (ops/sec from protocol file) |
-| `ext_ops_stddev` | Standard deviation of external ops across samples |
-| `throughput_per_unit` | Throughput divided by concurrency level (efficiency) |
+| `ext_ops_sec` | Pooled mean rate (see SoI sweep column above) |
+| `ext_ops_stddev` | Standard deviation of per-sample mean rates across runs |
+| `throughput_per_unit` | `ext_ops_sec` divided by concurrency (efficiency) |
+| `total_ops`, `total_ops_secs`, `ops_sec_p10/p50/p90` | See SoI sweep columns above |
 | `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV |
 
 ### Time-Series CSV columns

@@ -8,6 +8,9 @@ pub struct ThroughputReader {
     last_line_count: usize,
     /// Last known cumulative ops and timestamp, used to compute rates.
     last_cumulative: Option<(u64, f64)>,
+    /// First cumulative seen after the most recent `reset()`. Used to compute
+    /// total ops completed over the measurement window.
+    first_cumulative: Option<(u64, f64)>,
 }
 
 impl ThroughputReader {
@@ -16,7 +19,43 @@ impl ThroughputReader {
             path: path.to_string(),
             last_line_count: 0,
             last_cumulative: None,
+            first_cumulative: None,
         }
+    }
+
+    /// Total ops and elapsed seconds between the first sample after `reset()`
+    /// and the most recent sample. Returns `None` until at least two samples
+    /// have been seen (including the one seeded by `reset()`).
+    pub fn total_ops(&self) -> Option<(f64, f64)> {
+        let (first_ts, first_ops) = self.first_cumulative?;
+        let (last_ts, last_ops) = self.last_cumulative?;
+        let dt = last_ts.saturating_sub(first_ts) as f64 / 1000.0;
+        if dt <= 0.0 {
+            return None;
+        }
+        Some((last_ops - first_ops, dt))
+    }
+
+    /// Return the given quantiles (0.0–1.0) of a set of rate samples. Linear
+    /// interpolation between sorted samples. Empty input yields zeros.
+    pub fn percentiles(samples: &[(u64, f64)], qs: &[f64]) -> Vec<f64> {
+        if samples.is_empty() {
+            return qs.iter().map(|_| 0.0).collect();
+        }
+        let mut rates: Vec<f64> = samples.iter().map(|(_, r)| *r).collect();
+        rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        qs.iter().map(|q| {
+            let q = q.clamp(0.0, 1.0);
+            let pos = q * (rates.len() - 1) as f64;
+            let lo = pos.floor() as usize;
+            let hi = pos.ceil() as usize;
+            if lo == hi {
+                rates[lo]
+            } else {
+                let frac = pos - lo as f64;
+                rates[lo] * (1.0 - frac) + rates[hi] * frac
+            }
+        }).collect()
     }
 
     /// Read any new lines since the last call and compute instantaneous rates
@@ -47,6 +86,9 @@ impl ThroughputReader {
                             let rate = (cum_ops - prev_ops) / dt_sec;
                             samples.push((ts, rate));
                         }
+                    }
+                    if self.first_cumulative.is_none() {
+                        self.first_cumulative = Some((ts, cum_ops));
                     }
                     self.last_cumulative = Some((ts, cum_ops));
                 }
@@ -91,16 +133,19 @@ impl ThroughputReader {
     /// Call after warmup to start fresh for the measurement window.
     pub fn reset(&mut self) {
         // Read current line count and last cumulative value so we skip warmup data
+        self.first_cumulative = None;
         if let Ok(contents) = std::fs::read_to_string(&self.path) {
             let lines: Vec<&str> = contents.lines().collect();
             self.last_line_count = lines.len();
             // Seed cumulative state from the last warmup line so the first
-            // measurement sample can compute a valid delta
+            // measurement sample can compute a valid delta. This seed also
+            // anchors the "first sample" used by total_ops().
             if let Some(last_line) = lines.last() {
                 let parts: Vec<&str> = last_line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     if let (Ok(ts), Ok(cum_ops)) = (parts[0].parse::<u64>(), parts[1].parse::<f64>()) {
                         self.last_cumulative = Some((ts, cum_ops));
+                        self.first_cumulative = Some((ts, cum_ops));
                     }
                 }
             }

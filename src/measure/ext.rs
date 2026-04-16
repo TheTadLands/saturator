@@ -1,13 +1,39 @@
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::saturator::{TuningParams, create_shared_region, destroy_shared_region, worker_counters, now_ns};
+use crate::saturator::{TuningParams, SharedRegion, create_shared_region, destroy_shared_region, worker_counters, now_ns};
 use crate::proc_metrics;
-use crate::soi::SoiType;
+use crate::soi::{SoiBackend, SoiType};
 use super::ext_throughput::ThroughputReader;
 use super::spawn_soi_worker;
+
+/// Active SoI for one measurement run. `Internal` uses the in-process synthetic
+/// worker shape (shmem rendezvous, deadline, per-worker counters). `External`
+/// is an opaque child process group — no shmem, no counters, lifecycle is
+/// "spawn → run for warmup+duration+slack → SIGTERM the group → unlink scratch".
+enum SoiState {
+    Internal {
+        shm_name: String,
+        region_ptr: *mut SharedRegion,
+        shm_fd: i32,
+        children: Vec<Child>,
+    },
+    External {
+        child: Child,
+        scratch_dir: String,
+    },
+}
+
+impl SoiState {
+    fn region_ptr(&self) -> Option<*mut SharedRegion> {
+        match self {
+            SoiState::Internal { region_ptr, .. } => Some(*region_ptr),
+            SoiState::External { .. } => None,
+        }
+    }
+}
 
 /// Result of a single external workload measurement run.
 pub struct ExtMeasurementResult {
@@ -24,7 +50,6 @@ pub struct ExtMeasurementResult {
     pub rate_samples: Vec<f64>,
     pub soi_ops: f64,
     pub metrics: proc_metrics::SystemMetrics,
-    pub soi_per_worker: Vec<(f64, f64, f64, u64)>,
     pub timeseries: Option<Vec<ExtTimeSeriesSample>>,
 }
 
@@ -73,22 +98,50 @@ pub fn run_ext_measurement(
         .expect("Failed to spawn external workload");
 
     // Set up SoI workers (if any)
-    let soi_state = if soi_count > 0 {
-        let shm_name = format!("/saturator_ext_{}_{}", std::process::id(), soi_count);
-        let (region_ptr, shm_fd) = create_shared_region(&shm_name, soi_count);
-        let region = unsafe { &*region_ptr };
+    let soi_state: Option<SoiState> = if soi_count > 0 {
+        Some(match soi_type.backend() {
+            SoiBackend::Internal => {
+                let shm_name = format!("/saturator_ext_{}_{}", std::process::id(), soi_count);
+                let (region_ptr, shm_fd) = create_shared_region(&shm_name, soi_count);
+                let region = unsafe { &*region_ptr };
 
-        let mut children = Vec::with_capacity(soi_count);
-        for i in 0..soi_count {
-            children.push(spawn_soi_worker(&shm_name, i, soi_count, soi_type, soi_buffer_size));
-        }
+                let mut children = Vec::with_capacity(soi_count);
+                for i in 0..soi_count {
+                    children.push(spawn_soi_worker(&shm_name, i, soi_count, soi_type, soi_buffer_size));
+                }
 
-        // Wait for all SoI workers to signal ready
-        while region.ready_count.load(Ordering::Relaxed) < soi_count as u64 {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+                // Wait for all SoI workers to signal ready
+                while region.ready_count.load(Ordering::Relaxed) < soi_count as u64 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
 
-        Some((shm_name, region_ptr, shm_fd, children))
+                SoiState::Internal { shm_name, region_ptr, shm_fd, children }
+            }
+            SoiBackend::External(template) => {
+                // Per-run scratch dir; fio creates per-job files inside it.
+                let scratch_dir = format!("/tmp/saturator_soi_{}_{}", std::process::id(), soi_count);
+                let _ = std::fs::remove_dir_all(&scratch_dir);
+                std::fs::create_dir_all(&scratch_dir)
+                    .expect("Failed to create SoI scratch directory");
+
+                // Stay alive past the measurement window so warmup+sample drift
+                // can't end measurement before fio is still pressuring IO.
+                let runtime = params.warmup_secs + params.duration_secs + 5;
+                let cmd = template
+                    .replace("{n}", &soi_count.to_string())
+                    .replace("{runtime}", &runtime.to_string())
+                    .replace("{scratch_dir}", &scratch_dir);
+
+                let child = Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .process_group(0)
+                    .spawn()
+                    .expect("Failed to spawn external SoI command (is fio installed?)");
+
+                SoiState::External { child, scratch_dir }
+            }
+        })
     } else {
         None
     };
@@ -100,9 +153,9 @@ pub fn run_ext_measurement(
     let mut tp_reader = ThroughputReader::new(throughput_file);
     tp_reader.reset();
 
-    if let Some((_, region_ptr, _, _)) = &soi_state {
+    if let Some(region_ptr) = soi_state.as_ref().and_then(SoiState::region_ptr) {
         for i in 0..soi_count {
-            let (wk_cpu, wk_io, wk_sleep, _) = unsafe { worker_counters(*region_ptr, i) };
+            let (wk_cpu, wk_io, wk_sleep, _) = unsafe { worker_counters(region_ptr, i) };
             wk_cpu.store(0, Ordering::Relaxed);
             wk_io.store(0, Ordering::Relaxed);
             wk_sleep.store(0, Ordering::Relaxed);
@@ -112,8 +165,8 @@ pub fn run_ext_measurement(
     // Start measurement
     let snap_before = proc_metrics::take_snapshot();
 
-    if let Some((_, region_ptr, _, _)) = &soi_state {
-        let region = unsafe { &**region_ptr };
+    if let Some(region_ptr) = soi_state.as_ref().and_then(SoiState::region_ptr) {
+        let region = unsafe { &*region_ptr };
         let deadline = now_ns() + params.duration_secs * 1_000_000_000;
         region.deadline_ns.store(deadline, Ordering::Relaxed);
     }
@@ -140,12 +193,12 @@ pub fn run_ext_measurement(
             }
             all_tp_samples.extend_from_slice(&new_tp);
 
-            // Read SoI counters
+            // Read SoI counters (empty for External backends — soi_delta stays 0)
             let curr_soi_counters = read_soi_counters(&soi_state, soi_count);
             let mut soi_delta = 0u64;
-            for i in 0..soi_count {
-                soi_delta += curr_soi_counters[i].0.saturating_sub(prev_soi_counters[i].0);
-                soi_delta += curr_soi_counters[i].1.saturating_sub(prev_soi_counters[i].1);
+            for (curr, prev) in curr_soi_counters.iter().zip(prev_soi_counters.iter()) {
+                soi_delta += curr.0.saturating_sub(prev.0);
+                soi_delta += curr.1.saturating_sub(prev.1);
             }
 
             let curr_snap = proc_metrics::take_snapshot();
@@ -187,23 +240,40 @@ pub fn run_ext_measurement(
         }
     }
 
-    // Collect SoI results
-    let mut soi_per_worker = Vec::new();
+    // Collect SoI results. Internal backends sum per-worker shmem counters into
+    // a total. External backends (fio etc.) leave soi_ops at 0 — there's no
+    // reliable cross-backend ops counter, and cgroup metrics still reflect what
+    // the SoI did. Per-worker breakdown is dropped in both cases.
     let mut soi_ops_total = 0.0;
-    if let Some((shm_name, region_ptr, shm_fd, mut children)) = soi_state {
-        for mut child in children.drain(..) {
-            let _ = child.wait();
+    match soi_state {
+        Some(SoiState::Internal { shm_name, region_ptr, shm_fd, mut children }) => {
+            for mut child in children.drain(..) {
+                let _ = child.wait();
+            }
+            for i in 0..soi_count {
+                let (wk_cpu, wk_io, _, _) = unsafe { worker_counters(region_ptr, i) };
+                let wc = wk_cpu.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
+                let wi = wk_io.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
+                soi_ops_total += wc + wi;
+            }
+            destroy_shared_region(&shm_name, region_ptr, shm_fd, soi_count);
         }
-        for i in 0..soi_count {
-            let (wk_cpu, wk_io, wk_sleep, wk_errors) = unsafe { worker_counters(region_ptr, i) };
-            let wc = wk_cpu.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
-            let wi = wk_io.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
-            let ws = wk_sleep.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
-            let we = wk_errors.load(Ordering::Relaxed);
-            soi_ops_total += wc + wi;
-            soi_per_worker.push((wc, wi, ws, we));
+        Some(SoiState::External { mut child, scratch_dir }) => {
+            // Mirror the victim teardown: SIGTERM the whole process group
+            // (fio + any helpers spawned by sh), give it 2s, then SIGKILL.
+            let pid = child.id() as i32;
+            unsafe { libc::kill(-pid, libc::SIGTERM); }
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    std::thread::sleep(Duration::from_secs(2));
+                    unsafe { libc::kill(-pid, libc::SIGKILL); }
+                    let _ = child.wait();
+                }
+            }
+            let _ = std::fs::remove_dir_all(&scratch_dir);
         }
-        destroy_shared_region(&shm_name, region_ptr, shm_fd, soi_count);
+        None => {}
     }
 
     let ext_ops_per_sec = ThroughputReader::average_ops(&all_tp_samples);
@@ -217,7 +287,6 @@ pub fn run_ext_measurement(
         rate_samples,
         soi_ops: soi_ops_total,
         metrics,
-        soi_per_worker,
         timeseries,
     }
 }
@@ -237,7 +306,6 @@ pub struct ExtAggregateResult {
     pub p90_ops_sec: f64,
     pub median_soi_ops: f64,
     pub metrics: proc_metrics::SystemMetrics,
-    pub soi_per_worker: Vec<(f64, f64, f64, u64)>,
     pub timeseries: Option<Vec<ExtTimeSeriesSample>>,
     pub per_sample_ext_ops: Vec<f64>,
     pub per_sample_soi_ops: Vec<f64>,
@@ -279,7 +347,7 @@ pub fn measure_ext_throughput(
     let pcts = super::ext_throughput::ThroughputReader::percentiles(&pooled, &[0.10, 0.50, 0.90]);
     let (p10, p50, p90) = (pcts[0], pcts[1], pcts[2]);
 
-    // Select per-worker data and timeseries from the sample closest to median
+    // Select timeseries from the sample closest to median
     let median_idx = results.iter().enumerate()
         .min_by(|(_, a), (_, b)| {
             (a.ext_ops_per_sec - median_ext).abs()
@@ -288,7 +356,6 @@ pub fn measure_ext_throughput(
         .map(|(i, _)| i)
         .unwrap_or(0);
 
-    let soi_per_worker = results[median_idx].soi_per_worker.clone();
     let timeseries = results.into_iter().nth(median_idx).and_then(|r| r.timeseries);
 
     ExtAggregateResult {
@@ -301,24 +368,24 @@ pub fn measure_ext_throughput(
         p90_ops_sec: p90,
         median_soi_ops: median_soi,
         metrics: proc_metrics::median_metrics(&metrics_list),
-        soi_per_worker,
         timeseries,
         per_sample_ext_ops: ext_vals,
         per_sample_soi_ops: soi_vals,
     }
 }
 
-/// Read SoI worker counters from shared memory (if SoI workers are active).
+/// Read SoI worker counters from shared memory. Returns an empty vec for
+/// External-backend SoIs (fio etc.) — they don't expose per-iteration counters,
+/// so the timeseries soi_ops_sec column is just 0 for those runs.
 fn read_soi_counters(
-    soi_state: &Option<(String, *mut crate::saturator::SharedRegion, i32, Vec<std::process::Child>)>,
+    soi_state: &Option<SoiState>,
     soi_count: usize,
 ) -> Vec<(u64, u64)> {
-    if let Some((_, region_ptr, _, _)) = soi_state {
-        (0..soi_count).map(|i| {
-            let (wk_cpu, wk_io, _, _) = unsafe { worker_counters(*region_ptr, i) };
+    match soi_state.as_ref().and_then(SoiState::region_ptr) {
+        Some(region_ptr) => (0..soi_count).map(|i| {
+            let (wk_cpu, wk_io, _, _) = unsafe { worker_counters(region_ptr, i) };
             (wk_cpu.load(Ordering::Relaxed), wk_io.load(Ordering::Relaxed))
-        }).collect()
-    } else {
-        Vec::new()
+        }).collect(),
+        None => Vec::new(),
     }
 }

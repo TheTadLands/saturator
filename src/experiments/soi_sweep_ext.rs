@@ -39,10 +39,6 @@ pub fn run_soi_sweep_ext_experiment(
     writeln!(csv_file, "soi_workers,ext_ops_sec,ext_change_pct,soi_ops,ext_ops_stddev,total_ops,total_ops_secs,ops_sec_p10,ops_sec_p50,ops_sec_p90,{}",
              proc_metrics::csv_header()).unwrap();
 
-    let pw_csv_path = format!("{}/per_worker_ext_soi_{}.csv", run_dir, soi_type.name());
-    let mut pw_file = std::fs::File::create(&pw_csv_path).unwrap();
-    writeln!(pw_file, "soi_workers,worker_id,cpu_ops_sec,io_ops_sec,sleep_ops_sec,total_ops_sec,io_errors").unwrap();
-
     // Long-format per-sample CSV: one row per (soi_workers, sample_idx).
     // Preserves individual sample values so plots can show within-N distribution
     // rather than only median/stddev.
@@ -123,11 +119,6 @@ pub fn run_soi_sweep_ext_experiment(
                  r.total_ops, r.total_ops_secs,
                  r.p10_ops_sec, r.p50_ops_sec, r.p90_ops_sec,
                  r.metrics.to_csv_row()).unwrap();
-
-        for (wid, &(wc, wi, ws, we)) in r.soi_per_worker.iter().enumerate() {
-            writeln!(pw_file, "{},{},{:.2},{:.2},{:.2},{:.2},{}",
-                     soi_count, wid, wc, wi, ws, wc + wi, we).unwrap();
-        }
 
         for (i, (e, s)) in r.per_sample_ext_ops.iter().zip(r.per_sample_soi_ops.iter()).enumerate() {
             writeln!(ps_file, "{},{},{:.2},{:.2}", soi_count, i, e, s).unwrap();

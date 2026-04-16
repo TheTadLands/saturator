@@ -502,33 +502,6 @@ def plot_ext_soi(csv_path: str):
         save_fig(fig, os.path.join(ext_subdir(folder, 'utilization'), 'utilization.png'))
 
 
-def plot_per_worker_ext_soi(csv_path: str):
-    """Box plot of SoI worker throughput distribution for external workload experiments."""
-    df = pd.read_csv(csv_path)
-    folder = str(Path(csv_path).parent)
-
-    soi_counts = sorted(df['soi_workers'].unique())
-
-    print(f"  -> {folder}/")
-
-    box_width = (soi_counts[1] - soi_counts[0]) * 0.6 if len(soi_counts) > 1 else 0.6
-
-    fig, ax = plt.subplots(figsize=(max(8, len(soi_counts) * 0.5), 5))
-    data = [df[df['soi_workers'] == s]['total_ops_sec'].values for s in soi_counts]
-    ax.boxplot(data, positions=soi_counts, widths=box_width * 0.7, patch_artist=True,
-               boxprops=dict(facecolor=C_CYAN, alpha=0.7),
-               medianprops=dict(color=C_BLUE, linewidth=2), manage_ticks=False)
-    ax.set_xticks(soi_counts)
-    ax.set_xticklabels([int(s) for s in soi_counts])
-    ax.set_xlabel('SoI Workers')
-    ax.set_ylabel('Per-Worker SoI Throughput (ops/sec)')
-    ax.set_title('External SoI Sweep — SoI Worker Distribution')
-    ax.set_ylim(bottom=0)
-    ax.grid(True, alpha=0.3)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
-    save_fig(fig, os.path.join(ext_subdir(folder, 'per_worker'), 'distribution.png'))
-
-
 SOI_COLORS = {
     'cpu': C_BLUE, 'l1d': C_CYAN, 'l2': C_PURPLE, 'l3': C_GREEN,
     'membw': C_ORANGE, 'memcap': '#999999', 'iobw': C_RED, 'iops': '#8B4513',

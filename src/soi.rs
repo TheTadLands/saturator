@@ -18,6 +18,42 @@ pub enum SoiType {
     IoOps,
 }
 
+/// How a SoI applies pressure: an in-process synthetic worker, or an external
+/// command spawned as a child. External backends bypass the shmem ready/deadline
+/// rendezvous and the per-worker counter shape — they're started, run for the
+/// full warmup+measurement window, and SIGTERM-ed at teardown.
+pub enum SoiBackend {
+    Internal,
+    /// Shell command template. Supported placeholders: `{n}` (worker count),
+    /// `{runtime}` (wall seconds the SoI must stay alive),
+    /// `{scratch_dir}` (per-run scratch directory, created by caller).
+    External(&'static str),
+}
+
+/// fio profile for sustained sequential write bandwidth pressure. `numjobs={n}`
+/// scales pressure via fio's native multi-job model rather than spawning N fio
+/// processes (which would each carry their own io_uring/libaio state). Direct IO
+/// bypasses the page cache so the bytes actually hit the device queue.
+const IOBW_FIO_TEMPLATE: &str = "exec fio \
+    --name=saturator_iobw \
+    --rw=write --bs=128k --direct=1 \
+    --ioengine=libaio --iodepth=32 \
+    --numjobs={n} --group_reporting \
+    --time_based --runtime={runtime} --size=1G \
+    --directory={scratch_dir} --output=/dev/null";
+
+/// fio profile for sustained IOPS pressure. Random offsets prevent the IO
+/// scheduler and device from merging contiguous writes into bandwidth-friendly
+/// batches (which would inflate bytes/sec without inflating ops/sec). 4k blocks
+/// maximize ops per byte transferred against a fixed bandwidth ceiling.
+const IOOPS_FIO_TEMPLATE: &str = "exec fio \
+    --name=saturator_iops \
+    --rw=randwrite --bs=4k --direct=1 \
+    --ioengine=libaio --iodepth=32 \
+    --numjobs={n} --group_reporting \
+    --time_based --runtime={runtime} --size=1G \
+    --directory={scratch_dir} --output=/dev/null";
+
 impl SoiType {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
@@ -65,6 +101,14 @@ impl SoiType {
             Self::Cpu => "CPU integer units",
             Self::IoBw => "Storage bandwidth",
             Self::IoOps => "Storage IOPS",
+        }
+    }
+
+    pub fn backend(&self) -> SoiBackend {
+        match self {
+            Self::IoBw => SoiBackend::External(IOBW_FIO_TEMPLATE),
+            Self::IoOps => SoiBackend::External(IOOPS_FIO_TEMPLATE),
+            _ => SoiBackend::Internal,
         }
     }
 }

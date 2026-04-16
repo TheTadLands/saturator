@@ -23,7 +23,6 @@ from plotting.ext import (
     plot_ext_timeseries,
     plot_per_sample_ext_saturation,
     plot_per_sample_ext_soi,
-    plot_per_worker_ext_soi,
 )
 from plotting.intensity import plot_per_worker_intensity_sweep
 from plotting.saturation import plot_per_worker_saturation, plot_saturation
@@ -55,8 +54,6 @@ def dispatch(csv_path):
             plot_per_worker_intensity_sweep(csv_path)
         elif 'proc_slack' in name:
             plot_per_worker_proc_slack(csv_path)
-        elif name.startswith('per_worker_ext_soi_'):
-            plot_per_worker_ext_soi(csv_path)
         elif name.startswith('per_worker_soi_'):
             plot_per_worker_soi(csv_path)
         else:

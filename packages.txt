@@ -9,3 +9,6 @@ zlib1g
 libbz2-1.0
 liblz4-1
 libzstd1
+
+# fio: backs the iobw SoI (libaio engine, direct=1, sustained QD=32 writes)
+fio

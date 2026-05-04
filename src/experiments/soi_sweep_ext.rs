@@ -6,19 +6,25 @@ use crate::proc_metrics;
 use crate::measure::{
     timestamp, write_params_file,
 };
-use crate::measure::ext::{measure_ext_throughput, ExtTimeSeriesSample};
+use crate::measure::ext::{measure_ext_throughput, ExtAggregateResult, ExtTimeSeriesSample};
 
-/// Run a single SoI sweep with an external victim workload.
+/// Run a single SoI sweep with an external victim workload. The `baseline`
+/// argument provides a pre-computed soi_workers=0 measurement so the sweep
+/// can skip re-measuring the workload in isolation. The caller is responsible
+/// for measuring once and sharing across SoI types.
 pub fn run_soi_sweep_ext_experiment(
     soi_type: SoiType,
     ext_cmd: &str,
     throughput_file: &str,
+    stats_file: &str,
     cache_sizes: &CacheSizes,
     params: &TuningParams,
+    baseline: &ExtAggregateResult,
 ) {
     println!("=== SoI SWEEP (EXTERNAL): {} ({}) ===", soi_type.name(), soi_type.resource());
     println!("External cmd: {}", ext_cmd);
     println!("Throughput file: {}", throughput_file);
+    println!("Stats file: {}", stats_file);
     println!("Sweeping {} SoI workers 0..{} by {}", soi_type.name(), params.max_workers, params.step);
 
     let run_dir = format!("ext_soi_{}_{}", soi_type.name(), timestamp());
@@ -32,6 +38,7 @@ pub fn run_soi_sweep_ext_experiment(
             ("soi_resource", soi_type.resource().to_string()),
             ("ext_cmd", ext_cmd.to_string()),
             ("throughput_file", throughput_file.to_string()),
+            ("stats_file", stats_file.to_string()),
         ]);
 
     let csv_path = format!("{}/ext_soi_{}_throughput.csv", run_dir, soi_type.name());
@@ -57,19 +64,20 @@ pub fn run_soi_sweep_ext_experiment(
         None
     };
 
+    // Workload stats CSV (narrow format: one row per metric observation).
+    // Always created; stays header-only for workloads that emit no stats.
+    let stats_csv_path = format!("{}/ext_stats_{}.csv", run_dir, soi_type.name());
+    let mut stats_csv = std::fs::File::create(&stats_csv_path).unwrap();
+    writeln!(stats_csv, "soi_workers,sample_idx,timestamp_ms,metric,value").unwrap();
+
     println!("\n  {:>7} | {:>12} | {:>8} | {:>10} | {:>6} {:>6} {:>6} {:>6}",
              "soi", "ext ops/s", "change%", "soi ops/s", "cpu%", "io%", "iops%", "mem%");
     println!("  {}", "-".repeat(82));
 
-    // Baseline: external workload alone (0 SoI workers)
-    let base = measure_ext_throughput(ext_cmd, throughput_file, 0, soi_type, 0, params);
-    // Pooled mean rate (total ops / elapsed) is a more defensible summary than
-    // the median of per-run rates when the victim is bimodal (e.g. RocksDB
-    // fillrandom phases). Falls back to median if the protocol file was empty.
-    let base_ext = if base.total_ops_secs > 0.0 {
-        base.total_ops / base.total_ops_secs
+    let base_ext = if baseline.total_ops_secs > 0.0 {
+        baseline.total_ops / baseline.total_ops_secs
     } else {
-        base.median_ext_ops
+        baseline.median_ext_ops
     };
 
     if base_ext == 0.0 {
@@ -77,27 +85,28 @@ pub fn run_soi_sweep_ext_experiment(
     }
 
     println!("  {:>7} | {:>12.0} | {:>7.1}% | {:>10} | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
-             0, base_ext, 0.0, "-",
-             base.metrics.cpu_pct, base.metrics.io_util_pct, base.metrics.io_iops_util_pct, base.metrics.mem_usage_pct);
+             0, base_ext, 0.0, "(cached)",
+             baseline.metrics.cpu_pct, baseline.metrics.io_util_pct, baseline.metrics.io_iops_util_pct, baseline.metrics.mem_usage_pct);
 
     writeln!(csv_file, "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
-             0, base_ext, 0.0, 0.0, base.ext_stddev,
-             base.total_ops, base.total_ops_secs,
-             base.p10_ops_sec, base.p50_ops_sec, base.p90_ops_sec,
-             base.metrics.to_csv_row()).unwrap();
+             0, base_ext, 0.0, 0.0, baseline.ext_stddev,
+             baseline.total_ops, baseline.total_ops_secs,
+             baseline.p10_ops_sec, baseline.p50_ops_sec, baseline.p90_ops_sec,
+             baseline.metrics.to_csv_row()).unwrap();
 
-    for (i, (e, s)) in base.per_sample_ext_ops.iter().zip(base.per_sample_soi_ops.iter()).enumerate() {
+    for (i, (e, s)) in baseline.per_sample_ext_ops.iter().zip(baseline.per_sample_soi_ops.iter()).enumerate() {
         writeln!(ps_file, "{},{},{:.2},{:.2}", 0, i, e, s).unwrap();
     }
 
-    write_ext_timeseries(&mut ts_file, 0, &base.timeseries);
+    write_ext_timeseries(&mut ts_file, 0, &baseline.timeseries);
+    write_ext_stats(&mut stats_csv, 0, baseline);
 
     // Sweep SoI workers
     let mut soi_count = params.step;
     while soi_count <= params.max_workers {
         let buf_size = soi_buffer_size(soi_type, cache_sizes, soi_count);
 
-        let r = measure_ext_throughput(ext_cmd, throughput_file, soi_count, soi_type, buf_size, params);
+        let r = measure_ext_throughput(ext_cmd, throughput_file, stats_file, soi_count, soi_type, buf_size, params);
 
         let r_mean = if r.total_ops_secs > 0.0 {
             r.total_ops / r.total_ops_secs
@@ -125,6 +134,7 @@ pub fn run_soi_sweep_ext_experiment(
         }
 
         write_ext_timeseries(&mut ts_file, soi_count, &r.timeseries);
+        write_ext_stats(&mut stats_csv, soi_count, &r);
 
         soi_count += params.step;
     }
@@ -167,6 +177,23 @@ fn write_ext_timeseries(
     }
 }
 
+/// Write per-sample workload stats rows keyed by `soi_workers` (or concurrency,
+/// for saturation experiments). Metric names are emitted verbatim; metric
+/// values containing embedded commas would break the CSV, so workloads must
+/// use simple identifiers.
+fn write_ext_stats(
+    stats_csv: &mut std::fs::File,
+    group_key: usize,
+    result: &ExtAggregateResult,
+) {
+    for (sample_idx, rows) in result.per_sample_stats.iter().enumerate() {
+        for row in rows {
+            writeln!(stats_csv, "{},{},{},{},{}",
+                     group_key, sample_idx, row.timestamp_ms, row.metric, row.value).unwrap();
+        }
+    }
+}
+
 /// Substitute `{N}` in a command template with the given value.
 fn substitute_template(template: &str, n: usize) -> String {
     template.replace("{N}", &n.to_string())
@@ -177,8 +204,9 @@ fn substitute_template(template: &str, n: usize) -> String {
 pub fn run_ext_saturation_experiment(
     ext_cmd_template: &str,
     throughput_file: &str,
+    stats_file: &str,
     params: &TuningParams,
-) -> usize {
+) -> (usize, ExtAggregateResult) {
     println!("=== FINDING EXTERNAL WORKLOAD SATURATION POINT ===");
     println!("Command template: {}", ext_cmd_template);
     println!("Sweeping {{N}} from {} to {} by {}", params.step, params.max_workers, params.step);
@@ -191,6 +219,7 @@ pub fn run_ext_saturation_experiment(
         &[
             ("ext_cmd_template", ext_cmd_template.to_string()),
             ("throughput_file", throughput_file.to_string()),
+            ("stats_file", stats_file.to_string()),
         ]);
 
     let csv_path = format!("{}/ext_saturation.csv", run_dir);
@@ -213,19 +242,25 @@ pub fn run_ext_saturation_experiment(
         None
     };
 
+    // Workload stats CSV (same protocol as SoI sweep, keyed by concurrency).
+    let stats_csv_path = format!("{}/ext_stats_saturation.csv", run_dir);
+    let mut stats_csv = std::fs::File::create(&stats_csv_path).unwrap();
+    writeln!(stats_csv, "concurrency,sample_idx,timestamp_ms,metric,value").unwrap();
+
     println!("\n  {:>7} | {:>12} | {:>12} | {:>6} {:>6} {:>6} {:>6}",
              "N", "ext ops/s", "per unit", "cpu%", "io%", "iops%", "mem%");
     println!("  {}", "-".repeat(72));
 
     let mut best_throughput = 0.0_f64;
     let mut saturation_point = params.step;
+    let mut best_result: Option<ExtAggregateResult> = None;
 
     let mut n = params.step;
     while n <= params.max_workers {
         let cmd = substitute_template(ext_cmd_template, n);
 
         // soi_count=0: no SoI workers, just measure the external workload
-        let r = measure_ext_throughput(&cmd, throughput_file, 0, SoiType::Cpu, 0, params);
+        let r = measure_ext_throughput(&cmd, throughput_file, stats_file, 0, SoiType::Cpu, 0, params);
 
         let r_mean = if r.total_ops_secs > 0.0 {
             r.total_ops / r.total_ops_secs
@@ -249,10 +284,12 @@ pub fn run_ext_saturation_experiment(
         }
 
         write_saturation_timeseries(&mut ts_file, n, &r.timeseries);
+        write_ext_stats(&mut stats_csv, n, &r);
 
         if r_mean > best_throughput {
             best_throughput = r_mean;
             saturation_point = n;
+            best_result = Some(r);
         }
 
         n += params.step;
@@ -266,7 +303,7 @@ pub fn run_ext_saturation_experiment(
     println!("Best throughput: {:.0} ops/sec", best_throughput);
     println!("Results written to: {}", csv_path);
 
-    saturation_point
+    (saturation_point, best_result.expect("no measurements were taken"))
 }
 
 /// Run external workload saturation finding, then optionally chain into SoI sweep.
@@ -274,25 +311,31 @@ pub fn run_ext_saturation_and_sweep(
     soi_types: &[SoiType],
     ext_cmd_template: &str,
     throughput_file: &str,
+    stats_file: &str,
     cache_sizes: &CacheSizes,
     params: &TuningParams,
 ) {
-    let saturation_n = run_ext_saturation_experiment(ext_cmd_template, throughput_file, params);
+    let (saturation_n, best_result) = run_ext_saturation_experiment(ext_cmd_template, throughput_file, stats_file, params);
 
     if params.chain {
         let fixed_cmd = substitute_template(ext_cmd_template, saturation_n);
-        println!("\n=== CHAINING: SoI sweep at saturation point N={} ===\n", saturation_n);
-        run_soi_ext_experiments(soi_types, &fixed_cmd, throughput_file, cache_sizes, params);
+        println!("\n=== CHAINING: SoI sweep at saturation point N={} (reusing baseline) ===\n", saturation_n);
+        run_soi_ext_experiments(soi_types, &fixed_cmd, throughput_file, stats_file, cache_sizes, params, Some(best_result));
     }
 }
 
 /// Run SoI sweeps for multiple SoI types with an external victim workload.
+/// If `baseline` is provided (e.g. from a preceding saturation sweep), it is
+/// reused as the soi_workers=0 reference for every SoI type. Otherwise a single
+/// baseline measurement is taken once and shared across all types.
 pub fn run_soi_ext_experiments(
     soi_types: &[SoiType],
     ext_cmd: &str,
     throughput_file: &str,
+    stats_file: &str,
     cache_sizes: &CacheSizes,
     params: &TuningParams,
+    baseline: Option<ExtAggregateResult>,
 ) {
     println!("=== SoI INTERFERENCE PROFILING — EXTERNAL WORKLOAD ===");
     println!("External cmd: {}", ext_cmd);
@@ -300,8 +343,13 @@ pub fn run_soi_ext_experiments(
              cache_sizes.l1d / 1024, cache_sizes.l2 / 1024, cache_sizes.l3 / 1024);
     println!("SoI types: {}\n", soi_types.iter().map(|s| s.name()).collect::<Vec<_>>().join(", "));
 
+    let baseline = baseline.unwrap_or_else(|| {
+        println!("Measuring baseline (0 SoI workers)...");
+        measure_ext_throughput(ext_cmd, throughput_file, stats_file, 0, SoiType::Cpu, 0, params)
+    });
+
     for &soi_type in soi_types {
-        run_soi_sweep_ext_experiment(soi_type, ext_cmd, throughput_file, cache_sizes, params);
+        run_soi_sweep_ext_experiment(soi_type, ext_cmd, throughput_file, stats_file, cache_sizes, params, &baseline);
         println!();
     }
 

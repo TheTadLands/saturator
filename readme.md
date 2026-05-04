@@ -141,7 +141,7 @@ docker compose run --build --remove-orphans saturator find-io-slack-proc <N> <ex
 Holds a fixed number of victim workers running a real workload, then incrementally adds SoI (Source of Interference) workers that stress a specific shared resource. Measures how victim throughput degrades as interference increases.
 
 ```bash
-docker compose run --build --remove-orphans saturator find-soi-slack <soi|all> <victim_workers> [victim_io%] [OPTIONS]
+docker compose run --build --remove-orphans saturator find-soi-sweep <soi|all> <victim_workers> [victim_io%] [OPTIONS]
 ```
 
 Arguments:
@@ -152,10 +152,10 @@ Arguments:
 Examples:
 ```bash
 # 32 I/O victim workers, sweep IOPS interference
-docker compose run --build --remove-orphans saturator find-soi-slack ioops 32 100 --max-workers 16
+docker compose run --build --remove-orphans saturator find-soi-sweep ioops 32 100 --max-workers 16
 
 # 4 CPU victim workers, sweep all SoI types
-docker compose run --build --remove-orphans saturator find-soi-slack all 4 0 --duration 5 --samples 3
+docker compose run --build --remove-orphans saturator find-soi-sweep all 4 0 --duration 5 --samples 3
 ```
 
 **Output:** `soi_<type>_<N>_victims_<io%>pct_io_<timestamp>/soi_<type>_throughput.csv`, `per_worker_soi_<type>.csv`
@@ -166,13 +166,14 @@ docker compose run --build --remove-orphans saturator find-soi-slack all 4 0 --d
 Runs an external workload (e.g. RocksDB's `db_bench`) as the victim, then incrementally adds SoI workers to measure interference. The external workload reports throughput via a simple file-based protocol.
 
 ```bash
-docker compose run --build --remove-orphans saturator find-soi-slack-ext <soi|all> --cmd '<command>' [OPTIONS]
+docker compose run --build --remove-orphans saturator find-soi-sweep-ext <soi|all> --cmd '<command>' [OPTIONS]
 ```
 
 Arguments:
-- `soi` — SoI type to sweep (same as `find-soi-slack`)
-- `--cmd '<command>'` — shell command to run the external workload (required). The `SATURATOR_THROUGHPUT_FILE` env var is set automatically.
+- `soi` — SoI type to sweep (same as `find-soi-sweep`)
+- `--cmd '<command>'` — shell command to run the external workload (required). The `SATURATOR_THROUGHPUT_FILE` and `SATURATOR_STATS_FILE` env vars are set automatically.
 - `--throughput-file <path>` — path for throughput protocol file (default: `/tmp/saturator_ext_throughput.txt`)
+- `--stats-file <path>` — path for workload stats protocol file (default: `/tmp/saturator_ext_stats.txt`)
 
 The external workload (or its wrapper script) writes cumulative throughput samples to the protocol file:
 ```
@@ -180,43 +181,50 @@ The external workload (or its wrapper script) writes cumulative throughput sampl
 ```
 One line per sample. Values must be monotonically increasing. Saturator computes instantaneous rates from deltas between consecutive reports, making the protocol robust to timing mismatches between the reporting frequency and the sampling interval. A wrapper script for RocksDB's `db_bench` is provided at `scripts/run_db_bench.sh`.
 
+The wrapper may also write workload-specific stats (compaction bytes, stall %, write-amp, etc.) to the stats file:
+```
+<timestamp_ms>,<metric_name>,<value>
+```
+One row per observation. Metric names are workload-defined; saturator passes them through verbatim into `ext_stats_<soi_type>.csv`. The protocol supports both time-series (many rows with increasing timestamps) and end-of-run aggregates (one row per metric at workload exit). The `run_db_bench.sh` wrapper emits RocksDB compaction and stall time-series when `SATURATOR_STATS_FILE` is set.
+
 Examples:
 ```bash
 # RocksDB readrandom benchmark vs CPU interference
-docker compose run --build --remove-orphans saturator find-soi-slack-ext cpu \
+docker compose run --build --remove-orphans saturator find-soi-sweep-ext cpu \
     --cmd 'run_db_bench.sh --benchmarks=readrandom --num=10000000 --threads=4' \
     --duration 30 --samples 3 --max-workers 8
 
 # With time-series sampling to capture phase-dependent effects
-docker compose run --build --remove-orphans saturator find-soi-slack-ext all \
+docker compose run --build --remove-orphans saturator find-soi-sweep-ext all \
     --cmd 'run_db_bench.sh --benchmarks=readwhilewriting --threads=4' \
     --sample-interval 1000 --duration 30 --max-workers 8
 ```
 
-**Output:** `ext_soi_<type>_<timestamp>/ext_soi_<type>_throughput.csv`, `per_worker_ext_soi_<type>.csv`, optional `timeseries_ext_soi_<type>.csv`
+**Output:** `ext_soi_<type>_<timestamp>/ext_soi_<type>_throughput.csv`, `ext_stats_<type>.csv` (empty header only if the workload emits no stats), optional `timeseries_ext_soi_<type>.csv`
 
 #### Find External Workload Saturation
 Scales an external workload's concurrency parameter (via `{N}` template substitution in the command) to find its saturation point — the concurrency level that produces peak throughput. Optionally chains into an SoI sweep at the saturation point.
 
 ```bash
-docker compose run --build --remove-orphans saturator find-soi-saturation-ext <soi|all> --cmd '<command with {N}>' [OPTIONS]
+docker compose run --build --remove-orphans saturator find-saturation-ext <soi|all> --cmd '<command with {N}>' [OPTIONS]
 ```
 
 Arguments:
 - `soi` — SoI type for the chained sweep (used only with `--chain`)
 - `--cmd '<command>'` — shell command with `{N}` placeholder for concurrency (required). `{N}` is replaced with the current concurrency level at each sweep step.
-- `--chain` — after finding saturation point N, automatically run `find-soi-slack-ext` with `{N}` substituted to the saturation value
+- `--chain` — after finding saturation point N, automatically run `find-soi-sweep-ext` with `{N}` substituted to the saturation value
 - `--throughput-file <path>` — path for throughput protocol file (default: `/tmp/saturator_ext_throughput.txt`)
+- `--stats-file <path>` — path for workload stats protocol file (default: `/tmp/saturator_ext_stats.txt`)
 
 Examples:
 ```bash
 # Find saturation point of db_bench by scaling thread count
-docker compose run --build --remove-orphans saturator find-soi-saturation-ext cpu \
+docker compose run --build --remove-orphans saturator find-saturation-ext cpu \
     --cmd 'run_db_bench.sh --benchmarks=readrandom --num=10000000 --threads={N}' \
     --duration 30 --samples 3 --max-workers 16
 
 # Find saturation, then automatically sweep CPU interference at the saturation point
-docker compose run --build --remove-orphans saturator find-soi-saturation-ext cpu \
+docker compose run --build --remove-orphans saturator find-saturation-ext cpu \
     --cmd 'run_db_bench.sh --benchmarks=readrandom --threads={N}' \
     --duration 30 --samples 3 --max-workers 16 --chain
 ```
@@ -241,8 +249,9 @@ All experiments accept optional flags to control workload parameters.
 | `--direct-io` | — | Use `O_DIRECT \| O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. |
 | `--chain` | — | After a proc saturation experiment finds the saturation point N, automatically runs `find-saturation-intensity-proc` with N base workers. |
 | `--sample-interval <ms>` | off | Enable time-series sampling during measurement windows (minimum: 100ms). Produces a `timeseries_soi_*.csv` with per-interval throughput and utilization traces. See [Time-Series CSV columns](#time-series-csv-columns). |
-| `--cmd <command>` | — | External workload command (for `find-soi-slack-ext`). Launched via `sh -c`. |
+| `--cmd <command>` | — | External workload command (for `find-soi-sweep-ext`). Launched via `sh -c`. |
 | `--throughput-file <path>` | `/tmp/saturator_ext_throughput.txt` | Path for external workload throughput protocol file. |
+| `--stats-file <path>` | `/tmp/saturator_ext_stats.txt` | Path for external workload stats protocol file. Wrapper-emitted rows are collected into `ext_stats_<soi_type>.csv`. |
 
 Examples:
 ```bash
@@ -340,7 +349,7 @@ Process-based experiments produce a `per_worker_*.csv` alongside the aggregate C
 
 ### External Workload CSV columns
 
-Produced by `find-soi-slack-ext`. The external workload reports a single throughput number rather than split CPU/IO ops.
+Produced by `find-soi-sweep-ext`. The external workload reports a single throughput number rather than split CPU/IO ops.
 
 | Column | Description |
 |--------|-------------|
@@ -356,7 +365,7 @@ Produced by `find-soi-slack-ext`. The external workload reports a single through
 
 ### External Saturation CSV columns
 
-Produced by `find-soi-saturation-ext`. One row per concurrency level tested.
+Produced by `find-saturation-ext`. One row per concurrency level tested.
 
 | Column | Description |
 |--------|-------------|
@@ -383,7 +392,7 @@ Produced by SoI sweep experiments when `--sample-interval` is set. One row per s
 Example:
 ```bash
 # 1-second sampling with 10s measurement windows
-docker compose run --build --remove-orphans saturator find-soi-slack cpu 4 50 \
+docker compose run --build --remove-orphans saturator find-soi-sweep cpu 4 50 \
     --sample-interval 1000 --duration 10 --samples 1
 ```
 

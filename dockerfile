@@ -23,6 +23,7 @@ RUN if grep -qvE '^\s*#|^\s*$' /tmp/packages.txt; then \
 
 WORKDIR /app
 COPY --from=builder /app/target/release/saturator /app/saturator
+COPY scripts /app/scripts
 
 # Create directories
 RUN mkdir -p /tmp /app/output

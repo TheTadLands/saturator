@@ -34,9 +34,10 @@ fn main() {
         println!("  find-saturation-intensity-proc <N> <io_pct> - N base procs + 1 probe, sweep probe intensity");
         println!("  find-slack-proc <N> <extra_io%>    - N CPU baseline procs, add procs at extra_io%");
         println!("  find-io-slack-proc <N> <extra_io%> - N I/O baseline procs, add procs at extra_io%");
-        println!("  find-soi-slack <soi|all> <victim_workers> [victim_io%] - SoI interference profiling");
-        println!("  find-soi-slack-ext <soi|all> --cmd '<command>' [OPTIONS] - SoI sweep with external workload victim");
-        println!("  find-soi-saturation-ext <soi|all> --cmd '<cmd {{N}}>' [OPTIONS] - Find external workload saturation, optionally chain SoI sweep");
+        println!("  find-soi-sweep <soi|all> <victim_workers> [victim_io%] - SoI interference profiling");
+        println!("  find-soi-sweep-ext <soi|all> --cmd '<command>' [OPTIONS] - SoI sweep with external workload victim");
+        println!("  find-saturation-ext --cmd '<cmd {{N}}>' [OPTIONS] - Find external workload saturation point");
+        println!("    Use --chain <soi|all> to auto-run SoI sweep at saturation point");
         println!("");
         println!("Options (for -proc variants):");
         println!("  --buffer-kb <N>      CPU work buffer size in KB (default: 100)");
@@ -52,16 +53,17 @@ fn main() {
         println!("  --random-access      Use random buffer access pattern to defeat hardware prefetcher");
         println!("  --direct-io          Use O_DIRECT to bypass page cache for I/O ops");
         println!("  --sample-interval <ms> Time-series sampling interval in ms (default: off)");
-        println!("  --cmd <command>        External workload command (for find-soi-slack-ext)");
+        println!("  --cmd <command>        External workload command (for find-soi-sweep-ext)");
         println!("  --throughput-file <path> Throughput protocol file path (default: /tmp/saturator_ext_throughput.txt)");
+        println!("  --stats-file <path>  Workload stats protocol file path (default: /tmp/saturator_ext_stats.txt)");
         println!("");
         println!("Examples:");
         println!("  find-slack 4 100     - 4 CPU baseline, add 100% I/O threads");
         println!("  find-saturation-proc --buffer-kb 1024 --max-workers 100 --samples 7");
         println!("  find-mixed-saturation-proc 50 --max-workers 32");
         println!("  find-saturation-intensity-proc 6 50 --duration 2");
-        println!("  find-soi-slack l3 4 0 --max-workers 8");
-        println!("  find-soi-slack all 4 50 --duration 5 --samples 3");
+        println!("  find-soi-sweep l3 4 0 --max-workers 8");
+        println!("  find-soi-sweep all 4 50 --duration 5 --samples 3");
         return;
     }
 
@@ -107,7 +109,7 @@ fn main() {
     let params = parse_tuning_params(&args);
 
     // External workload experiments skip calibration (no synthetic victims)
-    let needs_calibration = experiment != "find-soi-slack-ext" && experiment != "find-soi-saturation-ext";
+    let needs_calibration = experiment != "find-soi-sweep-ext" && experiment != "find-saturation-ext";
     let calibration = if needs_calibration {
         println!("Calibrating operations...");
         let cal = calibrate_operations_full(&params);
@@ -245,9 +247,9 @@ fn main() {
             });
             run_slack_proc_experiment("I/O", 1.0, true, baseline, extra_io_pct / 100.0, calibration.unwrap(), &params);
         },
-        "find-soi-slack" => {
+        "find-soi-sweep" => {
             let soi_str = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: saturator find-soi-slack <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
+                eprintln!("Usage: saturator find-soi-sweep <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
                 eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, iops, all");
                 std::process::exit(1);
             });
@@ -256,7 +258,7 @@ fn main() {
                 std::process::exit(1);
             });
             let victim_workers = args.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(|| {
-                eprintln!("Usage: saturator find-soi-slack <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
+                eprintln!("Usage: saturator find-soi-sweep <soi|all> <victim_workers> [victim_io%] [OPTIONS]");
                 std::process::exit(1);
             });
             let victim_io_pct = args.get(4).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
@@ -268,9 +270,9 @@ fn main() {
 
             run_soi_experiments(&soi_types, victim_workers, victim_io_perc, &cache_sizes, calibration.unwrap(), &params);
         },
-        "find-soi-slack-ext" => {
+        "find-soi-sweep-ext" => {
             let soi_str = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: saturator find-soi-slack-ext <soi|all> [OPTIONS]");
+                eprintln!("Usage: saturator find-soi-sweep-ext <soi|all> [OPTIONS]");
                 eprintln!("  Requires: --cmd '<command>'");
                 eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, iops, all");
                 std::process::exit(1);
@@ -280,33 +282,27 @@ fn main() {
                 std::process::exit(1);
             });
             let ext_cmd = params.ext_cmd.as_ref().unwrap_or_else(|| {
-                eprintln!("Error: --cmd is required for find-soi-slack-ext");
-                eprintln!("Usage: saturator find-soi-slack-ext <soi|all> --cmd '<command>' [OPTIONS]");
+                eprintln!("Error: --cmd is required for find-soi-sweep-ext");
+                eprintln!("Usage: saturator find-soi-sweep-ext <soi|all> --cmd '<command>' [OPTIONS]");
                 std::process::exit(1);
             });
             let throughput_file = params.ext_throughput_file.clone()
                 .unwrap_or_else(|| "/tmp/saturator_ext_throughput.txt".to_string());
+            let stats_file = params.ext_stats_file.clone()
+                .unwrap_or_else(|| "/tmp/saturator_ext_stats.txt".to_string());
 
             let cache_sizes = soi::detect_cache_sizes();
             println!("Detected cache sizes: L1d={}KB, L2={}KB, L3={}KB",
                      cache_sizes.l1d / 1024, cache_sizes.l2 / 1024, cache_sizes.l3 / 1024);
 
-            run_soi_ext_experiments(&soi_types, ext_cmd, &throughput_file, &cache_sizes, &params);
+            run_soi_ext_experiments(&soi_types, ext_cmd, &throughput_file, &stats_file, &cache_sizes, &params, None);
         },
-        "find-soi-saturation-ext" => {
-            let soi_str = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: saturator find-soi-saturation-ext <soi|all> --cmd '<cmd {{N}}>' [OPTIONS]");
-                eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, iops, all");
-                eprintln!("  {{N}} in --cmd is replaced with the concurrency level");
-                eprintln!("  Use --chain to auto-run SoI sweep at saturation point");
-                std::process::exit(1);
-            });
-            let soi_types = soi::parse_soi_list(soi_str).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            });
+        "find-saturation-ext" => {
             let ext_cmd = params.ext_cmd.as_ref().unwrap_or_else(|| {
-                eprintln!("Error: --cmd is required for find-soi-saturation-ext");
+                eprintln!("Error: --cmd is required for find-saturation-ext");
+                eprintln!("Usage: saturator find-saturation-ext --cmd '<cmd {{N}}>' [OPTIONS]");
+                eprintln!("  {{N}} in --cmd is replaced with the concurrency level");
+                eprintln!("  Use --chain <soi|all> to auto-run SoI sweep at saturation point");
                 std::process::exit(1);
             });
             if !ext_cmd.contains("{N}") {
@@ -314,14 +310,32 @@ fn main() {
                 eprintln!("Example: --cmd 'run_db_bench.sh --threads={{N}}'");
                 std::process::exit(1);
             }
+            // SoI type is only needed when --chain is set; parse it from arg 2
+            // (optional — defaults to empty, validated at chain time).
+            let soi_types = if params.chain {
+                let soi_str = args.get(2).unwrap_or_else(|| {
+                    eprintln!("Error: --chain requires a SoI type argument");
+                    eprintln!("Usage: saturator find-saturation-ext <soi|all> --cmd '<cmd {{N}}>' --chain");
+                    eprintln!("  SoI types: l1d, l2, l3, membw, memcap, cpu, iobw, iops, all");
+                    std::process::exit(1);
+                });
+                soi::parse_soi_list(soi_str).unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                })
+            } else {
+                Vec::new()
+            };
             let throughput_file = params.ext_throughput_file.clone()
                 .unwrap_or_else(|| "/tmp/saturator_ext_throughput.txt".to_string());
+            let stats_file = params.ext_stats_file.clone()
+                .unwrap_or_else(|| "/tmp/saturator_ext_stats.txt".to_string());
 
             let cache_sizes = soi::detect_cache_sizes();
             println!("Detected cache sizes: L1d={}KB, L2={}KB, L3={}KB",
                      cache_sizes.l1d / 1024, cache_sizes.l2 / 1024, cache_sizes.l3 / 1024);
 
-            run_ext_saturation_and_sweep(&soi_types, ext_cmd, &throughput_file, &cache_sizes, &params);
+            run_ext_saturation_and_sweep(&soi_types, ext_cmd, &throughput_file, &stats_file, &cache_sizes, &params);
         },
         _ => println!("Unknown experiment: {}", experiment),
     }
@@ -335,7 +349,7 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
     // For -proc variants, use higher default max_workers
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(4);
-    if args.len() >= 2 && (args[1].ends_with("-proc") || args[1] == "find-soi-slack" || args[1].starts_with("find-soi-") && args[1].ends_with("-ext")) {
+    if args.len() >= 2 && (args[1].ends_with("-proc") || args[1] == "find-soi-sweep" || args[1].starts_with("find-soi-") && args[1].ends_with("-ext")) {
         params.max_workers = parallelism * 16;
     }
 
@@ -421,6 +435,18 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
                 i += 1;
                 if let Some(v) = args.get(i) {
                     params.ext_throughput_file = Some(v.clone());
+                }
+            }
+            "--stats-file" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    params.ext_stats_file = Some(v.clone());
+                }
+            }
+            "--prefill" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    params.ext_prefill = Some(v.clone());
                 }
             }
             _ => {}

@@ -37,8 +37,8 @@ There are no tests or lints configured.
 - `find-saturation-intensity-proc <N> <io_pct>` — N base processes at intensity=1.0 + 1 probe process, sweep probe intensity 0.0–1.0 to find saturation tipping point
 
 **External workload** (real application as victim, SoI workers apply interference):
-- `find-soi-slack-ext <soi|all> --cmd '<command>' [OPTIONS]` — run an external workload (e.g. RocksDB's db_bench) as the victim, sweep SoI workers to measure interference. The external workload reports throughput via a cumulative file-based protocol (`<timestamp_ms> <cumulative_ops>\n`). Saturator computes rates from deltas between consecutive reports. Wrapper scripts adapt specific workloads to this protocol (see `scripts/run_db_bench.sh` for RocksDB).
-- `find-soi-saturation-ext <soi|all> --cmd '<cmd {N}>' [OPTIONS]` — find the saturation point of an external workload by sweeping the `{N}` template parameter (e.g. thread count). Optionally chain into SoI sweep at the saturation point with `--chain`.
+- `find-soi-sweep-ext <soi|all> --cmd '<command>' [OPTIONS]` — run an external workload (e.g. RocksDB's db_bench) as the victim, sweep SoI workers to measure interference. The external workload reports throughput via a cumulative file-based protocol (`<timestamp_ms> <cumulative_ops>\n`). Saturator computes rates from deltas between consecutive reports. Wrapper scripts adapt specific workloads to this protocol (see `scripts/run_db_bench.sh` for RocksDB).
+- `find-saturation-ext <soi|all> --cmd '<cmd {N}>' [OPTIONS]` — find the saturation point of an external workload by sweeping the `{N}` template parameter (e.g. thread count). Optionally chain into SoI sweep at the saturation point with `--chain`.
 
 **Tuning flags** (work with all experiments):
 - `--buffer-kb <N>` — CPU work buffer size in KB (default: 100). Larger = more cache pressure.
@@ -53,7 +53,7 @@ There are no tests or lints configured.
 - `--random-access` — use hash-derived random buffer offsets for CPU work instead of sequential stride. Defeats hardware prefetcher so cache misses scale with buffer size.
 - `--direct-io` — use `O_DIRECT | O_SYNC` for I/O writes, bypassing the page cache. Each write is a full round-trip to the block device. Requires page-aligned buffers (handled automatically via `posix_memalign`).
 - `--sample-interval <ms>` — enable time-series sampling during measurement windows (default: off, minimum: 100ms). When set, the parent process periodically reads per-worker atomic counters and cgroup metrics mid-flight, producing a `timeseries_soi_*.csv` alongside the aggregate CSV. Useful for observing phase-dependent interference effects in workloads with time-varying CPU/IO ratios.
-- `--cmd <command>` — external workload command to run as victim (for `find-soi-slack-ext`). Launched via `sh -c`. The `SATURATOR_THROUGHPUT_FILE` env var is set automatically.
+- `--cmd <command>` — external workload command to run as victim (for `find-soi-sweep-ext`). Launched via `sh -c`. The `SATURATOR_THROUGHPUT_FILE` env var is set automatically.
 - `--throughput-file <path>` — path for the external workload throughput protocol file (default: `/tmp/saturator_ext_throughput.txt`).
 
 ### Plotting

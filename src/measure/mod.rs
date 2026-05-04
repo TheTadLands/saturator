@@ -1,6 +1,7 @@
 pub mod thread;
 pub mod proc;
 pub mod ext_throughput;
+pub mod ext_stats;
 pub mod ext;
 
 pub use thread::*;

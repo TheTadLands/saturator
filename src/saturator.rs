@@ -32,6 +32,8 @@ pub struct TuningParams {
     pub sample_interval_ms: Option<u64>, // time-series sampling interval in ms (default: None = disabled)
     pub ext_cmd: Option<String>,           // external workload command (default: None)
     pub ext_throughput_file: Option<String>, // throughput protocol file path (default: None)
+    pub ext_stats_file: Option<String>,    // workload stats protocol file path (default: None)
+    pub ext_prefill: Option<String>,       // prefill command for external workload (default: None)
 }
 
 impl Default for TuningParams {
@@ -54,6 +56,8 @@ impl Default for TuningParams {
             sample_interval_ms: None,
             ext_cmd: None,
             ext_throughput_file: None,
+            ext_stats_file: None,
+            ext_prefill: None,
         }
     }
 }

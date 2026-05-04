@@ -7,6 +7,7 @@ use crate::saturator::{TuningParams, SharedRegion, create_shared_region, destroy
 use crate::proc_metrics;
 use crate::soi::{SoiBackend, SoiType};
 use super::ext_throughput::ThroughputReader;
+use super::ext_stats::{self, StatsRow};
 use super::spawn_soi_worker;
 
 /// Active SoI for one measurement run. `Internal` uses the in-process synthetic
@@ -51,6 +52,9 @@ pub struct ExtMeasurementResult {
     pub soi_ops: f64,
     pub metrics: proc_metrics::SystemMetrics,
     pub timeseries: Option<Vec<ExtTimeSeriesSample>>,
+    /// Raw stats rows emitted by the workload (or its wrapper) during this run.
+    /// Format is workload-defined — saturator passes them through verbatim.
+    pub stats: Vec<StatsRow>,
 }
 
 /// A single time-series sample for external workload experiments.
@@ -76,25 +80,32 @@ pub struct ExtTimeSeriesSample {
 pub fn run_ext_measurement(
     ext_cmd: &str,
     throughput_file: &str,
+    stats_file: &str,
     soi_count: usize,
     soi_type: SoiType,
     soi_buffer_size: usize,
     params: &TuningParams,
 ) -> ExtMeasurementResult {
-    // Clean up stale throughput file
+    // Clean up stale throughput and stats files so cross-sample state can't leak.
     let _ = std::fs::remove_file(throughput_file);
+    ext_stats::truncate(stats_file);
 
     // Launch external workload in its own process group so we can signal the
     // whole group (including any backgrounded children like db_bench) at teardown.
     // sh does not propagate signals to backgrounded children by default, so
     // without a group-wide signal db_bench survives wrapper teardown, reparents
     // to init, and corrupts the shared throughput file across subsequent samples.
-    let mut ext_child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(ext_cmd)
         .env("SATURATOR_THROUGHPUT_FILE", throughput_file)
-        .process_group(0)
-        .spawn()
+        .env("SATURATOR_STATS_FILE", stats_file)
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    if let Some(ref prefill) = params.ext_prefill {
+        cmd.env("SATURATOR_PREFILL", prefill);
+    }
+    let mut ext_child = cmd.spawn()
         .expect("Failed to spawn external workload");
 
     // Set up SoI workers (if any)
@@ -227,17 +238,29 @@ pub fn run_ext_measurement(
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, params.duration_secs as f64);
 
-    // Terminate external workload: SIGTERM the whole process group, then SIGKILL
-    // the group after 2s. Negative PID targets the group (kill(2)).
+    // Terminate external workload: SIGTERM the whole process group, poll for
+    // exit (up to 10s so the wrapper's cleanup trap can run parse_stats), then
+    // SIGKILL. Negative PID targets the group (kill(2)).
+    //
+    // The wrapper's trap handler kills db_bench, waits for it, then runs an awk
+    // script that parses db_bench's raw stats log and appends to the stats file.
+    // If we SIGKILL the group too early, awk may still be writing — and a
+    // partially-written (or not-yet-started) stats file causes sample N's data
+    // to leak into sample N+1. Polling with short sleeps instead of a fixed 2s
+    // timeout gives the trap handler enough time to finish in the common case
+    // while still bounding the wait.
     let ext_pid = ext_child.id() as i32;
     unsafe { libc::kill(-ext_pid, libc::SIGTERM); }
-    match ext_child.try_wait() {
-        Ok(Some(_)) => {}
-        _ => {
-            std::thread::sleep(Duration::from_secs(2));
-            unsafe { libc::kill(-ext_pid, libc::SIGKILL); }
-            let _ = ext_child.wait();
+    let mut exited = false;
+    for _ in 0..40 {
+        match ext_child.try_wait() {
+            Ok(Some(_)) => { exited = true; break; }
+            _ => std::thread::sleep(Duration::from_millis(250)),
         }
+    }
+    if !exited {
+        unsafe { libc::kill(-ext_pid, libc::SIGKILL); }
+        let _ = ext_child.wait();
     }
 
     // Collect SoI results. Internal backends sum per-worker shmem counters into
@@ -280,6 +303,10 @@ pub fn run_ext_measurement(
     let (total_ops, total_ops_secs) = tp_reader.total_ops().unwrap_or((0.0, 0.0));
     let rate_samples: Vec<f64> = all_tp_samples.iter().map(|(_, r)| *r).collect();
 
+    // Read whatever stats the workload emitted during this run. Empty file →
+    // empty vec, which is valid for workloads that don't emit stats.
+    let stats = ext_stats::read_all(stats_file);
+
     ExtMeasurementResult {
         ext_ops_per_sec,
         total_ops,
@@ -288,6 +315,7 @@ pub fn run_ext_measurement(
         soi_ops: soi_ops_total,
         metrics,
         timeseries,
+        stats,
     }
 }
 
@@ -309,6 +337,10 @@ pub struct ExtAggregateResult {
     pub timeseries: Option<Vec<ExtTimeSeriesSample>>,
     pub per_sample_ext_ops: Vec<f64>,
     pub per_sample_soi_ops: Vec<f64>,
+    /// Stats rows keyed by sample index, in sample order. Outer Vec length
+    /// equals `params.samples`; inner Vec is whatever the workload emitted for
+    /// that sample (possibly empty).
+    pub per_sample_stats: Vec<Vec<StatsRow>>,
 }
 
 /// Run multiple measurement samples and return aggregated results plus the
@@ -317,6 +349,7 @@ pub struct ExtAggregateResult {
 pub fn measure_ext_throughput(
     ext_cmd: &str,
     throughput_file: &str,
+    stats_file: &str,
     soi_count: usize,
     soi_type: SoiType,
     soi_buffer_size: usize,
@@ -328,7 +361,7 @@ pub fn measure_ext_throughput(
         if i > 0 && params.cooldown_secs > 0 {
             std::thread::sleep(Duration::from_secs(params.cooldown_secs));
         }
-        run_ext_measurement(ext_cmd, throughput_file, soi_count, soi_type, soi_buffer_size, params)
+        run_ext_measurement(ext_cmd, throughput_file, stats_file, soi_count, soi_type, soi_buffer_size, params)
     }).collect();
 
     let ext_vals: Vec<f64> = results.iter().map(|r| r.ext_ops_per_sec).collect();
@@ -356,7 +389,17 @@ pub fn measure_ext_throughput(
         .map(|(i, _)| i)
         .unwrap_or(0);
 
-    let timeseries = results.into_iter().nth(median_idx).and_then(|r| r.timeseries);
+    // Drain stats and timeseries from results without cloning. `stats` is
+    // retained per-sample; `timeseries` is taken from the sample closest to
+    // the median throughput (same rule as before).
+    let mut per_sample_stats: Vec<Vec<StatsRow>> = Vec::with_capacity(results.len());
+    let mut timeseries: Option<Vec<ExtTimeSeriesSample>> = None;
+    for (i, r) in results.into_iter().enumerate() {
+        per_sample_stats.push(r.stats);
+        if i == median_idx {
+            timeseries = r.timeseries;
+        }
+    }
 
     ExtAggregateResult {
         median_ext_ops: median_ext,
@@ -371,6 +414,7 @@ pub fn measure_ext_throughput(
         timeseries,
         per_sample_ext_ops: ext_vals,
         per_sample_soi_ops: soi_vals,
+        per_sample_stats,
     }
 }
 

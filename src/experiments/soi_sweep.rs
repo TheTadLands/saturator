@@ -25,8 +25,37 @@ pub fn run_soi_sweep_experiment(
              victim_workers, victim_io_pct_int, soi_type.name(),
              params.max_workers, params.step);
 
-    let run_dir = format!("soi_{}_{}_victims_{}pct_io_{}",
-                          soi_type.name(), victim_workers, victim_io_pct_int, timestamp());
+    if let Some(period_ms) = params.soi_period_ms {
+        println!("SoI square-wave: period={}ms, duty={:.0}%", period_ms, params.soi_duty * 100.0);
+        if let Some(interval_ms) = params.sample_interval_ms {
+            if period_ms % interval_ms != 0 {
+                eprintln!("WARNING: sample_interval_ms ({}) does not evenly divide soi_period_ms ({}). \
+                           Time-series samples may straddle phase boundaries.", interval_ms, period_ms);
+            }
+        }
+        if matches!(soi_type.backend(), crate::soi::SoiBackend::External(_)) {
+            eprintln!("WARNING: --soi-period has no effect on external SoI backend ({})", soi_type.name());
+        }
+    }
+    if let Some(period_ms) = params.victim_period_ms {
+        if let Some(ref phases) = params.victim_phases {
+            let labels: Vec<String> = phases.iter().map(|p| format!("{:.0}%", p * 100.0)).collect();
+            println!("Victim phase cycling: period={}ms, phases=[{}]", period_ms, labels.join(", "));
+        } else if params.antiphase {
+            println!("Antiphase gating: period={}ms, duty={:.0}% (victim/SoI alternate)", period_ms, params.soi_duty * 100.0);
+        } else {
+            println!("Victim square-wave: period={}ms (on/off)", period_ms);
+        }
+        if let Some(interval_ms) = params.sample_interval_ms {
+            if period_ms % interval_ms != 0 {
+                eprintln!("WARNING: sample_interval_ms ({}) does not evenly divide victim_period_ms ({}). \
+                           Time-series samples may straddle phase boundaries.", interval_ms, period_ms);
+            }
+        }
+    }
+
+    let run_dir = params.run_dir(&format!("soi_{}_{}_victims_{}pct_io_{}",
+                          soi_type.name(), victim_workers, victim_io_pct_int, timestamp()));
     std::fs::create_dir_all(&run_dir).unwrap();
 
     write_params_file(&run_dir, &format!("soi_sweep_{}", soi_type.name()), params, &calibration, &[
@@ -53,7 +82,7 @@ pub fn run_soi_sweep_experiment(
     let mut ts_file = if params.sample_interval_ms.is_some() {
         let ts_path = format!("{}/timeseries_soi_{}.csv", run_dir, soi_type.name());
         let mut f = std::fs::File::create(&ts_path).unwrap();
-        writeln!(f, "soi_workers,elapsed_ms,victim_cpu_ops_sec,victim_io_ops_sec,soi_ops_sec,{}",
+        writeln!(f, "soi_workers,sample_idx,elapsed_ms,victim_cpu_ops_sec,victim_io_ops_sec,soi_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
                  proc_metrics::csv_header()).unwrap();
         Some(f)
     } else {
@@ -143,14 +172,21 @@ pub fn run_soi_sweep_experiment(
 fn write_timeseries(
     ts_file: &mut Option<std::fs::File>,
     soi_workers: usize,
-    ts_data: &Option<Vec<TimeSeriesSample>>,
+    all_ts: &[Option<Vec<TimeSeriesSample>>],
 ) {
-    if let (Some(f), Some(samples)) = (ts_file.as_mut(), ts_data.as_ref()) {
-        for s in samples {
-            writeln!(f, "{},{},{:.2},{:.2},{:.2},{}",
-                     soi_workers, s.elapsed_ms,
-                     s.victim_cpu_ops_sec, s.victim_io_ops_sec, s.soi_ops_sec,
-                     s.metrics.to_csv_row()).unwrap();
+    if let Some(f) = ts_file.as_mut() {
+        for (sample_idx, ts_data) in all_ts.iter().enumerate() {
+            if let Some(samples) = ts_data {
+                for s in samples {
+                    writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{},{},{:.3},{}",
+                             soi_workers, sample_idx, s.elapsed_ms,
+                             s.victim_cpu_ops_sec, s.victim_io_ops_sec, s.soi_ops_sec,
+                             if s.soi_gate_on { 1 } else { 0 },
+                             if s.victim_gate_on { 1 } else { 0 },
+                             s.victim_io_phase,
+                             s.metrics.to_csv_row()).unwrap();
+                }
+            }
         }
     }
 }

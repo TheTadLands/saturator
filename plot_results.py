@@ -27,7 +27,7 @@ from plotting.ext import (
 from plotting.intensity import plot_per_worker_intensity_sweep
 from plotting.saturation import plot_per_worker_saturation, plot_saturation
 from plotting.slack import plot_per_worker_proc_slack, plot_proc_slack, plot_slack
-from plotting.soi import plot_per_worker_soi, plot_soi, plot_soi_comparison
+from plotting.soi import plot_per_worker_soi, plot_soi, plot_soi_comparison, plot_soi_timeseries
 
 
 def find_csvs(paths):
@@ -58,6 +58,8 @@ def dispatch(csv_path):
             plot_per_worker_soi(csv_path)
         else:
             plot_per_worker_saturation(csv_path)
+    elif name.startswith('timeseries_soi_') and not name.startswith('timeseries_soi_ext'):
+        plot_soi_timeseries(csv_path)
     elif name.startswith('timeseries_ext_soi_'):
         plot_ext_timeseries(csv_path)
     elif name == 'timeseries_ext_saturation':

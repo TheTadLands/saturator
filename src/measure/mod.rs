@@ -13,6 +13,9 @@ pub struct TimeSeriesSample {
     pub victim_cpu_ops_sec: f64,
     pub victim_io_ops_sec: f64,
     pub soi_ops_sec: f64,
+    pub soi_gate_on: bool,
+    pub victim_gate_on: bool,
+    pub victim_io_phase: f64,
     pub metrics: crate::proc_metrics::SystemMetrics,
 }
 
@@ -93,8 +96,22 @@ pub fn write_params_file(
     if let Some(nice) = params.nice {
         writeln!(f, "nice: {}", nice).unwrap();
     }
+    if let Some(period) = params.soi_period_ms {
+        writeln!(f, "soi_period_ms: {}", period).unwrap();
+        writeln!(f, "soi_duty: {}", params.soi_duty).unwrap();
+    }
+    if let Some(period) = params.victim_period_ms {
+        writeln!(f, "victim_period_ms: {}", period).unwrap();
+    }
+    if let Some(ref phases) = params.victim_phases {
+        let s: Vec<String> = phases.iter().map(|p| format!("{:.0}", p * 100.0)).collect();
+        writeln!(f, "victim_phases: {}", s.join(",")).unwrap();
+    }
     if let Some(ref prefill) = params.ext_prefill {
         writeln!(f, "prefill: {}", prefill).unwrap();
+    }
+    if let Some(ref output_dir) = params.output_dir {
+        writeln!(f, "output_dir: {}", output_dir).unwrap();
     }
     writeln!(f, "cpu_iterations: {}", calibration.cpu_iterations).unwrap();
     writeln!(f, "io_iterations: {}", calibration.io_iterations).unwrap();

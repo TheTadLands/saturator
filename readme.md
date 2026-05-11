@@ -255,6 +255,10 @@ All experiments accept optional flags to control workload parameters.
 | `--nice <N>` | inherit | Nice value for SoI workers (-20 to 19). Lower values give SoI workers higher scheduling priority. |
 | `--cooldown <N>` | 0 | Idle gap in seconds between samples to let system state settle. |
 | `--prefill <args>` | — | Prefill command args for external workload (e.g. DB pre-population). Runs once before all samples via the wrapper's `SATURATOR_PREFILL` env var. |
+| `--soi-period <ms>` | off | SoI square-wave period in ms. When set, SoI workers alternate between active and sleeping phases. Minimum 10ms. |
+| `--soi-duty <F>` | 0.5 | SoI square-wave duty cycle (0.0–1.0), fraction of the period that is "on". Only meaningful with `--soi-period`. |
+| `--victim-period <ms>` | off | Victim period in ms. Without `--victim-phases`: on/off square-wave gating. With `--victim-phases`: total cycle time divided equally among phases. Minimum 10ms. Works with all process-based experiments. |
+| `--victim-phases <io%,...>` | off | Comma-separated IO percentages (0–100) to cycle through. Each phase gets `victim-period / N` time. Requires `--victim-period`. E.g. `--victim-phases 0,100` alternates pure CPU and pure IO. |
 
 Examples:
 ```bash
@@ -390,6 +394,9 @@ Produced by SoI sweep experiments when `--sample-interval` is set. One row per s
 | `victim_cpu_ops_sec` | Victim CPU operations per second during this interval |
 | `victim_io_ops_sec` | Victim IO operations per second during this interval |
 | `soi_ops_sec` | SoI worker operations per second during this interval |
+| `soi_gate_on` | 1 if SoI workers were active (gate open), 0 if sleeping (gate closed). Always 1 when `--soi-period` is not set. |
+| `victim_gate_on` | 1 if victim workers were active, 0 if sleeping. Always 1 when `--victim-period` is not set (or when `--victim-phases` is used instead of on/off gating). |
+| `victim_io_phase` | Current victim IO percentage (0.0–1.0) when `--victim-phases` is active. -1.0 when phase cycling is disabled. |
 | `cpu_pct` ... `psi_io_full_us` | Same system metrics as saturation CSV, computed over the interval |
 
 Example:

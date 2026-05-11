@@ -4,13 +4,14 @@ import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
 
 from .common import (
     C_BLUE, C_CYAN, C_GREEN, C_ORANGE, C_PURPLE, C_RED,
-    format_number, save_fig,
+    ext_subdir, format_number, save_fig,
 )
 
 
@@ -459,3 +460,326 @@ def plot_soi_comparison(soi_csvs: list):
     ax.legend(loc='best', ncol=2, fontsize=9)
     ax.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(out_dir, 'soi_comparison_normalized.png'))
+
+
+def _shade_gate(ax, t, gate_col, sub, color, label, alpha=0.08):
+    """Shade background regions where a gate is off (value == 0)."""
+    gate = sub[gate_col].values
+    in_off = False
+    start = None
+    for i, val in enumerate(gate):
+        if val == 0 and not in_off:
+            start = t.iloc[i]
+            in_off = True
+        elif val == 1 and in_off:
+            ax.axvspan(start, t.iloc[i], color=color, alpha=alpha, label=label if i == len(gate) - 1 or start == t.iloc[0] else None)
+            label = None
+            in_off = False
+    if in_off:
+        ax.axvspan(start, t.iloc[-1], color=color, alpha=alpha, label=label)
+
+
+def plot_soi_timeseries(csv_path: str):
+    """Generate time-series plots for synthetic victim SoI sweep."""
+    df = pd.read_csv(csv_path)
+    name = Path(csv_path).stem
+    folder = str(Path(csv_path).parent)
+
+    soi_type = name.replace('timeseries_soi_', '')
+    soi_counts = sorted(df['soi_workers'].unique())
+    has_victim_gate = 'victim_gate_on' in df.columns
+    has_multi_sample = 'sample_idx' in df.columns
+
+    has_cpu = df['victim_cpu_ops_sec'].max() > 0 if 'victim_cpu_ops_sec' in df.columns else False
+    has_io = df['victim_io_ops_sec'].max() > 0 if 'victim_io_ops_sec' in df.columns else False
+    tp_col = 'victim_cpu_ops_sec' if has_cpu else 'victim_io_ops_sec'
+    tp_label = 'Victim CPU ops/s' if has_cpu else 'Victim IO ops/s'
+
+    n_samples = df['sample_idx'].nunique() if has_multi_sample else 1
+    group_cols = ['soi_workers', 'elapsed_ms']
+
+    # Compute per-timeslice mean/std across samples
+    if has_multi_sample and n_samples > 1:
+        agg = df.groupby(group_cols).agg(
+            tp_mean=(tp_col, 'mean'), tp_std=(tp_col, 'std'),
+            cpu_pct_mean=('cpu_pct', 'mean') if 'cpu_pct' in df.columns else (tp_col, 'count'),
+            **({'io_util_mean': ('io_util_pct', 'mean')} if 'io_util_pct' in df.columns else {}),
+            **({'io_iops_mean': ('io_iops_util_pct', 'mean')} if 'io_iops_util_pct' in df.columns else {}),
+            **({'mem_mean': ('mem_usage_pct', 'mean')} if 'mem_usage_pct' in df.columns else {}),
+            **({'victim_gate_on': ('victim_gate_on', 'mean')} if has_victim_gate else {}),
+        ).reset_index()
+        agg['tp_std'] = agg['tp_std'].fillna(0)
+    else:
+        agg = df.rename(columns={tp_col: 'tp_mean'}).copy()
+        agg['tp_std'] = 0.0
+        if 'cpu_pct' in df.columns:
+            agg['cpu_pct_mean'] = agg['cpu_pct']
+        if 'io_util_pct' in df.columns:
+            agg['io_util_mean'] = agg['io_util_pct']
+        if 'io_iops_util_pct' in df.columns:
+            agg['io_iops_mean'] = agg['io_iops_util_pct']
+        if 'mem_usage_pct' in df.columns:
+            agg['mem_mean'] = agg['mem_usage_pct']
+
+    print(f"  -> {folder}/ (timeseries, {n_samples} sample(s))")
+
+    # 1. Throughput time-series — mean ± stddev per SoI count
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cmap = plt.cm.viridis
+    for i, s in enumerate(soi_counts):
+        sub = agg[agg['soi_workers'] == s].sort_values('elapsed_ms')
+        color = cmap(i / max(len(soi_counts) - 1, 1))
+        t = sub['elapsed_ms'] / 1000
+        ax.plot(t, sub['tp_mean'], '-', color=color, linewidth=1.2, alpha=0.8, label=f'{int(s)} SoI')
+        if n_samples > 1:
+            ax.fill_between(t, sub['tp_mean'] - sub['tp_std'], sub['tp_mean'] + sub['tp_std'],
+                            color=color, alpha=0.15)
+    ax.set_xlabel('Elapsed (seconds)')
+    ax.set_ylabel(tp_label)
+    title_suffix = f' (mean ± σ, n={n_samples})' if n_samples > 1 else ''
+    ax.set_title(f'SoI Sweep ({soi_type}) — Victim Throughput Time Series{title_suffix}')
+    ax.set_ylim(bottom=0)
+    ax.legend(loc='best', fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+    save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'victim_throughput.png'))
+
+    # 2. Heatmap — mean throughput
+    if len(soi_counts) > 1:
+        pivot = agg.pivot_table(index='soi_workers', columns='elapsed_ms', values='tp_mean')
+        fig, ax = plt.subplots(figsize=(12, 5))
+        im = ax.imshow(pivot.values, aspect='auto', cmap='viridis',
+                       extent=[pivot.columns.min() / 1000, pivot.columns.max() / 1000,
+                               pivot.index.max() + 0.5, pivot.index.min() - 0.5])
+        ax.set_xlabel('Elapsed (seconds)')
+        ax.set_ylabel('SoI Workers')
+        ax.set_title(f'SoI Sweep ({soi_type}) — Throughput Heatmap')
+        ax.set_yticks(soi_counts)
+        cbar = fig.colorbar(im, ax=ax, label=tp_label)
+        cbar.formatter = plt.FuncFormatter(lambda v, p: format_number(v))
+        cbar.update_ticks()
+        save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'heatmap.png'))
+
+    # 3. SoI throughput time-series
+    if 'soi_ops_sec' in df.columns:
+        soi_df = df[df['soi_workers'] > 0]
+        if len(soi_df) and soi_df['soi_ops_sec'].max() > 0:
+            soi_nonzero = sorted(soi_df['soi_workers'].unique())
+
+            if has_multi_sample and n_samples > 1:
+                soi_agg = soi_df.groupby(group_cols).agg(
+                    soi_mean=('soi_ops_sec', 'mean'), soi_std=('soi_ops_sec', 'std'),
+                    **({'soi_gate_on': ('soi_gate_on', 'mean')} if 'soi_gate_on' in soi_df.columns else {}),
+                ).reset_index()
+                soi_agg['soi_std'] = soi_agg['soi_std'].fillna(0)
+            else:
+                soi_agg = soi_df.rename(columns={'soi_ops_sec': 'soi_mean'}).copy()
+                soi_agg['soi_std'] = 0.0
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            cmap = plt.cm.plasma
+            for i, s in enumerate(soi_nonzero):
+                sub = soi_agg[soi_agg['soi_workers'] == s].sort_values('elapsed_ms')
+                color = cmap(i / max(len(soi_nonzero) - 1, 1))
+                t = sub['elapsed_ms'] / 1000
+                ax.plot(t, sub['soi_mean'], '-', color=color, linewidth=1.2, alpha=0.8,
+                        label=f'{int(s)} SoI')
+                if n_samples > 1:
+                    ax.fill_between(t, sub['soi_mean'] - sub['soi_std'],
+                                    sub['soi_mean'] + sub['soi_std'], color=color, alpha=0.15)
+            ax.set_xlabel('Elapsed (seconds)')
+            ax.set_ylabel('SoI Throughput (ops/sec)')
+            title_suffix = f' (mean +/- sigma, n={n_samples})' if n_samples > 1 else ''
+            ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput Time Series{title_suffix}')
+            ax.set_ylim(bottom=0)
+            ax.legend(loc='best', fontsize=8, ncol=2)
+            ax.grid(True, alpha=0.3)
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'soi_throughput.png'))
+
+            if len(soi_nonzero) > 1:
+                pivot = soi_agg.pivot_table(index='soi_workers', columns='elapsed_ms', values='soi_mean')
+                fig, ax = plt.subplots(figsize=(12, 5))
+                im = ax.imshow(pivot.values, aspect='auto', cmap='plasma',
+                               extent=[pivot.columns.min() / 1000, pivot.columns.max() / 1000,
+                                       pivot.index.max() + 0.5, pivot.index.min() - 0.5])
+                ax.set_xlabel('Elapsed (seconds)')
+                ax.set_ylabel('SoI Workers')
+                ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput Heatmap')
+                ax.set_yticks(soi_nonzero)
+                cbar = fig.colorbar(im, ax=ax, label='SoI ops/sec')
+                cbar.formatter = plt.FuncFormatter(lambda v, p: format_number(v))
+                cbar.update_ticks()
+                save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'soi_heatmap.png'))
+
+            for g in soi_nonzero:
+                sub = soi_agg[soi_agg['soi_workers'] == g].sort_values('elapsed_ms')
+                if sub.empty:
+                    continue
+                fig, ax = plt.subplots(figsize=(11, 5))
+                t = sub['elapsed_ms'] / 1000
+                if 'soi_gate_on' in sub.columns:
+                    gate_sub = sub.copy()
+                    gate_sub['soi_gate_on'] = (gate_sub['soi_gate_on'] >= 0.5).astype(int)
+                    _shade_gate(ax, t, 'soi_gate_on', gate_sub, C_ORANGE, 'SoI OFF')
+                ax.plot(t, sub['soi_mean'], '-', color=C_ORANGE, linewidth=2.2, label='SoI ops/s')
+                if n_samples > 1:
+                    ax.fill_between(t, sub['soi_mean'] - sub['soi_std'],
+                                    sub['soi_mean'] + sub['soi_std'],
+                                    color=C_ORANGE, alpha=0.2, label=f'±σ (n={n_samples})')
+                ax.set_xlabel('Elapsed (seconds)')
+                ax.set_ylabel('SoI Throughput (ops/sec)')
+                ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput, SoI={int(g)}')
+                ax.set_ylim(bottom=0)
+                ax.legend(loc='best', fontsize=9)
+                ax.grid(True, alpha=0.3)
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+                fig.tight_layout()
+                save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), f'soi_throughput_per_soi_{int(g):02d}.png'))
+
+    # 4. Per-SoI-count: mean victim throughput + stddev band + utilization + gate shading
+    has_cpu_pct = 'cpu_pct_mean' in agg.columns
+    has_io_bw = 'io_util_mean' in agg.columns
+    has_io_iops = 'io_iops_mean' in agg.columns
+    has_mem = 'mem_mean' in agg.columns
+
+    for g in soi_counts:
+        sub = agg[agg['soi_workers'] == g].sort_values('elapsed_ms')
+        if sub.empty:
+            continue
+
+        fig, ax_tp = plt.subplots(figsize=(11, 5))
+        t = sub['elapsed_ms'] / 1000
+
+        if has_victim_gate and 'victim_gate_on' in sub.columns:
+            gate_sub = sub.copy()
+            gate_sub['victim_gate_on'] = (gate_sub['victim_gate_on'] >= 0.5).astype(int)
+            _shade_gate(ax_tp, t, 'victim_gate_on', gate_sub, 'gray', 'Victim OFF')
+
+        line_tp, = ax_tp.plot(t, sub['tp_mean'], '-', color=C_BLUE, linewidth=2.2, label=tp_label)
+        if n_samples > 1:
+            ax_tp.fill_between(t, sub['tp_mean'] - sub['tp_std'], sub['tp_mean'] + sub['tp_std'],
+                               color=C_BLUE, alpha=0.2, label=f'±σ (n={n_samples})')
+        ax_tp.set_xlabel('Elapsed (seconds)')
+        ax_tp.set_ylabel(tp_label, color=C_BLUE)
+        ax_tp.tick_params(axis='y', labelcolor=C_BLUE)
+        ax_tp.set_ylim(bottom=0)
+        ax_tp.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        ax_tp.grid(True, alpha=0.3)
+
+        ax_util = ax_tp.twinx()
+        lines = [line_tp]
+        if has_cpu_pct:
+            l, = ax_util.plot(t, sub['cpu_pct_mean'], '-', color=C_ORANGE,
+                              linewidth=1.2, alpha=0.8, label='CPU%')
+            lines.append(l)
+        if has_io_bw:
+            l, = ax_util.plot(t, sub['io_util_mean'], '-', color=C_GREEN,
+                              linewidth=1.2, alpha=0.8, label='IO BW%')
+            lines.append(l)
+        if has_io_iops:
+            l, = ax_util.plot(t, sub['io_iops_mean'], '-', color=C_PURPLE,
+                              linewidth=1.2, alpha=0.8, label='IO IOPS%')
+            lines.append(l)
+        if has_mem:
+            l, = ax_util.plot(t, sub['mem_mean'], '-', color=C_RED,
+                              linewidth=1.2, alpha=0.8, label='Mem%')
+            lines.append(l)
+        ax_util.set_ylabel('Utilization (%)')
+        ax_util.set_ylim(0, 105)
+
+        ax_tp.set_title(f'SoI Sweep ({soi_type}) — SoI={int(g)}')
+        ax_tp.legend(lines, [l.get_label() for l in lines], loc='upper right', fontsize=9)
+        fig.tight_layout()
+        save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), f'timeseries_per_soi_{int(g):02d}.png'))
+
+    # 5. Gate-aware throughput comparison (victim on vs off phases)
+    if has_victim_gate:
+        on_means = []
+        off_means = []
+        for s in soi_counts:
+            sub = df[df['soi_workers'] == s]
+            on_data = sub[sub['victim_gate_on'] == 1][tp_col]
+            off_data = sub[sub['victim_gate_on'] == 0][tp_col]
+            on_means.append(on_data.mean() if len(on_data) else 0)
+            off_means.append(off_data.mean() if len(off_data) else 0)
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(soi_counts))
+        w = 0.35
+        ax.bar(x - w / 2, on_means, w, color=C_BLUE, alpha=0.8, label='Victim ON')
+        ax.bar(x + w / 2, off_means, w, color=C_RED, alpha=0.8, label='Victim OFF')
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(s) for s in soi_counts])
+        ax.set_xlabel('SoI Workers')
+        ax.set_ylabel(tp_label)
+        ax.set_title(f'SoI Sweep ({soi_type}) — Throughput by Victim Gate Phase')
+        ax.set_ylim(bottom=0)
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'gate_phase_comparison.png'))
+
+    # 6. Utilization distribution (peak / p95 / median)
+    if has_cpu_pct:
+        stats = []
+        for s in soi_counts:
+            sub = df[df['soi_workers'] == s] if not has_multi_sample else df[df['soi_workers'] == s]
+            cpu_col = 'cpu_pct' if 'cpu_pct' in sub.columns else None
+            if cpu_col is None:
+                break
+            row = {'soi': s, 'cpu_peak': sub[cpu_col].max(),
+                   'cpu_p95': sub[cpu_col].quantile(0.95),
+                   'cpu_median': sub[cpu_col].median()}
+            if 'io_util_pct' in sub.columns:
+                row.update({'io_peak': sub['io_util_pct'].max(),
+                            'io_p95': sub['io_util_pct'].quantile(0.95),
+                            'io_median': sub['io_util_pct'].median()})
+            stats.append(row)
+        if stats:
+            sdf = pd.DataFrame(stats)
+            has_io_stats = 'io_peak' in sdf.columns
+
+            nrows = 2 if has_io_stats else 1
+            fig, axes = plt.subplots(nrows, 1, figsize=(10, 3.5 * nrows), sharex=True,
+                                     layout='constrained')
+            if nrows == 1:
+                axes = [axes]
+
+            ax_cpu = axes[0]
+            ax_cpu.fill_between(sdf['soi'], sdf['cpu_median'], sdf['cpu_peak'],
+                                alpha=0.15, color=C_ORANGE)
+            ax_cpu.fill_between(sdf['soi'], sdf['cpu_median'], sdf['cpu_p95'],
+                                alpha=0.25, color=C_ORANGE)
+            ax_cpu.plot(sdf['soi'], sdf['cpu_peak'], '-^', color=C_RED, linewidth=2,
+                        markersize=6, label='Peak')
+            ax_cpu.plot(sdf['soi'], sdf['cpu_p95'], '-s', color=C_ORANGE, linewidth=2,
+                        markersize=5, label='P95')
+            ax_cpu.plot(sdf['soi'], sdf['cpu_median'], '-o', color=C_BLUE, linewidth=2,
+                        markersize=5, label='Median')
+            ax_cpu.set_ylabel('CPU Utilization (%)')
+            ax_cpu.set_ylim(0, 105)
+            ax_cpu.legend(loc='best', fontsize=9)
+            ax_cpu.grid(True, alpha=0.3)
+            ax_cpu.set_title(f'SoI Sweep ({soi_type}) — Utilization Distribution')
+
+            if has_io_stats:
+                ax_io = axes[1]
+                ax_io.fill_between(sdf['soi'], sdf['io_median'], sdf['io_peak'],
+                                   alpha=0.15, color=C_GREEN)
+                ax_io.fill_between(sdf['soi'], sdf['io_median'], sdf['io_p95'],
+                                   alpha=0.25, color=C_GREEN)
+                ax_io.plot(sdf['soi'], sdf['io_peak'], '-^', color=C_RED, linewidth=2,
+                           markersize=6, label='Peak')
+                ax_io.plot(sdf['soi'], sdf['io_p95'], '-s', color=C_GREEN, linewidth=2,
+                           markersize=5, label='P95')
+                ax_io.plot(sdf['soi'], sdf['io_median'], '-o', color=C_BLUE, linewidth=2,
+                           markersize=5, label='Median')
+                ax_io.set_ylabel('IO BW Utilization (%)')
+                ax_io.set_ylim(0, 105)
+                ax_io.legend(loc='best', fontsize=9)
+                ax_io.grid(True, alpha=0.3)
+
+            axes[-1].set_xlabel('SoI Workers')
+            axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
+            save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'utilization_distribution.png'))

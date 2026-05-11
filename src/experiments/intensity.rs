@@ -18,7 +18,7 @@ pub fn run_intensity_sweep_experiment(
     println!("{} base workers at intensity=1.0, io_pct={}%", base_workers, io_pct_int);
     println!("Sweeping 1 probe worker intensity from 0.0 to 1.0\n");
 
-    let run_dir = format!("proc_intensity_sweep_{}base_{}pct_io_{}", base_workers, io_pct_int, timestamp());
+    let run_dir = params.run_dir(&format!("proc_intensity_sweep_{}base_{}pct_io_{}", base_workers, io_pct_int, timestamp()));
     std::fs::create_dir_all(&run_dir).unwrap();
 
     write_params_file(&run_dir, "intensity sweep", params, &calibration, &[

@@ -3,7 +3,7 @@ use std::process::{Child, Command};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::saturator::{TuningParams, SharedRegion, create_shared_region, destroy_shared_region, worker_counters, now_ns};
+use crate::saturator::{TuningParams, SharedRegion, create_shared_region, destroy_shared_region, worker_counters, now_ns, spawn_soi_gate_coordinator};
 use crate::proc_metrics;
 use crate::soi::{SoiBackend, SoiType};
 use super::ext_throughput::ThroughputReader;
@@ -62,6 +62,9 @@ pub struct ExtTimeSeriesSample {
     pub elapsed_ms: u64,
     pub ext_ops_sec: f64,
     pub soi_ops_sec: f64,
+    pub soi_gate_on: bool,
+    pub victim_gate_on: bool,
+    pub victim_io_phase: f64,
     pub metrics: proc_metrics::SystemMetrics,
 }
 
@@ -190,6 +193,18 @@ pub fn run_ext_measurement(
         None
     };
 
+    let gate_handle = if let Some(period_ms) = params.soi_period_ms {
+        if let Some(region_ptr) = soi_state.as_ref().and_then(SoiState::region_ptr) {
+            let gate: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).soi_gate };
+            let deadline_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).deadline_ns };
+            Some(spawn_soi_gate_coordinator(gate, deadline_ref, period_ms, params.soi_duty))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Warmup
     std::thread::sleep(Duration::from_secs(params.warmup_secs));
 
@@ -248,10 +263,17 @@ pub fn run_ext_measurement(
             let curr_snap = proc_metrics::take_snapshot();
             let delta_metrics = proc_metrics::compute_delta(&prev_snap, &curr_snap, interval_secs);
 
+            let soi_on = soi_state.as_ref()
+                .and_then(SoiState::region_ptr)
+                .map(|rp| unsafe { (*rp).soi_gate.load(Ordering::Relaxed) } == 1)
+                .unwrap_or(true);
             ts_samples.push(ExtTimeSeriesSample {
                 elapsed_ms,
                 ext_ops_sec: last_ext_ops,
                 soi_ops_sec: soi_delta as f64 / interval_secs,
+                soi_gate_on: soi_on,
+                victim_gate_on: true,
+                victim_io_phase: -1.0,
                 metrics: delta_metrics,
             });
 
@@ -330,6 +352,10 @@ pub fn run_ext_measurement(
             let _ = std::fs::remove_dir_all(&scratch_dir);
         }
         None => {}
+    }
+
+    if let Some(h) = gate_handle {
+        let _ = h.join();
     }
 
     let ext_ops_per_sec = ThroughputReader::average_ops(&all_tp_samples);

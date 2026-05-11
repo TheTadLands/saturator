@@ -90,7 +90,7 @@ pub fn run_saturation_experiment(
         }
     }
 
-    let run_dir = format!("{}_{}", exp.csv_base, timestamp());
+    let run_dir = params.run_dir(&format!("{}_{}", exp.csv_base, timestamp()));
     std::fs::create_dir_all(&run_dir).unwrap();
 
     let mode_str = match exp.mode { Mode::Threads => "threads", Mode::Procs => "procs" };

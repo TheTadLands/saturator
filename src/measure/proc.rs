@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::constants::*;
-use crate::saturator::{CalibrationResult, TuningParams, create_shared_region, destroy_shared_region, worker_counters, now_ns};
+use crate::saturator::{CalibrationResult, TuningParams, create_shared_region, destroy_shared_region, worker_counters, now_ns, spawn_soi_gate_coordinator, spawn_victim_phase_coordinator, spawn_antiphase_gate_coordinator};
 use crate::proc_metrics;
 use crate::soi::SoiType;
 use super::{aggregate_samples, TimeSeriesSample};
@@ -63,6 +63,8 @@ fn run_proc_measurement(
 
     let exe = std::env::current_exe().unwrap();
     let sleep_us = calibration.cpu_us as u64;
+    let always_io = params.victim_phases.as_ref()
+        .is_some_and(|phases| phases.iter().any(|&p| p > 0.0));
     let mut children = Vec::with_capacity(worker_count);
 
     for (i, wc) in workers.iter().enumerate() {
@@ -80,6 +82,7 @@ fn run_proc_measurement(
             .arg(worker_count.to_string())
             .arg(params.random_access.to_string())
             .arg(params.direct_io.to_string())
+            .arg(always_io.to_string())
             .spawn()
             .expect("Failed to spawn worker process");
         children.push(child);
@@ -89,6 +92,19 @@ fn run_proc_measurement(
     while region.ready_count.load(Ordering::Relaxed) < worker_count as u64 {
         std::thread::sleep(Duration::from_millis(READY_POLL_INTERVAL_MS));
     }
+
+    let victim_coord_handle = if let Some(period_ms) = params.victim_period_ms {
+        let deadline_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).deadline_ns };
+        if let Some(ref phases) = params.victim_phases {
+            let io_perc_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).victim_io_perc };
+            Some(spawn_victim_phase_coordinator(io_perc_ref, deadline_ref, period_ms, phases.clone()))
+        } else {
+            let gate: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).victim_gate };
+            Some(spawn_soi_gate_coordinator(gate, deadline_ref, period_ms, 0.5))
+        }
+    } else {
+        None
+    };
 
     // Warmup
     std::thread::sleep(Duration::from_secs(params.warmup_secs));
@@ -111,6 +127,10 @@ fn run_proc_measurement(
 
     for mut child in children {
         let _ = child.wait();
+    }
+
+    if let Some(h) = victim_coord_handle {
+        let _ = h.join();
     }
 
     // Collect per-worker rates
@@ -263,6 +283,8 @@ fn run_mixed_proc_measurement(
 
     let exe = std::env::current_exe().unwrap();
     let sleep_us = calibration.cpu_us as u64;
+    let always_io = params.victim_phases.as_ref()
+        .is_some_and(|phases| phases.iter().any(|&p| p > 0.0));
     let mut children = Vec::with_capacity(worker_count);
 
     for (i, wk) in workers.iter().enumerate() {
@@ -282,6 +304,7 @@ fn run_mixed_proc_measurement(
                     .arg(worker_count.to_string())
                     .arg(params.random_access.to_string())
                     .arg(params.direct_io.to_string())
+                    .arg(always_io.to_string())
                     .spawn()
                     .expect("Failed to spawn worker process")
             }
@@ -296,6 +319,36 @@ fn run_mixed_proc_measurement(
     while region.ready_count.load(Ordering::Relaxed) < worker_count as u64 {
         std::thread::sleep(Duration::from_millis(READY_POLL_INTERVAL_MS));
     }
+
+    let (soi_gate_handle, victim_coord_handle) = if params.antiphase {
+        let victim_gate: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).victim_gate };
+        let soi_gate: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).soi_gate };
+        let deadline_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).deadline_ns };
+        let period_ms = params.victim_period_ms.unwrap();
+        let h = spawn_antiphase_gate_coordinator(victim_gate, soi_gate, deadline_ref, period_ms, params.soi_duty);
+        (None, Some(h))
+    } else {
+        let soi_h = if let Some(period_ms) = params.soi_period_ms {
+            let gate: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).soi_gate };
+            let deadline_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).deadline_ns };
+            Some(spawn_soi_gate_coordinator(gate, deadline_ref, period_ms, params.soi_duty))
+        } else {
+            None
+        };
+        let victim_h = if let Some(period_ms) = params.victim_period_ms {
+            let deadline_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).deadline_ns };
+            if let Some(ref phases) = params.victim_phases {
+                let io_perc_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).victim_io_perc };
+                Some(spawn_victim_phase_coordinator(io_perc_ref, deadline_ref, period_ms, phases.clone()))
+            } else {
+                let gate: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).victim_gate };
+                Some(spawn_soi_gate_coordinator(gate, deadline_ref, period_ms, 0.5))
+            }
+        } else {
+            None
+        };
+        (soi_h, victim_h)
+    };
 
     // Warmup
     std::thread::sleep(Duration::from_secs(params.warmup_secs));
@@ -342,11 +395,18 @@ fn run_mixed_proc_measurement(
                 }
             }
 
+            let soi_on = unsafe { (*region_ptr).soi_gate.load(Ordering::Relaxed) } == 1;
+            let victim_on = unsafe { (*region_ptr).victim_gate.load(Ordering::Relaxed) } == 1;
+            let io_perc_raw = unsafe { (*region_ptr).victim_io_perc.load(Ordering::Relaxed) };
+            let victim_io_phase = if io_perc_raw == u64::MAX { -1.0 } else { io_perc_raw as f64 / 1000.0 };
             samples.push(TimeSeriesSample {
                 elapsed_ms,
                 victim_cpu_ops_sec: v_cpu_delta as f64 / interval_secs,
                 victim_io_ops_sec: v_io_delta as f64 / interval_secs,
                 soi_ops_sec: soi_delta as f64 / interval_secs,
+                soi_gate_on: soi_on,
+                victim_gate_on: victim_on,
+                victim_io_phase,
                 metrics: delta_metrics,
             });
 
@@ -366,6 +426,13 @@ fn run_mixed_proc_measurement(
 
     for mut child in children {
         let _ = child.wait();
+    }
+
+    if let Some(h) = soi_gate_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = victim_coord_handle {
+        let _ = h.join();
     }
 
     // Collect per-worker rates
@@ -443,7 +510,7 @@ pub fn measure_soi_throughput(
     soi_buffer_size: usize,
     calibration: &CalibrationResult,
     params: &TuningParams,
-) -> (f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Option<Vec<TimeSeriesSample>>) {
+) -> (f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Vec<Option<Vec<TimeSeriesSample>>>) {
     let samples: Vec<_> = (0..params.samples).map(|_| {
         measure_single_run_soi(
             victim_count, victim_io_perc, soi_count, soi_type, soi_buffer_size,
@@ -466,7 +533,7 @@ pub fn measure_soi_throughput(
         .map(|(i, _)| i)
         .unwrap_or(0);
     let per_worker = samples[median_idx].4.clone();
-    let timeseries = samples.into_iter().nth(median_idx).and_then(|s| s.5);
+    let all_timeseries: Vec<Option<Vec<TimeSeriesSample>>> = samples.into_iter().map(|s| s.5).collect();
 
     (
         super::median(&cpu_vals),
@@ -476,7 +543,7 @@ pub fn measure_soi_throughput(
         super::median(&soi_vals),
         proc_metrics::median_metrics(&metrics_list),
         per_worker,
-        timeseries,
+        all_timeseries,
     )
 }
 

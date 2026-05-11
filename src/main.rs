@@ -57,6 +57,7 @@ fn main() {
         println!("  --throughput-file <path> Throughput protocol file path (default: /tmp/saturator_ext_throughput.txt)");
         println!("  --stats-file <path>  Workload stats protocol file path (default: /tmp/saturator_ext_stats.txt)");
         println!("  --nice <N>           Nice value for SoI workers (-20 to 19, default: inherit)");
+        println!("  --output-dir <name>  Place all output under output/<name>/ (default: cwd)");
         println!("");
         println!("Examples:");
         println!("  find-slack 4 100     - 4 CPU baseline, add 100% I/O threads");
@@ -72,7 +73,7 @@ fn main() {
 
     // Hidden worker subcommand — child process entry point
     if experiment == "__worker" {
-        // Args: __worker <shm_name> <worker_id> <cpu_iters> <io_iters> <io_perc> <buffer_kb> <io_buffer_kb> <intensity> <sleep_us> <max_workers> <random_access> <direct_io>
+        // Args: __worker <shm_name> <worker_id> <cpu_iters> <io_iters> <io_perc> <buffer_kb> <io_buffer_kb> <intensity> <sleep_us> <max_workers> <random_access> <direct_io> <always_io>
         let shm_name = &args[2];
         let worker_id: usize = args[3].parse().unwrap();
         let cpu_iters: usize = args[4].parse().unwrap();
@@ -85,8 +86,9 @@ fn main() {
         let max_workers: usize = args[11].parse().unwrap();
         let random_access: bool = args[12].parse().unwrap();
         let direct_io: bool = args[13].parse().unwrap();
+        let always_io: bool = args.get(14).and_then(|s| s.parse().ok()).unwrap_or(false);
 
-        run_worker_process(shm_name, worker_id, cpu_iters, io_iters, io_perc, buffer_kb * 1024, io_buffer_kb * 1024, intensity, sleep_us, max_workers, random_access, direct_io);
+        run_worker_process(shm_name, worker_id, cpu_iters, io_iters, io_perc, buffer_kb * 1024, io_buffer_kb * 1024, intensity, sleep_us, max_workers, random_access, direct_io, always_io);
         return;
     }
 
@@ -456,9 +458,59 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
                     params.nice = Some(v.clamp(-20, 19));
                 }
             }
+            "--soi-period" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse::<u64>().ok()) {
+                    params.soi_period_ms = Some(v.max(10));
+                }
+            }
+            "--soi-duty" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse::<f64>().ok()) {
+                    params.soi_duty = v.clamp(0.01, 0.99);
+                }
+            }
+            "--victim-period" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse::<u64>().ok()) {
+                    params.victim_period_ms = Some(v.max(10));
+                }
+            }
+            "--output-dir" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    params.output_dir = Some(v.clone());
+                }
+            }
+            "--antiphase" => {
+                params.antiphase = true;
+            }
+            "--victim-phases" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    let phases: Vec<f64> = v.split(',')
+                        .filter_map(|s| s.trim().parse::<f64>().ok())
+                        .map(|p| (p / 100.0).clamp(0.0, 1.0))
+                        .collect();
+                    if !phases.is_empty() {
+                        params.victim_phases = Some(phases);
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
     }
+
+    if params.victim_phases.is_some() && params.victim_period_ms.is_none() {
+        eprintln!("ERROR: --victim-phases requires --victim-period");
+        std::process::exit(1);
+    }
+
+    if params.antiphase && params.victim_period_ms.is_none() {
+        eprintln!("ERROR: --antiphase requires --victim-period");
+        std::process::exit(1);
+    }
+
     params
 }

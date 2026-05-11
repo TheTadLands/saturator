@@ -42,7 +42,7 @@ pub fn run_slack_experiment(
                            baseline_threads,
                            exp.baseline_label.to_lowercase(),
                            (extra_io_ratio * 100.0) as u32);
-    let run_dir = format!("{}_{}", csv_base, timestamp());
+    let run_dir = params.run_dir(&format!("{}_{}", csv_base, timestamp()));
     std::fs::create_dir_all(&run_dir).unwrap();
 
     write_params_file(&run_dir, &format!("{} slack", exp.baseline_label), params, &calibration, &[

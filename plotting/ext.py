@@ -203,6 +203,41 @@ def plot_ext_timeseries(csv_path: str):
         out_template='timeseries_per_soi_{:02d}.png',
     )
 
+    if 'soi_ops_sec' in df.columns:
+        soi_df = df[df['soi_workers'] > 0]
+        if soi_df['soi_ops_sec'].max() > 0:
+            soi_nonzero = sorted(soi_df['soi_workers'].unique())
+            fig, ax = plt.subplots(figsize=(10, 6))
+            cmap = plt.cm.plasma
+            for i, s in enumerate(soi_nonzero):
+                sub = soi_df[soi_df['soi_workers'] == s]
+                color = cmap(i / max(len(soi_nonzero) - 1, 1))
+                ax.plot(sub['elapsed_ms'] / 1000, sub['soi_ops_sec'], '-', color=color,
+                        linewidth=1.2, alpha=0.8, label=f'{int(s)} SoI')
+            ax.set_xlabel('Elapsed (seconds)')
+            ax.set_ylabel('SoI Throughput (ops/sec)')
+            ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput Time Series')
+            ax.set_ylim(bottom=0)
+            ax.legend(loc='best', fontsize=8, ncol=2)
+            ax.grid(True, alpha=0.3)
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'soi_throughput.png'))
+
+            if len(soi_nonzero) > 1:
+                pivot = soi_df.pivot_table(index='soi_workers', columns='elapsed_ms', values='soi_ops_sec')
+                fig, ax = plt.subplots(figsize=(12, 5))
+                im = ax.imshow(pivot.values, aspect='auto', cmap='plasma',
+                               extent=[pivot.columns.min() / 1000, pivot.columns.max() / 1000,
+                                       pivot.index.max() + 0.5, pivot.index.min() - 0.5])
+                ax.set_xlabel('Elapsed (seconds)')
+                ax.set_ylabel('SoI Workers')
+                ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput Heatmap')
+                ax.set_yticks(soi_nonzero)
+                cbar = fig.colorbar(im, ax=ax, label='SoI ops/sec')
+                cbar.formatter = plt.FuncFormatter(lambda v, p: format_number(v))
+                cbar.update_ticks()
+                save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'soi_heatmap.png'))
+
     if 'cpu_pct' in df.columns and 'io_util_pct' in df.columns:
         stats = []
         for s in soi_counts:

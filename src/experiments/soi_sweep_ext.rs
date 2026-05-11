@@ -27,7 +27,20 @@ pub fn run_soi_sweep_ext_experiment(
     println!("Stats file: {}", stats_file);
     println!("Sweeping {} SoI workers 0..{} by {}", soi_type.name(), params.max_workers, params.step);
 
-    let run_dir = format!("ext_soi_{}_{}", soi_type.name(), timestamp());
+    if let Some(period_ms) = params.soi_period_ms {
+        println!("SoI square-wave: period={}ms, duty={:.0}%", period_ms, params.soi_duty * 100.0);
+        if let Some(interval_ms) = params.sample_interval_ms {
+            if period_ms % interval_ms != 0 {
+                eprintln!("WARNING: sample_interval_ms ({}) does not evenly divide soi_period_ms ({}). \
+                           Time-series samples may straddle phase boundaries.", interval_ms, period_ms);
+            }
+        }
+        if matches!(soi_type.backend(), crate::soi::SoiBackend::External(_)) {
+            eprintln!("WARNING: --soi-period has no effect on external SoI backend ({})", soi_type.name());
+        }
+    }
+
+    let run_dir = params.run_dir(&format!("ext_soi_{}_{}", soi_type.name(), timestamp()));
     std::fs::create_dir_all(&run_dir).unwrap();
 
     write_params_file(&run_dir, &format!("ext_soi_sweep_{}", soi_type.name()), params,
@@ -57,7 +70,7 @@ pub fn run_soi_sweep_ext_experiment(
     let mut ts_file = if params.sample_interval_ms.is_some() {
         let ts_path = format!("{}/timeseries_ext_soi_{}.csv", run_dir, soi_type.name());
         let mut f = std::fs::File::create(&ts_path).unwrap();
-        writeln!(f, "soi_workers,elapsed_ms,ext_ops_sec,soi_ops_sec,{}",
+        writeln!(f, "soi_workers,elapsed_ms,ext_ops_sec,soi_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
                  proc_metrics::csv_header()).unwrap();
         Some(f)
     } else {
@@ -153,9 +166,12 @@ fn write_saturation_timeseries(
 ) {
     if let (Some(f), Some(samples)) = (ts_file.as_mut(), ts_data.as_ref()) {
         for s in samples {
-            writeln!(f, "{},{},{:.2},{:.2},{}",
+            writeln!(f, "{},{},{:.2},{:.2},{},{},{:.3},{}",
                      concurrency, s.elapsed_ms,
                      s.ext_ops_sec, s.soi_ops_sec,
+                     if s.soi_gate_on { 1 } else { 0 },
+                     if s.victim_gate_on { 1 } else { 0 },
+                     s.victim_io_phase,
                      s.metrics.to_csv_row()).unwrap();
         }
     }
@@ -169,9 +185,12 @@ fn write_ext_timeseries(
 ) {
     if let (Some(f), Some(samples)) = (ts_file.as_mut(), ts_data.as_ref()) {
         for s in samples {
-            writeln!(f, "{},{},{:.2},{:.2},{}",
+            writeln!(f, "{},{},{:.2},{:.2},{},{},{:.3},{}",
                      soi_workers, s.elapsed_ms,
                      s.ext_ops_sec, s.soi_ops_sec,
+                     if s.soi_gate_on { 1 } else { 0 },
+                     if s.victim_gate_on { 1 } else { 0 },
+                     s.victim_io_phase,
                      s.metrics.to_csv_row()).unwrap();
         }
     }
@@ -211,7 +230,7 @@ pub fn run_ext_saturation_experiment(
     println!("Command template: {}", ext_cmd_template);
     println!("Sweeping {{N}} from {} to {} by {}", params.step, params.max_workers, params.step);
 
-    let run_dir = format!("ext_saturation_{}", timestamp());
+    let run_dir = params.run_dir(&format!("ext_saturation_{}", timestamp()));
     std::fs::create_dir_all(&run_dir).unwrap();
 
     write_params_file(&run_dir, "ext_saturation", params,
@@ -235,7 +254,7 @@ pub fn run_ext_saturation_experiment(
     let mut ts_file = if params.sample_interval_ms.is_some() {
         let ts_path = format!("{}/timeseries_ext_saturation.csv", run_dir);
         let mut f = std::fs::File::create(&ts_path).unwrap();
-        writeln!(f, "concurrency,elapsed_ms,ext_ops_sec,soi_ops_sec,{}",
+        writeln!(f, "concurrency,elapsed_ms,ext_ops_sec,soi_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
                  proc_metrics::csv_header()).unwrap();
         Some(f)
     } else {

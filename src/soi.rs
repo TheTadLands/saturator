@@ -233,7 +233,7 @@ fn read_proc_meminfo_total() -> usize {
 
 /// Cache pressure SoI: memcpy half ← half within a cache-sized buffer.
 /// Used by L1d, L2, L3 SoIs.
-fn soi_cache_work(deadline_ns: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8]) {
+fn soi_cache_work(deadline_ns: &AtomicU64, gate: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8]) {
     let len = buffer.len();
     if len < 2 { return; }
     let half = len / 2;
@@ -243,6 +243,11 @@ fn soi_cache_work(deadline_ns: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8
         let d = deadline_ns.load(Ordering::Relaxed);
         if d != 0 && now_ns() >= d {
             break;
+        }
+
+        if gate.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
         }
 
         // Copy second half to first half
@@ -264,7 +269,7 @@ fn soi_cache_work(deadline_ns: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8
 }
 
 /// Memory bandwidth SoI: streaming scalar multiply over f64 array.
-fn soi_membw_work(deadline_ns: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8]) {
+fn soi_membw_work(deadline_ns: &AtomicU64, gate: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8]) {
     let f64_count = buffer.len() / 8;
     if f64_count < 2 { return; }
     let data = unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut f64, f64_count) };
@@ -281,6 +286,11 @@ fn soi_membw_work(deadline_ns: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8
         let d = deadline_ns.load(Ordering::Relaxed);
         if d != 0 && now_ns() >= d {
             break;
+        }
+
+        if gate.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
         }
 
         // Forward pass: multiply
@@ -306,12 +316,12 @@ fn soi_membw_work(deadline_ns: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8
 }
 
 /// Memory capacity SoI: memcpy over a huge buffer (same pattern as cache SoI).
-fn soi_memcap_work(deadline_ns: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8]) {
-    soi_cache_work(deadline_ns, counter, buffer);
+fn soi_memcap_work(deadline_ns: &AtomicU64, gate: &AtomicU64, counter: &AtomicU64, buffer: &mut [u8]) {
+    soi_cache_work(deadline_ns, gate, counter, buffer);
 }
 
 /// Pure CPU SoI: busy-spin integer ops.
-fn soi_cpu_work(deadline_ns: &AtomicU64, counter: &AtomicU64) {
+fn soi_cpu_work(deadline_ns: &AtomicU64, gate: &AtomicU64, counter: &AtomicU64) {
     let mut local_ops = 0u64;
     let mut hash = 0u64;
 
@@ -319,6 +329,11 @@ fn soi_cpu_work(deadline_ns: &AtomicU64, counter: &AtomicU64) {
         let d = deadline_ns.load(Ordering::Relaxed);
         if d != 0 && now_ns() >= d {
             break;
+        }
+
+        if gate.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
         }
 
         for i in 0..SOI_CPU_BATCH_ITERS {
@@ -341,7 +356,7 @@ fn soi_cpu_work(deadline_ns: &AtomicU64, counter: &AtomicU64) {
 
 /// IO SoI: O_DIRECT|O_SYNC pwrite at given block size.
 /// `random` = true for IOPs (random offsets), false for bandwidth (sequential).
-fn soi_io_work(deadline_ns: &AtomicU64, counter: &AtomicU64, worker_id: usize, block_size: usize, random: bool) {
+fn soi_io_work(deadline_ns: &AtomicU64, gate: &AtomicU64, counter: &AtomicU64, worker_id: usize, block_size: usize, random: bool) {
     let path = format!("/tmp/saturator_soi_{}", worker_id);
     let file_size = SOI_IO_FILE_SIZE_BYTES.max(256 * block_size);
 
@@ -371,6 +386,11 @@ fn soi_io_work(deadline_ns: &AtomicU64, counter: &AtomicU64, worker_id: usize, b
         let d = deadline_ns.load(Ordering::Relaxed);
         if d != 0 && now_ns() >= d {
             break;
+        }
+
+        if gate.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
         }
 
         if random {
@@ -420,36 +440,38 @@ pub fn run_soi_worker_process(
     // Cache/CPU/Mem SoIs write to cpu_ops; IO SoIs write to io_ops.
     let (wk_cpu, wk_io, _wk_sleep, _wk_errors) = unsafe { worker_counters(region, worker_id) };
 
+    let gate = &region_ref.soi_gate;
+
     match soi_type {
         SoiType::L1d | SoiType::L2 | SoiType::L3 => {
             let mut buffer = alloc_mmap_buffer(buffer_size);
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_cache_work(&region_ref.deadline_ns, wk_cpu, &mut buffer);
+            soi_cache_work(&region_ref.deadline_ns, gate, wk_cpu, &mut buffer);
             free_mmap_buffer(&mut buffer);
         }
         SoiType::MemBw => {
             let mut buffer = alloc_mmap_buffer(buffer_size);
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_membw_work(&region_ref.deadline_ns, wk_cpu, &mut buffer);
+            soi_membw_work(&region_ref.deadline_ns, gate, wk_cpu, &mut buffer);
             free_mmap_buffer(&mut buffer);
         }
         SoiType::MemCap => {
             let mut buffer = alloc_mmap_buffer(buffer_size);
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_memcap_work(&region_ref.deadline_ns, wk_cpu, &mut buffer);
+            soi_memcap_work(&region_ref.deadline_ns, gate, wk_cpu, &mut buffer);
             free_mmap_buffer(&mut buffer);
         }
         SoiType::Cpu => {
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_cpu_work(&region_ref.deadline_ns, wk_cpu);
+            soi_cpu_work(&region_ref.deadline_ns, gate, wk_cpu);
         }
         SoiType::IoBw => {
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_io_work(&region_ref.deadline_ns, wk_io, worker_id, SOI_IOBW_BLOCK_BYTES, false);
+            soi_io_work(&region_ref.deadline_ns, gate, wk_io, worker_id, SOI_IOBW_BLOCK_BYTES, false);
         }
         SoiType::IoOps => {
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_io_work(&region_ref.deadline_ns, wk_io, worker_id, SOI_IOOPS_BLOCK_BYTES, true);
+            soi_io_work(&region_ref.deadline_ns, gate, wk_io, worker_id, SOI_IOOPS_BLOCK_BYTES, true);
         }
     }
 }

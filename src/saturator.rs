@@ -35,6 +35,21 @@ pub struct TuningParams {
     pub ext_stats_file: Option<String>,    // workload stats protocol file path (default: None)
     pub ext_prefill: Option<String>,       // prefill command for external workload (default: None)
     pub nice: Option<i32>,                 // nice value for SoI workers (default: None = inherit)
+    pub soi_period_ms: Option<u64>,        // SoI square-wave period in ms (default: None = continuous)
+    pub soi_duty: f64,                     // SoI square-wave duty cycle, fraction "on" (default: 0.5)
+    pub victim_period_ms: Option<u64>,     // victim square-wave period in ms (default: None = continuous)
+    pub victim_phases: Option<Vec<f64>>,   // victim IO% phases to cycle through (default: None = fixed io_perc)
+    pub antiphase: bool,                   // run SoI and victim gates in opposition (default: false)
+    pub output_dir: Option<String>,        // subdirectory under output/ for all run artifacts (default: None = cwd)
+}
+
+impl TuningParams {
+    pub fn run_dir(&self, base: &str) -> String {
+        match &self.output_dir {
+            Some(dir) => format!("output/{}/{}", dir, base),
+            None => base.to_string(),
+        }
+    }
 }
 
 impl Default for TuningParams {
@@ -60,6 +75,12 @@ impl Default for TuningParams {
             ext_stats_file: None,
             ext_prefill: None,
             nice: None,
+            soi_period_ms: None,
+            soi_duty: 0.5,
+            victim_period_ms: None,
+            victim_phases: None,
+            antiphase: false,
+            output_dir: None,
         }
     }
 }
@@ -231,6 +252,8 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize, random_acces
 /// until the deadline (read from `deadline_ns`) is reached.
 fn work_loop(
     deadline_ns: &AtomicU64,
+    gate: &AtomicU64,
+    dynamic_io_perc: &AtomicU64,
     cpu_counter: &AtomicU64,
     io_counter: &AtomicU64,
     sleep_counter: &AtomicU64,
@@ -256,6 +279,16 @@ fn work_loop(
             break;
         }
 
+        if gate.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+
+        let effective_io_perc = {
+            let v = dynamic_io_perc.load(Ordering::Relaxed);
+            if v == u64::MAX { io_perc } else { v as f64 / 1000.0 }
+        };
+
         rng_state = rng_state.wrapping_mul(PCG_MULTIPLIER).wrapping_add(1);
         let rand_f64 = (rng_state >> 32) as f64 / u32::MAX as f64;
 
@@ -274,7 +307,7 @@ fn work_loop(
             }
         }
 
-        if rand_f64 < io_perc {
+        if rand_f64 < effective_io_perc {
             if let Some(io) = io_state {
                 do_io_work(io, io_iterations, io_buf);
             }
@@ -302,6 +335,9 @@ fn work_loop(
         sleep_counter.fetch_add(local_sleep_ops, Ordering::Relaxed);
     }
 }
+
+static GATE_ALWAYS_ON: AtomicU64 = AtomicU64::new(1);
+static IO_PERC_DISABLED: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Thread work loop: sets up buffers and IO state, runs the shared work loop,
 /// then records errors and cleans up.
@@ -332,7 +368,8 @@ pub fn run_saturator(
     };
 
     work_loop(
-        &deadline_ns, &pt_cpu, &pt_io, &pt_sleep,
+        &deadline_ns, &GATE_ALWAYS_ON, &IO_PERC_DISABLED,
+        &pt_cpu, &pt_io, &pt_sleep,
         &cpu_buffer, &mut io_state, io_buf,
         calibration.cpu_iterations, calibration.io_iterations,
         io_perc, params.intensity, calibration.cpu_us as u64,
@@ -486,6 +523,9 @@ pub struct SharedRegion {
     pub io_ops: AtomicU64,
     pub ready_count: AtomicU64,  // children increment when setup is complete
     pub deadline_ns: AtomicU64,  // 0 = no deadline (warmup), >0 = stop when clock >= this
+    pub soi_gate: AtomicU64,     // 1 = SoI workers work, 0 = SoI workers sleep (square-wave gating)
+    pub victim_gate: AtomicU64,  // 1 = victim workers work, 0 = victim workers sleep (square-wave gating)
+    pub victim_io_perc: AtomicU64, // dynamic IO%, encoded as (io_perc * 1000) as u64; u64::MAX = use local
 }
 
 /// Compute shared memory size: header + per-worker counters, rounded up to page size.
@@ -527,6 +567,9 @@ pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegio
         std::ptr::write(&mut (*region).io_ops, AtomicU64::new(0));
         std::ptr::write(&mut (*region).ready_count, AtomicU64::new(0));
         std::ptr::write(&mut (*region).deadline_ns, AtomicU64::new(0));
+        std::ptr::write(&mut (*region).soi_gate, AtomicU64::new(1));
+        std::ptr::write(&mut (*region).victim_gate, AtomicU64::new(1));
+        std::ptr::write(&mut (*region).victim_io_perc, AtomicU64::new(u64::MAX));
 
         // Zero-init per-worker area
         let worker_area = (ptr as *mut u8).add(std::mem::size_of::<SharedRegion>());
@@ -570,6 +613,91 @@ pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_wo
     }
 }
 
+/// Spawn a thread that drives the SoI square-wave gate.
+/// Toggles `gate` between 1 (on) and 0 (off) at the given period and duty cycle.
+/// Exits when `deadline_ns` is reached.
+pub fn spawn_soi_gate_coordinator(
+    gate: &'static AtomicU64,
+    deadline_ns: &'static AtomicU64,
+    period_ms: u64,
+    duty: f64,
+) -> std::thread::JoinHandle<()> {
+    let on_ms = (period_ms as f64 * duty) as u64;
+    let off_ms = period_ms - on_ms;
+
+    std::thread::spawn(move || {
+        loop {
+            gate.store(1, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(on_ms));
+
+            let d = deadline_ns.load(Ordering::Relaxed);
+            if d != 0 && now_ns() >= d { break; }
+
+            gate.store(0, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(off_ms));
+
+            let d = deadline_ns.load(Ordering::Relaxed);
+            if d != 0 && now_ns() >= d { break; }
+        }
+    })
+}
+
+/// Spawn a thread that cycles `io_perc_field` through the given phases.
+/// Each phase gets `period_ms / phases.len()` time. Exits when `deadline_ns` is reached.
+pub fn spawn_victim_phase_coordinator(
+    io_perc_field: &'static AtomicU64,
+    deadline_ns: &'static AtomicU64,
+    period_ms: u64,
+    phases: Vec<f64>,
+) -> std::thread::JoinHandle<()> {
+    let phase_ms = period_ms / phases.len() as u64;
+    let encoded: Vec<u64> = phases.iter().map(|p| (p * 1000.0) as u64).collect();
+
+    std::thread::spawn(move || {
+        loop {
+            for &enc in &encoded {
+                io_perc_field.store(enc, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(phase_ms));
+
+                let d = deadline_ns.load(Ordering::Relaxed);
+                if d != 0 && now_ns() >= d { return; }
+            }
+        }
+    })
+}
+
+/// Spawn a single coordinator that drives victim and SoI gates in opposition.
+/// Phase 1: victim ON, SoI OFF for `duty` fraction of the period.
+/// Phase 2: victim OFF, SoI ON for the remainder.
+pub fn spawn_antiphase_gate_coordinator(
+    victim_gate: &'static AtomicU64,
+    soi_gate: &'static AtomicU64,
+    deadline_ns: &'static AtomicU64,
+    period_ms: u64,
+    duty: f64,
+) -> std::thread::JoinHandle<()> {
+    let victim_on_ms = (period_ms as f64 * duty) as u64;
+    let soi_on_ms = period_ms - victim_on_ms;
+
+    std::thread::spawn(move || {
+        loop {
+            victim_gate.store(1, Ordering::Relaxed);
+            soi_gate.store(0, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(victim_on_ms));
+
+            let d = deadline_ns.load(Ordering::Relaxed);
+            if d != 0 && now_ns() >= d { break; }
+
+            victim_gate.store(0, Ordering::Relaxed);
+            soi_gate.store(1, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(soi_on_ms));
+
+            let d = deadline_ns.load(Ordering::Relaxed);
+            if d != 0 && now_ns() >= d { break; }
+        }
+    })
+}
+
 /// Get per-worker atomic counters (cpu_ops, io_ops, sleep_ops, io_errors) from the shared region.
 /// Worker counters are laid out after the SharedRegion header: [AtomicU64 cpu, AtomicU64 io, AtomicU64 sleep, AtomicU64 errors] per worker.
 ///
@@ -602,6 +730,7 @@ pub fn run_worker_process(
     max_workers: usize,
     random_access: bool,
     direct_io: bool,
+    always_io: bool,
 ) {
     let region = open_shared_region(shm_name, max_workers);
     let region_ref = unsafe { &*region };
@@ -615,7 +744,7 @@ pub fn run_worker_process(
         Vec::leak(vec![0u8; io_buffer_size])
     };
 
-    let mut io_state = if io_perc > 0.0 {
+    let mut io_state = if io_perc > 0.0 || always_io {
         Some(IoState::new(&io_path, io_buffer_size, direct_io))
     } else {
         None
@@ -625,7 +754,8 @@ pub fn run_worker_process(
     region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
 
     work_loop(
-        &region_ref.deadline_ns, wk_cpu, wk_io, wk_sleep,
+        &region_ref.deadline_ns, &region_ref.victim_gate, &region_ref.victim_io_perc,
+        wk_cpu, wk_io, wk_sleep,
         &cpu_buffer, &mut io_state, io_buf,
         cpu_iterations, io_iterations,
         io_perc, intensity, sleep_us,

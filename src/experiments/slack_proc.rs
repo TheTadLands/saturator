@@ -36,7 +36,7 @@ pub fn run_slack_proc_experiment(
                            baseline_workers,
                            baseline_label.to_lowercase().replace("/", ""),
                            (extra_io_perc * 100.0) as u32);
-    let run_dir = format!("{}_{}", csv_base, timestamp());
+    let run_dir = params.run_dir(&format!("{}_{}", csv_base, timestamp()));
     std::fs::create_dir_all(&run_dir).unwrap();
 
     write_params_file(&run_dir, &format!("{} proc slack", baseline_label), params, &calibration, &[

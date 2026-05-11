@@ -65,6 +65,28 @@ pub struct ExtTimeSeriesSample {
     pub metrics: proc_metrics::SystemMetrics,
 }
 
+/// Run the external workload command in prefill-only mode (blocking).
+/// The wrapper creates the DB snapshot and exits. Subsequent per-sample
+/// invocations detect the snapshot and do a fast restore instead of re-filling.
+/// No-op if `params.ext_prefill` is None.
+pub fn run_prefill_blocking(ext_cmd: &str, throughput_file: &str, stats_file: &str, params: &TuningParams) {
+    let Some(ref prefill) = params.ext_prefill else { return };
+    println!("Running prefill (blocking)...");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(ext_cmd)
+        .env("SATURATOR_THROUGHPUT_FILE", throughput_file)
+        .env("SATURATOR_STATS_FILE", stats_file)
+        .env("SATURATOR_PREFILL", prefill)
+        .env("SATURATOR_PREFILL_ONLY", "1")
+        .status()
+        .expect("Failed to run prefill command");
+    if !status.success() {
+        eprintln!("Warning: prefill exited with {}", status);
+    }
+    println!("Prefill complete.");
+}
+
 /// Run a single measurement: external workload command + SoI workers.
 ///
 /// Lifecycle:
@@ -118,7 +140,7 @@ pub fn run_ext_measurement(
 
                 let mut children = Vec::with_capacity(soi_count);
                 for i in 0..soi_count {
-                    children.push(spawn_soi_worker(&shm_name, i, soi_count, soi_type, soi_buffer_size));
+                    children.push(spawn_soi_worker(&shm_name, i, soi_count, soi_type, soi_buffer_size, params.nice));
                 }
 
                 // Wait for all SoI workers to signal ready
@@ -143,11 +165,22 @@ pub fn run_ext_measurement(
                     .replace("{runtime}", &runtime.to_string())
                     .replace("{scratch_dir}", &scratch_dir);
 
-                let child = Command::new("sh")
-                    .arg("-c")
+                let mut fio_cmd = Command::new("sh");
+                fio_cmd.arg("-c")
                     .arg(&cmd)
-                    .process_group(0)
-                    .spawn()
+                    .process_group(0);
+                if let Some(n) = params.nice {
+                    unsafe {
+                        fio_cmd.pre_exec(move || {
+                            let ret = libc::nice(n);
+                            if ret == -1 && *libc::__errno_location() != 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                let child = fio_cmd.spawn()
                     .expect("Failed to spawn external SoI command (is fio installed?)");
 
                 SoiState::External { child, scratch_dir }

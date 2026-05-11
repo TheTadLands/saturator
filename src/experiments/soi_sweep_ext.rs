@@ -6,7 +6,7 @@ use crate::proc_metrics;
 use crate::measure::{
     timestamp, write_params_file,
 };
-use crate::measure::ext::{measure_ext_throughput, ExtAggregateResult, ExtTimeSeriesSample};
+use crate::measure::ext::{measure_ext_throughput, run_prefill_blocking, ExtAggregateResult, ExtTimeSeriesSample};
 
 /// Run a single SoI sweep with an external victim workload. The `baseline`
 /// argument provides a pre-computed soi_workers=0 measurement so the sweep
@@ -315,6 +315,8 @@ pub fn run_ext_saturation_and_sweep(
     cache_sizes: &CacheSizes,
     params: &TuningParams,
 ) {
+    run_prefill_blocking(&substitute_template(ext_cmd_template, 1), throughput_file, stats_file, params);
+
     let (saturation_n, best_result) = run_ext_saturation_experiment(ext_cmd_template, throughput_file, stats_file, params);
 
     if params.chain {
@@ -342,6 +344,8 @@ pub fn run_soi_ext_experiments(
     println!("Cache sizes: L1d={}KB, L2={}KB, L3={}KB",
              cache_sizes.l1d / 1024, cache_sizes.l2 / 1024, cache_sizes.l3 / 1024);
     println!("SoI types: {}\n", soi_types.iter().map(|s| s.name()).collect::<Vec<_>>().join(", "));
+
+    run_prefill_blocking(ext_cmd, throughput_file, stats_file, params);
 
     let baseline = baseline.unwrap_or_else(|| {
         println!("Measuring baseline (0 SoI workers)...");

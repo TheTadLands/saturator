@@ -52,6 +52,9 @@ if [ -n "${SATURATOR_PREFILL:-}" ] && [ -n "$DB_PATH" ]; then
         db_bench $SATURATOR_PREFILL > /dev/null 2>&1
         cp -r "$DB_PATH" "$PREFILL_SNAPSHOT"
     fi
+    if [ "${SATURATOR_PREFILL_ONLY:-}" = "1" ]; then
+        exit 0
+    fi
     rm -rf "$DB_PATH"
     cp -r "$PREFILL_SNAPSHOT" "$DB_PATH"
 elif [ -n "$DB_PATH" ]; then

@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -15,17 +16,28 @@ pub fn spawn_soi_worker(
     max_workers: usize,
     soi_type: SoiType,
     buffer_size: usize,
+    nice: Option<i32>,
 ) -> std::process::Child {
     let exe = std::env::current_exe().unwrap();
-    Command::new(&exe)
-        .arg("__soi_worker")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__soi_worker")
         .arg(shm_name)
         .arg(worker_id.to_string())
         .arg(max_workers.to_string())
         .arg(soi_type.name())
-        .arg(buffer_size.to_string())
-        .spawn()
-        .expect("Failed to spawn SoI worker process")
+        .arg(buffer_size.to_string());
+    if let Some(n) = nice {
+        unsafe {
+            cmd.pre_exec(move || {
+                let ret = libc::nice(n);
+                if ret == -1 && *libc::__errno_location() != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn().expect("Failed to spawn SoI worker process")
 }
 
 /// Per-worker configuration for a process-based measurement run.
@@ -274,7 +286,7 @@ fn run_mixed_proc_measurement(
                     .expect("Failed to spawn worker process")
             }
             WorkerKind::Soi { soi_type, buffer_size } => {
-                spawn_soi_worker(&shm_name, i, worker_count, *soi_type, *buffer_size)
+                spawn_soi_worker(&shm_name, i, worker_count, *soi_type, *buffer_size, params.nice)
             }
         };
         children.push(child);

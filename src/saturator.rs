@@ -34,6 +34,7 @@ pub struct TuningParams {
     pub ext_throughput_file: Option<String>, // throughput protocol file path (default: None)
     pub ext_stats_file: Option<String>,    // workload stats protocol file path (default: None)
     pub ext_prefill: Option<String>,       // prefill command for external workload (default: None)
+    pub nice: Option<i32>,                 // nice value for SoI workers (default: None = inherit)
 }
 
 impl Default for TuningParams {
@@ -58,6 +59,7 @@ impl Default for TuningParams {
             ext_throughput_file: None,
             ext_stats_file: None,
             ext_prefill: None,
+            nice: None,
         }
     }
 }

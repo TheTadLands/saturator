@@ -56,6 +56,7 @@ fn main() {
         println!("  --cmd <command>        External workload command (for find-soi-sweep-ext)");
         println!("  --throughput-file <path> Throughput protocol file path (default: /tmp/saturator_ext_throughput.txt)");
         println!("  --stats-file <path>  Workload stats protocol file path (default: /tmp/saturator_ext_stats.txt)");
+        println!("  --nice <N>           Nice value for SoI workers (-20 to 19, default: inherit)");
         println!("");
         println!("Examples:");
         println!("  find-slack 4 100     - 4 CPU baseline, add 100% I/O threads");
@@ -447,6 +448,12 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
                 i += 1;
                 if let Some(v) = args.get(i) {
                     params.ext_prefill = Some(v.clone());
+                }
+            }
+            "--nice" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse::<i32>().ok()) {
+                    params.nice = Some(v.clamp(-20, 19));
                 }
             }
             _ => {}

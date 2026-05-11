@@ -90,6 +90,12 @@ pub fn write_params_file(
     if let Some(interval) = params.sample_interval_ms {
         writeln!(f, "sample_interval_ms: {}", interval).unwrap();
     }
+    if let Some(nice) = params.nice {
+        writeln!(f, "nice: {}", nice).unwrap();
+    }
+    if let Some(ref prefill) = params.ext_prefill {
+        writeln!(f, "prefill: {}", prefill).unwrap();
+    }
     writeln!(f, "cpu_iterations: {}", calibration.cpu_iterations).unwrap();
     writeln!(f, "io_iterations: {}", calibration.io_iterations).unwrap();
     writeln!(f, "cpu_us: {}", calibration.cpu_us).unwrap();

@@ -1,6 +1,7 @@
 use std::fs::read_to_string;
 
 /// Snapshot of cgroup/proc metrics at a point in time, used to compute deltas.
+#[derive(Clone)]
 pub struct ProcSnapshot {
     // Cgroup CPU accounting (microseconds)
     usage_usec: u64,
@@ -19,10 +20,15 @@ pub struct ProcSnapshot {
     // IO operations limit from cgroup io.max (ops/sec, summed read+write across devices)
     // None if no limit is configured
     io_max_iops: Option<u64>,
+    // Memory usage from cgroup memory.current (bytes)
+    mem_current: u64,
+    // Memory limit from cgroup memory.max (bytes), None if unlimited
+    mem_max: Option<u64>,
     // PSI cumulative microseconds (cgroup-scoped)
     psi_cpu_some_us: u64,
     psi_io_some_us: u64,
     psi_io_full_us: u64,
+    psi_mem_some_us: u64,
 }
 
 /// Computed system metrics for a measurement window (delta between two snapshots).
@@ -32,10 +38,12 @@ pub struct SystemMetrics {
     pub system_pct: f64,
     pub io_util_pct: f64,
     pub io_iops_util_pct: f64,
+    pub mem_usage_pct: f64,
     pub io_psi_pct: f64,
     pub psi_cpu_some_us: u64,
     pub psi_io_some_us: u64,
     pub psi_io_full_us: u64,
+    pub psi_mem_some_us: u64,
 }
 
 /// Capture a snapshot of current cgroup CPU, IO, and PSI metrics.
@@ -48,6 +56,10 @@ pub fn take_snapshot() -> ProcSnapshot {
     let (io_rbytes, io_wbytes, io_rios, io_wios) = read_io_stat();
     let (io_max_bps, io_max_iops) = read_io_max();
 
+    // Memory: cgroup current usage and limit
+    let mem_current = read_cgroup_u64("/sys/fs/cgroup/memory.current").unwrap_or(0);
+    let mem_max = read_cgroup_u64("/sys/fs/cgroup/memory.max");
+
     // PSI: prefer cgroup-scoped, fall back to system-wide
     let psi_cpu_some_us = read_psi_total("/sys/fs/cgroup/cpu.pressure", "some")
         .or_else(|| read_psi_total("/proc/pressure/cpu", "some"))
@@ -58,12 +70,16 @@ pub fn take_snapshot() -> ProcSnapshot {
     let psi_io_full_us = read_psi_total("/sys/fs/cgroup/io.pressure", "full")
         .or_else(|| read_psi_total("/proc/pressure/io", "full"))
         .unwrap_or(0);
+    let psi_mem_some_us = read_psi_total("/sys/fs/cgroup/memory.pressure", "some")
+        .or_else(|| read_psi_total("/proc/pressure/memory", "some"))
+        .unwrap_or(0);
 
     ProcSnapshot {
         usage_usec, system_usec, num_cpus,
         io_rbytes, io_wbytes, io_rios, io_wios,
         io_max_bps, io_max_iops,
-        psi_cpu_some_us, psi_io_some_us, psi_io_full_us,
+        mem_current, mem_max,
+        psi_cpu_some_us, psi_io_some_us, psi_io_full_us, psi_mem_some_us,
     }
 }
 
@@ -197,6 +213,17 @@ fn read_io_max() -> (Option<u64>, Option<u64>) {
     (bps_limit, iops_limit)
 }
 
+/// Read a single u64 value from a cgroup file. Returns None if the file
+/// doesn't exist, is empty, or contains "max" (meaning unlimited).
+fn read_cgroup_u64(path: &str) -> Option<u64> {
+    let content = read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
 fn read_psi_total(path: &str, kind: &str) -> Option<u64> {
     let content = read_to_string(path).ok()?;
     for line in content.lines() {
@@ -261,7 +288,19 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
         0.0
     };
 
+    // Memory utilization: current / max (uses the "after" snapshot, since this is instantaneous)
+    let mem_usage_pct = if let Some(max) = after.mem_max {
+        if max > 0 {
+            after.mem_current as f64 / max as f64 * 100.0
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
     let d_psi_io_some = after.psi_io_some_us.saturating_sub(before.psi_io_some_us);
+    let d_psi_mem_some = after.psi_mem_some_us.saturating_sub(before.psi_mem_some_us);
     let wall_us = duration_secs * 1_000_000.0;
     let io_psi_pct = if wall_us > 0.0 {
         d_psi_io_some as f64 / wall_us * 100.0
@@ -274,23 +313,26 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
         system_pct,
         io_util_pct,
         io_iops_util_pct,
+        mem_usage_pct,
         io_psi_pct,
         psi_cpu_some_us: after.psi_cpu_some_us.saturating_sub(before.psi_cpu_some_us),
         psi_io_some_us: d_psi_io_some,
         psi_io_full_us: after.psi_io_full_us.saturating_sub(before.psi_io_full_us),
+        psi_mem_some_us: d_psi_mem_some,
     }
 }
 
 /// Return the CSV column header string for system metrics.
 pub fn csv_header() -> &'static str {
-    "cpu_pct,system_pct,io_util_pct,io_iops_util_pct,io_psi_pct,psi_cpu_some_us,psi_io_some_us,psi_io_full_us"
+    "cpu_pct,system_pct,io_util_pct,io_iops_util_pct,mem_usage_pct,io_psi_pct,psi_cpu_some_us,psi_io_some_us,psi_io_full_us,psi_mem_some_us"
 }
 
 impl SystemMetrics {
     pub fn to_csv_row(&self) -> String {
-        format!("{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{}",
-            self.cpu_pct, self.system_pct, self.io_util_pct, self.io_iops_util_pct, self.io_psi_pct,
-            self.psi_cpu_some_us, self.psi_io_some_us, self.psi_io_full_us)
+        format!("{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{}",
+            self.cpu_pct, self.system_pct, self.io_util_pct, self.io_iops_util_pct,
+            self.mem_usage_pct, self.io_psi_pct,
+            self.psi_cpu_some_us, self.psi_io_some_us, self.psi_io_full_us, self.psi_mem_some_us)
     }
 }
 
@@ -316,20 +358,24 @@ pub fn median_metrics(samples: &[SystemMetrics]) -> SystemMetrics {
     let mut system_pct: Vec<f64> = samples.iter().map(|s| s.system_pct).collect();
     let mut io_util_pct: Vec<f64> = samples.iter().map(|s| s.io_util_pct).collect();
     let mut io_iops_util_pct: Vec<f64> = samples.iter().map(|s| s.io_iops_util_pct).collect();
+    let mut mem_usage_pct: Vec<f64> = samples.iter().map(|s| s.mem_usage_pct).collect();
     let mut io_psi_pct: Vec<f64> = samples.iter().map(|s| s.io_psi_pct).collect();
     let mut psi_cpu_some_us: Vec<u64> = samples.iter().map(|s| s.psi_cpu_some_us).collect();
     let mut psi_io_some_us: Vec<u64> = samples.iter().map(|s| s.psi_io_some_us).collect();
     let mut psi_io_full_us: Vec<u64> = samples.iter().map(|s| s.psi_io_full_us).collect();
+    let mut psi_mem_some_us: Vec<u64> = samples.iter().map(|s| s.psi_mem_some_us).collect();
 
     SystemMetrics {
         cpu_pct: median_f64(&mut cpu_pct),
         system_pct: median_f64(&mut system_pct),
         io_util_pct: median_f64(&mut io_util_pct),
         io_iops_util_pct: median_f64(&mut io_iops_util_pct),
+        mem_usage_pct: median_f64(&mut mem_usage_pct),
         io_psi_pct: median_f64(&mut io_psi_pct),
         psi_cpu_some_us: median_u64(&mut psi_cpu_some_us),
         psi_io_some_us: median_u64(&mut psi_io_some_us),
         psi_io_full_us: median_u64(&mut psi_io_full_us),
+        psi_mem_some_us: median_u64(&mut psi_mem_some_us),
     }
 }
 
@@ -340,9 +386,11 @@ pub fn empty() -> SystemMetrics {
         system_pct: 0.0,
         io_util_pct: 0.0,
         io_iops_util_pct: 0.0,
+        mem_usage_pct: 0.0,
         io_psi_pct: 0.0,
         psi_cpu_some_us: 0,
         psi_io_some_us: 0,
         psi_io_full_us: 0,
+        psi_mem_some_us: 0,
     }
 }

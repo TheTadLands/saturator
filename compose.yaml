@@ -35,6 +35,7 @@ services:
     volumes:
       - ./output:/app/output
       - ./io_scratch:/tmp
+      - ./scripts:/app/scripts:ro
     working_dir: /app/output
 
   ibench:

@@ -33,9 +33,9 @@ pub fn run_intensity_sweep_experiment(
     writeln!(file, "probe_intensity,workers,cpu_ops_sec,io_ops_sec,total_ops_sec,cpu_ops_stddev,io_ops_stddev,io_errors,{}",
              proc_metrics::csv_header()).unwrap();
 
-    println!("  {:>9} | {:>12} {:>12} {:>12} | {:>6} {:>6} {:>6}",
-             "intensity", "cpu ops/s", "io ops/s", "total ops/s", "cpu%", "io%", "iops%");
-    println!("  {}", "-".repeat(79));
+    println!("  {:>9} | {:>12} {:>12} {:>12} | {:>6} {:>6} {:>6} {:>6}",
+             "intensity", "cpu ops/s", "io ops/s", "total ops/s", "cpu%", "io%", "iops%", "mem%");
+    println!("  {}", "-".repeat(86));
 
     let mut best_throughput = 0.0;
     let mut best_intensity = 0.0;
@@ -50,9 +50,9 @@ pub fn run_intensity_sweep_experiment(
         );
         let total_ops = cpu_ops + io_ops;
 
-        println!("  {:>9.2} | {:>12.0} {:>12.0} {:>12.0} | {:>5.1}% {:>5.1}% {:>5.1}%",
+        println!("  {:>9.2} | {:>12.0} {:>12.0} {:>12.0} | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
                  probe_intensity, cpu_ops, io_ops, total_ops,
-                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
+                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct, metrics.mem_usage_pct);
 
         let io_errors: u64 = per_worker.iter().map(|w| w.3).sum();
         writeln!(file, "{:.2},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{}",

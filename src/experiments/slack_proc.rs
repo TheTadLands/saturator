@@ -59,9 +59,9 @@ pub fn run_slack_proc_experiment(
              b0_cpu_std, b0_io_std,
              b0_metrics.to_csv_row()).unwrap();
 
-    println!("  {:>5} {:>7} | {:>12} {:>12} | {:>12} {:>12} | {:>8} | {:>6} {:>6} {:>6}",
-             "extra", "total", "base_cpu/s", "base_io/s", "extra_cpu/s", "extra_io/s", "vs base", "cpu%", "io%", "iops%");
-    println!("  {}", "-".repeat(112));
+    println!("  {:>5} {:>7} | {:>12} {:>12} | {:>12} {:>12} | {:>8} | {:>6} {:>6} {:>6} {:>6}",
+             "extra", "total", "base_cpu/s", "base_io/s", "extra_cpu/s", "extra_io/s", "vs base", "cpu%", "io%", "iops%", "mem%");
+    println!("  {}", "-".repeat(119));
 
     let mut per_worker_rows: Vec<(usize, Vec<(f64, f64, f64, u64)>)> = vec![(baseline_workers, b0_per_worker)];
 
@@ -75,9 +75,9 @@ pub fn run_slack_proc_experiment(
         let tracked = if track_io { b_io } else { b_cpu };
         let baseline_change = (tracked - baseline_throughput) / baseline_throughput * 100.0;
 
-        println!("  {:>5} {:>7} | {:>12.0} {:>12.0} | {:>12.0} {:>12.0} | {:>+7.1}% | {:>5.1}% {:>5.1}% {:>5.1}%",
+        println!("  {:>5} {:>7} | {:>12.0} {:>12.0} | {:>12.0} {:>12.0} | {:>+7.1}% | {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
                  extra, baseline_workers + extra, b_cpu, b_io, e_cpu, e_io, baseline_change,
-                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct);
+                 metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct, metrics.mem_usage_pct);
 
         writeln!(file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
                  extra, baseline_workers + extra, baseline_workers,

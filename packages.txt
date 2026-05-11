@@ -1,0 +1,14 @@
+# Runtime packages for the saturator container.
+# One package per line. Lines starting with # are ignored.
+# These are installed via apt-get in the final Docker stage.
+#
+# RocksDB db_bench runtime dependencies
+libgflags2.2
+libsnappy1v5
+zlib1g
+libbz2-1.0
+liblz4-1
+libzstd1
+
+# fio: backs the iobw SoI (libaio engine, direct=1, sustained QD=32 writes)
+fio

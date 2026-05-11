@@ -15,7 +15,7 @@ pub fn now_ns() -> u64 {
 }
 
 /// Tuning parameters that affect contention behavior
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TuningParams {
     pub buffer_kb: usize,     // CPU work buffer size in KB (default: 100)
     pub io_buffer_kb: usize,  // IO read/write buffer size in KB (default: 4)
@@ -26,8 +26,15 @@ pub struct TuningParams {
     pub intensity: f64,       // probability of working vs sleeping per iteration (default: 1.0)
     pub chain: bool,          // auto-chain saturation → intensity sweep (default: false)
     pub warmup_secs: u64,     // warmup duration before measurement in seconds (default: 10)
+    pub cooldown_secs: u64,   // idle gap between samples to let system state settle (default: 0)
     pub random_access: bool,  // use random buffer access pattern to defeat prefetcher (default: false)
     pub direct_io: bool,      // use O_DIRECT to bypass page cache for I/O ops (default: false)
+    pub sample_interval_ms: Option<u64>, // time-series sampling interval in ms (default: None = disabled)
+    pub ext_cmd: Option<String>,           // external workload command (default: None)
+    pub ext_throughput_file: Option<String>, // throughput protocol file path (default: None)
+    pub ext_stats_file: Option<String>,    // workload stats protocol file path (default: None)
+    pub ext_prefill: Option<String>,       // prefill command for external workload (default: None)
+    pub nice: Option<i32>,                 // nice value for SoI workers (default: None = inherit)
 }
 
 impl Default for TuningParams {
@@ -44,8 +51,15 @@ impl Default for TuningParams {
             intensity: 1.0,
             chain: false,
             warmup_secs: 10,
+            cooldown_secs: 0,
             random_access: false,
             direct_io: false,
+            sample_interval_ms: None,
+            ext_cmd: None,
+            ext_throughput_file: None,
+            ext_stats_file: None,
+            ext_prefill: None,
+            nice: None,
         }
     }
 }

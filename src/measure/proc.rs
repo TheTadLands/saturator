@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -6,7 +7,38 @@ use crate::constants::*;
 use crate::saturator::{CalibrationResult, TuningParams, create_shared_region, destroy_shared_region, worker_counters, now_ns};
 use crate::proc_metrics;
 use crate::soi::SoiType;
-use super::aggregate_samples;
+use super::{aggregate_samples, TimeSeriesSample};
+
+/// Spawn a single SoI worker process that uses the given shared memory region.
+pub fn spawn_soi_worker(
+    shm_name: &str,
+    worker_id: usize,
+    max_workers: usize,
+    soi_type: SoiType,
+    buffer_size: usize,
+    nice: Option<i32>,
+) -> std::process::Child {
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__soi_worker")
+        .arg(shm_name)
+        .arg(worker_id.to_string())
+        .arg(max_workers.to_string())
+        .arg(soi_type.name())
+        .arg(buffer_size.to_string());
+    if let Some(n) = nice {
+        unsafe {
+            cmd.pre_exec(move || {
+                let ret = libc::nice(n);
+                if ret == -1 && *libc::__errno_location() != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn().expect("Failed to spawn SoI worker process")
+}
 
 /// Per-worker configuration for a process-based measurement run.
 pub struct WorkerConfig {
@@ -214,13 +246,16 @@ pub enum WorkerKind {
 }
 
 /// Core lifecycle for mixed measurements: victims + SoI workers sharing the same shm region.
-/// Returns (SystemMetrics, per_worker_rates) where per_worker_rates is a Vec of
+/// Returns (SystemMetrics, per_worker_rates, optional time-series) where per_worker_rates is a Vec of
 /// (cpu_ops/s, io_ops/s, sleep_ops/s, errors) per worker in spawn order.
+///
+/// `victim_count` is the number of leading workers that are victims (used for time-series splitting).
 fn run_mixed_proc_measurement(
     workers: &[WorkerKind],
+    victim_count: usize,
     calibration: &CalibrationResult,
     params: &TuningParams,
-) -> (proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+) -> (proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Option<Vec<TimeSeriesSample>>) {
     let worker_count = workers.len();
     let shm_name = format!("/saturator_soi_{}_{}", std::process::id(), worker_count);
     let (region_ptr, shm_fd) = create_shared_region(&shm_name, worker_count);
@@ -251,15 +286,7 @@ fn run_mixed_proc_measurement(
                     .expect("Failed to spawn worker process")
             }
             WorkerKind::Soi { soi_type, buffer_size } => {
-                Command::new(&exe)
-                    .arg("__soi_worker")
-                    .arg(&shm_name)
-                    .arg(i.to_string())
-                    .arg(worker_count.to_string())
-                    .arg(soi_type.name())
-                    .arg(buffer_size.to_string())
-                    .spawn()
-                    .expect("Failed to spawn SoI worker process")
+                spawn_soi_worker(&shm_name, i, worker_count, *soi_type, *buffer_size, params.nice)
             }
         };
         children.push(child);
@@ -284,7 +311,56 @@ fn run_mixed_proc_measurement(
     let snap_before = proc_metrics::take_snapshot();
     let deadline = now_ns() + params.duration_secs * 1_000_000_000;
     region.deadline_ns.store(deadline, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_secs(params.duration_secs));
+
+    // Time-series sampling loop or single sleep
+    let timeseries = if let Some(interval_ms) = params.sample_interval_ms {
+        let interval_secs = interval_ms as f64 / 1000.0;
+        let duration_ms = params.duration_secs * 1000;
+        let mut samples = Vec::new();
+        let mut prev_counters = read_all_worker_counters(region_ptr, worker_count);
+        let mut prev_snap = snap_before.clone();
+        let mut elapsed_ms: u64 = 0;
+
+        loop {
+            std::thread::sleep(Duration::from_millis(interval_ms));
+            elapsed_ms += interval_ms;
+
+            let curr_counters = read_all_worker_counters(region_ptr, worker_count);
+            let curr_snap = proc_metrics::take_snapshot();
+            let delta_metrics = proc_metrics::compute_delta(&prev_snap, &curr_snap, interval_secs);
+
+            // Sum deltas split by victim vs SoI
+            let (mut v_cpu_delta, mut v_io_delta, mut soi_delta) = (0u64, 0u64, 0u64);
+            for i in 0..worker_count {
+                let cpu_d = curr_counters[i].0.saturating_sub(prev_counters[i].0);
+                let io_d = curr_counters[i].1.saturating_sub(prev_counters[i].1);
+                if i < victim_count {
+                    v_cpu_delta += cpu_d;
+                    v_io_delta += io_d;
+                } else {
+                    soi_delta += cpu_d + io_d;
+                }
+            }
+
+            samples.push(TimeSeriesSample {
+                elapsed_ms,
+                victim_cpu_ops_sec: v_cpu_delta as f64 / interval_secs,
+                victim_io_ops_sec: v_io_delta as f64 / interval_secs,
+                soi_ops_sec: soi_delta as f64 / interval_secs,
+                metrics: delta_metrics,
+            });
+
+            prev_counters = curr_counters;
+            prev_snap = curr_snap;
+
+            if elapsed_ms >= duration_ms { break; }
+        }
+        Some(samples)
+    } else {
+        std::thread::sleep(Duration::from_secs(params.duration_secs));
+        None
+    };
+
     let snap_after = proc_metrics::take_snapshot();
     let metrics = proc_metrics::compute_delta(&snap_before, &snap_after, params.duration_secs as f64);
 
@@ -305,11 +381,23 @@ fn run_mixed_proc_measurement(
 
     destroy_shared_region(&shm_name, region_ptr, shm_fd, worker_count);
 
-    (metrics, per_worker)
+    (metrics, per_worker, timeseries)
+}
+
+/// Read all per-worker (cpu_ops, io_ops) counters from shared memory.
+/// Safe to call while workers are running — values may be up to BATCH_FLUSH_THRESHOLD ops stale.
+fn read_all_worker_counters(
+    region_ptr: *mut crate::saturator::SharedRegion,
+    worker_count: usize,
+) -> Vec<(u64, u64)> {
+    (0..worker_count).map(|i| {
+        let (wk_cpu, wk_io, _, _) = unsafe { worker_counters(region_ptr, i) };
+        (wk_cpu.load(Ordering::Relaxed), wk_io.load(Ordering::Relaxed))
+    }).collect()
 }
 
 /// Run a single SoI measurement: `victim_count` victim workers + `soi_count` SoI workers.
-/// Returns (victim_cpu, victim_io, soi_ops, metrics, per_worker).
+/// Returns (victim_cpu, victim_io, soi_ops, metrics, per_worker, timeseries).
 pub fn measure_single_run_soi(
     victim_count: usize,
     victim_io_perc: f64,
@@ -318,7 +406,7 @@ pub fn measure_single_run_soi(
     soi_buffer_size: usize,
     calibration: &CalibrationResult,
     params: &TuningParams,
-) -> (f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+) -> (f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Option<Vec<TimeSeriesSample>>) {
     let mut workers: Vec<WorkerKind> = (0..victim_count)
         .map(|_| WorkerKind::Standard(WorkerConfig { io_perc: victim_io_perc, intensity: params.intensity }))
         .collect();
@@ -326,7 +414,7 @@ pub fn measure_single_run_soi(
         workers.push(WorkerKind::Soi { soi_type, buffer_size: soi_buffer_size });
     }
 
-    let (metrics, per_worker) = run_mixed_proc_measurement(&workers, calibration, params);
+    let (metrics, per_worker, timeseries) = run_mixed_proc_measurement(&workers, victim_count, calibration, params);
 
     // Split results: first victim_count are victims, rest are SoI
     let (mut victim_cpu, mut victim_io) = (0.0, 0.0);
@@ -340,11 +428,13 @@ pub fn measure_single_run_soi(
         }
     }
 
-    (victim_cpu, victim_io, soi_ops, metrics, per_worker)
+    (victim_cpu, victim_io, soi_ops, metrics, per_worker, timeseries)
 }
 
 /// Multi-sample SoI measurement. Returns:
-/// (victim_cpu, victim_io, victim_cpu_stddev, victim_io_stddev, soi_ops, metrics, per_worker)
+/// (victim_cpu, victim_io, victim_cpu_stddev, victim_io_stddev, soi_ops, metrics, per_worker, timeseries)
+///
+/// Time-series data is taken from the sample closest to the median (same as per_worker selection).
 pub fn measure_soi_throughput(
     victim_count: usize,
     victim_io_perc: f64,
@@ -353,7 +443,7 @@ pub fn measure_soi_throughput(
     soi_buffer_size: usize,
     calibration: &CalibrationResult,
     params: &TuningParams,
-) -> (f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>) {
+) -> (f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Option<Vec<TimeSeriesSample>>) {
     let samples: Vec<_> = (0..params.samples).map(|_| {
         measure_single_run_soi(
             victim_count, victim_io_perc, soi_count, soi_type, soi_buffer_size,
@@ -376,6 +466,7 @@ pub fn measure_soi_throughput(
         .map(|(i, _)| i)
         .unwrap_or(0);
     let per_worker = samples[median_idx].4.clone();
+    let timeseries = samples.into_iter().nth(median_idx).and_then(|s| s.5);
 
     (
         super::median(&cpu_vals),
@@ -385,6 +476,7 @@ pub fn measure_soi_throughput(
         super::median(&soi_vals),
         proc_metrics::median_metrics(&metrics_list),
         per_worker,
+        timeseries,
     )
 }
 

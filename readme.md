@@ -7,7 +7,7 @@ A tool for measuring CPU and I/O saturation points and finding slack capacity in
 Saturator helps answer:
 1. Where is the saturation point (number of processes) for a given workload?
 2. How many processes with a given workload can we add before performance degrades?
-3. Can we model our our system's slack with system tools?
+3. Can we model our system's slack with system tools?
 
 Workload parameters are tunable: CPU buffer size (`--buffer-kb`), I/O buffer size (`--io-buffer-kb`), worker intensity (`--intensity`), random access patterns (`--random-access`), direct I/O (`--direct-io`), and measurement duration/samples. This lets you control how much cache pressure, I/O bandwidth, and context switch overhead each worker generates.
 
@@ -252,6 +252,9 @@ All experiments accept optional flags to control workload parameters.
 | `--cmd <command>` | — | External workload command (for `find-soi-sweep-ext`). Launched via `sh -c`. |
 | `--throughput-file <path>` | `/tmp/saturator_ext_throughput.txt` | Path for external workload throughput protocol file. |
 | `--stats-file <path>` | `/tmp/saturator_ext_stats.txt` | Path for external workload stats protocol file. Wrapper-emitted rows are collected into `ext_stats_<soi_type>.csv`. |
+| `--nice <N>` | inherit | Nice value for SoI workers (-20 to 19). Lower values give SoI workers higher scheduling priority. |
+| `--cooldown <N>` | 0 | Idle gap in seconds between samples to let system state settle. |
+| `--prefill <args>` | — | Prefill command args for external workload (e.g. DB pre-population). Runs once before all samples via the wrapper's `SATURATOR_PREFILL` env var. |
 
 Examples:
 ```bash

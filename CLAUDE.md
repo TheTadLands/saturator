@@ -36,6 +36,9 @@ There are no tests or lints configured.
 - `find-mixed-saturation-proc <io_pct>` — incremental mixed CPU+IO processes at given IO% (0-100) until throughput degrades
 - `find-saturation-intensity-proc <N> <io_pct>` — N base processes at intensity=1.0 + 1 probe process, sweep probe intensity 0.0–1.0 to find saturation tipping point
 
+**SoI (Source of Interference)** sweep with synthetic victims:
+- `find-soi-sweep <soi|all> <victim_workers> [victim_io%]` — hold fixed victim workers running a synthetic workload, sweep SoI workers that stress a specific shared resource (l1d, l2, l3, membw, memcap, cpu, iobw, ioops, or all). Measures victim throughput degradation as interference increases.
+
 **External workload** (real application as victim, SoI workers apply interference):
 - `find-soi-sweep-ext <soi|all> --cmd '<command>' [OPTIONS]` — run an external workload (e.g. RocksDB's db_bench) as the victim, sweep SoI workers to measure interference. The external workload reports throughput via a cumulative file-based protocol (`<timestamp_ms> <cumulative_ops>\n`). Saturator computes rates from deltas between consecutive reports. Wrapper scripts adapt specific workloads to this protocol (see `scripts/run_db_bench.sh` for RocksDB).
 - `find-saturation-ext <soi|all> --cmd '<cmd {N}>' [OPTIONS]` — find the saturation point of an external workload by sweeping the `{N}` template parameter (e.g. thread count). Optionally chain into SoI sweep at the saturation point with `--chain`.
@@ -55,6 +58,10 @@ There are no tests or lints configured.
 - `--sample-interval <ms>` — enable time-series sampling during measurement windows (default: off, minimum: 100ms). When set, the parent process periodically reads per-worker atomic counters and cgroup metrics mid-flight, producing a `timeseries_soi_*.csv` alongside the aggregate CSV. Useful for observing phase-dependent interference effects in workloads with time-varying CPU/IO ratios.
 - `--cmd <command>` — external workload command to run as victim (for `find-soi-sweep-ext`). Launched via `sh -c`. The `SATURATOR_THROUGHPUT_FILE` env var is set automatically.
 - `--throughput-file <path>` — path for the external workload throughput protocol file (default: `/tmp/saturator_ext_throughput.txt`).
+- `--stats-file <path>` — path for external workload stats protocol file (default: `/tmp/saturator_ext_stats.txt`). Wrapper-emitted rows are collected into `ext_stats_<soi_type>.csv`.
+- `--nice <N>` — nice value for SoI workers (-20 to 19, default: inherit). Lower values give SoI workers higher scheduling priority.
+- `--cooldown <N>` — idle gap in seconds between samples to let system state settle (default: 0).
+- `--prefill <args>` — prefill command args for external workload (e.g. DB pre-population). Runs once before all samples via the wrapper's `SATURATOR_PREFILL` env var.
 
 ### Plotting
 
@@ -80,16 +87,20 @@ Source files in `src/`:
   - `slack.rs` — `run_slack_experiment()`: baseline threads + extra threads at different I/O ratios.
   - `intensity.rs` — `run_intensity_sweep_experiment()`: sweep probe worker intensity 0.0–1.0.
   - `slack_proc.rs` — `run_slack_proc_experiment()`: process-based slack with baseline + extra workers.
-  - `soi_sweep_ext.rs` — `run_soi_sweep_ext_experiment()`, `run_soi_ext_experiments()`: SoI sweep with an external workload as the victim instead of synthetic workers.
+  - `soi_sweep.rs` — `run_soi_sweep_experiment()`, `run_soi_experiments()`: SoI sweep with synthetic victim workers.
+  - `soi_sweep_ext.rs` — `run_soi_sweep_ext_experiment()`, `run_soi_ext_experiments()`, `run_ext_saturation_and_sweep()`: SoI sweep with an external workload as the victim instead of synthetic workers.
 
 - **`measure/`** — Measurement infrastructure:
   - `mod.rs` — Shared utilities: `median()`, `stddev()`, `timestamp()`, `write_params_file()`, `cleanup_scratch_files()`, `aggregate_samples()`, `TimeSeriesSample` struct.
   - `thread.rs` — Thread-based measurements: `measure_single_run()`, `measure_thread_throughput()`, `measure_baseline()`, `measure_total_throughput()`, `run_saturator_split()`.
   - `proc.rs` — Process-based measurements: `measure_single_run_proc()`, `measure_proc_throughput()`, `measure_single_run_proc_mixed_intensity()`, `measure_proc_slack()`, `spawn_soi_worker()`. When `sample_interval_ms` is set, `run_mixed_proc_measurement()` replaces its single sleep with a polling loop that reads per-worker atomics and cgroup snapshots at each interval.
-  - `ext.rs` — External workload measurements: `run_ext_measurement()`, `measure_ext_throughput()`. Launches an external command as the victim alongside SoI workers. SoI workers use shared memory; external workload reports throughput via file protocol.
+  - `ext.rs` — External workload measurements: `run_ext_measurement()`, `measure_ext_throughput()`, `run_prefill_blocking()`. Launches an external command as the victim alongside SoI workers. SoI workers use shared memory; external workload reports throughput via file protocol.
   - `ext_throughput.rs` — `ThroughputReader`: reads the external workload cumulative throughput protocol file and computes instantaneous rates from deltas. Tracks cumulative state across calls; `reset()` seeds state from the last warmup line. Designed to be swappable for different throughput reporting mechanisms.
+  - `ext_stats.rs` — `StatsRow` struct and helpers (`truncate()`, `read_all()`) for reading workload-specific stats emitted by external wrapper scripts via the stats protocol file.
 
 - **`visualize.rs`** — CSV writer for saturation result types. Saturation CSV includes `throughput_stddev` column; slack CSV includes `cpu_ops_stddev` and `io_ops_stddev` columns.
+
+- **`soi.rs`** — SoI (Source of Interference) worker types and infrastructure. Defines `SoiType` enum (L1d, L2, L3, MemBw, MemCap, Cpu, IoBw, IoOps), `SoiBackend` enum (Builtin/Fio), `CacheSizes` struct, `parse_soi_list()`, `detect_cache_sizes()`, `soi_buffer_size()`, and `run_soi_worker_process()` (child process entry point for SoI workers).
 
 - **`proc_metrics.rs`** — System metrics collector. Reads cgroup CPU/IO stats and PSI pressure to compute CPU utilization, IO bandwidth utilization, and pressure stall percentages during measurement windows. Provides `SystemMetrics` struct and CSV output helpers.
 
@@ -101,7 +112,7 @@ Source files in `src/`:
 
 - Thread-safe coordination via `Arc<AtomicU64>` counters and `Arc<AtomicBool>` shutdown signals (relaxed ordering).
 - Process-based experiments use named POSIX shared memory (`/dev/shm`) for the same atomic counter pattern across process boundaries. Per-worker slots are padded to 64 bytes (one cache line) to eliminate false sharing; workers never write to global counters during measurement.
-- Configurable warmup before each measurement (default 1s, tunable via `--warmup`); configurable measurement window (default 5s).
+- Configurable warmup before each measurement (default 10s, tunable via `--warmup`); configurable measurement window (default 30s, tunable via `--duration`).
 - Docker compose pins to CPU cores 4-7 (`cpuset` in `compose.yaml`), 8GB memory limit, no network, raised ulimits for high process counts. Adjust `cpuset` for your hardware.
 - I/O scratch files go to `/tmp` (mapped to `./io_scratch` in Docker).
 - Rust edition 2024; dependencies: `libc`.

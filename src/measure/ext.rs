@@ -3,7 +3,7 @@ use std::process::{Child, Command};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::saturator::{TuningParams, SharedRegion, create_shared_region, destroy_shared_region, worker_counters, now_ns, spawn_soi_gate_coordinator};
+use crate::saturator::{TuningParams, SharedRegion, create_shared_region, destroy_shared_region, worker_counters, now_ns, spawn_soi_gate_coordinator, bump_gate_epoch};
 use crate::proc_metrics;
 use crate::soi::{SoiBackend, SoiType};
 use super::ext_throughput::ThroughputReader;
@@ -50,6 +50,8 @@ pub struct ExtMeasurementResult {
     /// collapsing each run to its own percentile first.
     pub rate_samples: Vec<f64>,
     pub soi_ops: f64,
+    pub soi_cpu_ops: f64,
+    pub soi_io_ops: f64,
     pub metrics: proc_metrics::SystemMetrics,
     pub timeseries: Option<Vec<ExtTimeSeriesSample>>,
     /// Raw stats rows emitted by the workload (or its wrapper) during this run.
@@ -62,6 +64,8 @@ pub struct ExtTimeSeriesSample {
     pub elapsed_ms: u64,
     pub ext_ops_sec: f64,
     pub soi_ops_sec: f64,
+    pub soi_cpu_ops_sec: f64,
+    pub soi_io_ops_sec: f64,
     pub soi_gate_on: bool,
     pub victim_gate_on: bool,
     pub victim_io_phase: f64,
@@ -143,7 +147,7 @@ pub fn run_ext_measurement(
 
                 let mut children = Vec::with_capacity(soi_count);
                 for i in 0..soi_count {
-                    children.push(spawn_soi_worker(&shm_name, i, soi_count, soi_type, soi_buffer_size, params.nice));
+                    children.push(spawn_soi_worker(&shm_name, i, soi_count, soi_type, soi_buffer_size, params.nice, None));
                 }
 
                 // Wait for all SoI workers to signal ready
@@ -196,8 +200,9 @@ pub fn run_ext_measurement(
     let gate_handle = if let Some(period_ms) = params.soi_period_ms {
         if let Some(region_ptr) = soi_state.as_ref().and_then(SoiState::region_ptr) {
             let gate: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).soi_gate };
+            let epoch_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).gate_epoch };
             let deadline_ref: &'static std::sync::atomic::AtomicU64 = unsafe { &(*region_ptr).deadline_ns };
-            Some(spawn_soi_gate_coordinator(gate, deadline_ref, period_ms, params.soi_duty))
+            Some(spawn_soi_gate_coordinator(gate, epoch_ref, deadline_ref, period_ms, params.soi_duty))
         } else {
             None
         }
@@ -228,6 +233,7 @@ pub fn run_ext_measurement(
         let region = unsafe { &*region_ptr };
         let deadline = now_ns() + params.duration_secs * 1_000_000_000;
         region.deadline_ns.store(deadline, Ordering::Relaxed);
+        bump_gate_epoch(region);
     }
 
     // Sampling loop or single sleep
@@ -252,12 +258,12 @@ pub fn run_ext_measurement(
             }
             all_tp_samples.extend_from_slice(&new_tp);
 
-            // Read SoI counters (empty for External backends — soi_delta stays 0)
+            // Read SoI counters (empty for External backends — deltas stay 0)
             let curr_soi_counters = read_soi_counters(&soi_state, soi_count);
-            let mut soi_delta = 0u64;
+            let (mut soi_cpu_delta, mut soi_io_delta) = (0u64, 0u64);
             for (curr, prev) in curr_soi_counters.iter().zip(prev_soi_counters.iter()) {
-                soi_delta += curr.0.saturating_sub(prev.0);
-                soi_delta += curr.1.saturating_sub(prev.1);
+                soi_cpu_delta += curr.0.saturating_sub(prev.0);
+                soi_io_delta += curr.1.saturating_sub(prev.1);
             }
 
             let curr_snap = proc_metrics::take_snapshot();
@@ -270,7 +276,9 @@ pub fn run_ext_measurement(
             ts_samples.push(ExtTimeSeriesSample {
                 elapsed_ms,
                 ext_ops_sec: last_ext_ops,
-                soi_ops_sec: soi_delta as f64 / interval_secs,
+                soi_ops_sec: (soi_cpu_delta + soi_io_delta) as f64 / interval_secs,
+                soi_cpu_ops_sec: soi_cpu_delta as f64 / interval_secs,
+                soi_io_ops_sec: soi_io_delta as f64 / interval_secs,
                 soi_gate_on: soi_on,
                 victim_gate_on: true,
                 victim_io_phase: -1.0,
@@ -322,7 +330,7 @@ pub fn run_ext_measurement(
     // a total. External backends (fio etc.) leave soi_ops at 0 — there's no
     // reliable cross-backend ops counter, and cgroup metrics still reflect what
     // the SoI did. Per-worker breakdown is dropped in both cases.
-    let mut soi_ops_total = 0.0;
+    let (mut soi_cpu_total, mut soi_io_total) = (0.0, 0.0);
     match soi_state {
         Some(SoiState::Internal { shm_name, region_ptr, shm_fd, mut children }) => {
             for mut child in children.drain(..) {
@@ -332,7 +340,8 @@ pub fn run_ext_measurement(
                 let (wk_cpu, wk_io, _, _) = unsafe { worker_counters(region_ptr, i) };
                 let wc = wk_cpu.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
                 let wi = wk_io.load(Ordering::Relaxed) as f64 / params.duration_secs as f64;
-                soi_ops_total += wc + wi;
+                soi_cpu_total += wc;
+                soi_io_total += wi;
             }
             destroy_shared_region(&shm_name, region_ptr, shm_fd, soi_count);
         }
@@ -371,7 +380,9 @@ pub fn run_ext_measurement(
         total_ops,
         total_ops_secs,
         rate_samples,
-        soi_ops: soi_ops_total,
+        soi_ops: soi_cpu_total + soi_io_total,
+        soi_cpu_ops: soi_cpu_total,
+        soi_io_ops: soi_io_total,
         metrics,
         timeseries,
         stats,
@@ -392,10 +403,14 @@ pub struct ExtAggregateResult {
     pub p50_ops_sec: f64,
     pub p90_ops_sec: f64,
     pub median_soi_ops: f64,
+    pub median_soi_cpu_ops: f64,
+    pub median_soi_io_ops: f64,
     pub metrics: proc_metrics::SystemMetrics,
     pub timeseries: Option<Vec<ExtTimeSeriesSample>>,
     pub per_sample_ext_ops: Vec<f64>,
     pub per_sample_soi_ops: Vec<f64>,
+    pub per_sample_soi_cpu_ops: Vec<f64>,
+    pub per_sample_soi_io_ops: Vec<f64>,
     /// Stats rows keyed by sample index, in sample order. Outer Vec length
     /// equals `params.samples`; inner Vec is whatever the workload emitted for
     /// that sample (possibly empty).
@@ -425,11 +440,15 @@ pub fn measure_ext_throughput(
 
     let ext_vals: Vec<f64> = results.iter().map(|r| r.ext_ops_per_sec).collect();
     let soi_vals: Vec<f64> = results.iter().map(|r| r.soi_ops).collect();
+    let soi_cpu_vals: Vec<f64> = results.iter().map(|r| r.soi_cpu_ops).collect();
+    let soi_io_vals: Vec<f64> = results.iter().map(|r| r.soi_io_ops).collect();
     let metrics_list: Vec<_> = results.iter().map(|r| r.metrics.clone()).collect();
 
     let median_ext = super::median(&ext_vals);
     let ext_stddev = super::stddev(&ext_vals);
     let median_soi = super::median(&soi_vals);
+    let median_soi_cpu = super::median(&soi_cpu_vals);
+    let median_soi_io = super::median(&soi_io_vals);
 
     let total_ops: f64 = results.iter().map(|r| r.total_ops).sum();
     let total_ops_secs: f64 = results.iter().map(|r| r.total_ops_secs).sum();
@@ -469,10 +488,14 @@ pub fn measure_ext_throughput(
         p50_ops_sec: p50,
         p90_ops_sec: p90,
         median_soi_ops: median_soi,
+        median_soi_cpu_ops: median_soi_cpu,
+        median_soi_io_ops: median_soi_io,
         metrics: proc_metrics::median_metrics(&metrics_list),
         timeseries,
         per_sample_ext_ops: ext_vals,
         per_sample_soi_ops: soi_vals,
+        per_sample_soi_cpu_ops: soi_cpu_vals,
+        per_sample_soi_io_ops: soi_io_vals,
         per_sample_stats,
     }
 }

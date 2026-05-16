@@ -56,7 +56,7 @@ pub fn run_soi_sweep_ext_experiment(
 
     let csv_path = format!("{}/ext_soi_{}_throughput.csv", run_dir, soi_type.name());
     let mut csv_file = std::fs::File::create(&csv_path).unwrap();
-    writeln!(csv_file, "soi_workers,ext_ops_sec,ext_change_pct,soi_ops,ext_ops_stddev,total_ops,total_ops_secs,ops_sec_p10,ops_sec_p50,ops_sec_p90,{}",
+    writeln!(csv_file, "soi_workers,ext_ops_sec,ext_change_pct,soi_ops,soi_cpu_ops,soi_io_ops,ext_ops_stddev,total_ops,total_ops_secs,ops_sec_p10,ops_sec_p50,ops_sec_p90,{}",
              proc_metrics::csv_header()).unwrap();
 
     // Long-format per-sample CSV: one row per (soi_workers, sample_idx).
@@ -64,13 +64,13 @@ pub fn run_soi_sweep_ext_experiment(
     // rather than only median/stddev.
     let ps_csv_path = format!("{}/per_sample_ext_soi_{}.csv", run_dir, soi_type.name());
     let mut ps_file = std::fs::File::create(&ps_csv_path).unwrap();
-    writeln!(ps_file, "soi_workers,sample_idx,ext_ops_sec,soi_ops").unwrap();
+    writeln!(ps_file, "soi_workers,sample_idx,ext_ops_sec,soi_ops,soi_cpu_ops,soi_io_ops").unwrap();
 
     // Time-series CSV
     let mut ts_file = if params.sample_interval_ms.is_some() {
         let ts_path = format!("{}/timeseries_ext_soi_{}.csv", run_dir, soi_type.name());
         let mut f = std::fs::File::create(&ts_path).unwrap();
-        writeln!(f, "soi_workers,elapsed_ms,ext_ops_sec,soi_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
+        writeln!(f, "soi_workers,elapsed_ms,ext_ops_sec,soi_ops_sec,soi_cpu_ops_sec,soi_io_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
                  proc_metrics::csv_header()).unwrap();
         Some(f)
     } else {
@@ -101,14 +101,18 @@ pub fn run_soi_sweep_ext_experiment(
              0, base_ext, 0.0, "(cached)",
              baseline.metrics.cpu_pct, baseline.metrics.io_util_pct, baseline.metrics.io_iops_util_pct, baseline.metrics.mem_usage_pct);
 
-    writeln!(csv_file, "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
-             0, base_ext, 0.0, 0.0, baseline.ext_stddev,
+    writeln!(csv_file, "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+             0, base_ext, 0.0, 0.0, 0.0, 0.0, baseline.ext_stddev,
              baseline.total_ops, baseline.total_ops_secs,
              baseline.p10_ops_sec, baseline.p50_ops_sec, baseline.p90_ops_sec,
              baseline.metrics.to_csv_row()).unwrap();
 
-    for (i, (e, s)) in baseline.per_sample_ext_ops.iter().zip(baseline.per_sample_soi_ops.iter()).enumerate() {
-        writeln!(ps_file, "{},{},{:.2},{:.2}", 0, i, e, s).unwrap();
+    for (i, ((e, s), (sc, si))) in baseline.per_sample_ext_ops.iter()
+        .zip(baseline.per_sample_soi_ops.iter())
+        .zip(baseline.per_sample_soi_cpu_ops.iter().zip(baseline.per_sample_soi_io_ops.iter()))
+        .enumerate()
+    {
+        writeln!(ps_file, "{},{},{:.2},{:.2},{:.2},{:.2}", 0, i, e, s, sc, si).unwrap();
     }
 
     write_ext_timeseries(&mut ts_file, 0, &baseline.timeseries);
@@ -136,14 +140,18 @@ pub fn run_soi_sweep_ext_experiment(
                  soi_count, r_mean, change_pct, r.median_soi_ops,
                  r.metrics.cpu_pct, r.metrics.io_util_pct, r.metrics.io_iops_util_pct, r.metrics.mem_usage_pct);
 
-        writeln!(csv_file, "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
-                 soi_count, r_mean, change_pct, r.median_soi_ops, r.ext_stddev,
-                 r.total_ops, r.total_ops_secs,
+        writeln!(csv_file, "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+                 soi_count, r_mean, change_pct, r.median_soi_ops, r.median_soi_cpu_ops, r.median_soi_io_ops,
+                 r.ext_stddev, r.total_ops, r.total_ops_secs,
                  r.p10_ops_sec, r.p50_ops_sec, r.p90_ops_sec,
                  r.metrics.to_csv_row()).unwrap();
 
-        for (i, (e, s)) in r.per_sample_ext_ops.iter().zip(r.per_sample_soi_ops.iter()).enumerate() {
-            writeln!(ps_file, "{},{},{:.2},{:.2}", soi_count, i, e, s).unwrap();
+        for (i, ((e, s), (sc, si))) in r.per_sample_ext_ops.iter()
+            .zip(r.per_sample_soi_ops.iter())
+            .zip(r.per_sample_soi_cpu_ops.iter().zip(r.per_sample_soi_io_ops.iter()))
+            .enumerate()
+        {
+            writeln!(ps_file, "{},{},{:.2},{:.2},{:.2},{:.2}", soi_count, i, e, s, sc, si).unwrap();
         }
 
         write_ext_timeseries(&mut ts_file, soi_count, &r.timeseries);
@@ -166,9 +174,9 @@ fn write_saturation_timeseries(
 ) {
     if let (Some(f), Some(samples)) = (ts_file.as_mut(), ts_data.as_ref()) {
         for s in samples {
-            writeln!(f, "{},{},{:.2},{:.2},{},{},{:.3},{}",
+            writeln!(f, "{},{},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{}",
                      concurrency, s.elapsed_ms,
-                     s.ext_ops_sec, s.soi_ops_sec,
+                     s.ext_ops_sec, s.soi_ops_sec, s.soi_cpu_ops_sec, s.soi_io_ops_sec,
                      if s.soi_gate_on { 1 } else { 0 },
                      if s.victim_gate_on { 1 } else { 0 },
                      s.victim_io_phase,
@@ -185,9 +193,9 @@ fn write_ext_timeseries(
 ) {
     if let (Some(f), Some(samples)) = (ts_file.as_mut(), ts_data.as_ref()) {
         for s in samples {
-            writeln!(f, "{},{},{:.2},{:.2},{},{},{:.3},{}",
+            writeln!(f, "{},{},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{}",
                      soi_workers, s.elapsed_ms,
-                     s.ext_ops_sec, s.soi_ops_sec,
+                     s.ext_ops_sec, s.soi_ops_sec, s.soi_cpu_ops_sec, s.soi_io_ops_sec,
                      if s.soi_gate_on { 1 } else { 0 },
                      if s.victim_gate_on { 1 } else { 0 },
                      s.victim_io_phase,
@@ -254,7 +262,7 @@ pub fn run_ext_saturation_experiment(
     let mut ts_file = if params.sample_interval_ms.is_some() {
         let ts_path = format!("{}/timeseries_ext_saturation.csv", run_dir);
         let mut f = std::fs::File::create(&ts_path).unwrap();
-        writeln!(f, "concurrency,elapsed_ms,ext_ops_sec,soi_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
+        writeln!(f, "concurrency,elapsed_ms,ext_ops_sec,soi_ops_sec,soi_cpu_ops_sec,soi_io_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
                  proc_metrics::csv_header()).unwrap();
         Some(f)
     } else {

@@ -4,6 +4,45 @@ use std::ffi::CString;
 
 use crate::constants::*;
 
+/// Futex wait: block until the u32 at `addr` is no longer `expected`, or `timeout` elapses.
+/// Uses the low 32 bits of an AtomicU64 (little-endian).
+pub fn futex_wait(atom: &AtomicU64, expected: u32, timeout: std::time::Duration) {
+    let ptr = atom as *const AtomicU64 as *const u32;
+    let ts = libc::timespec {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_nsec: timeout.subsec_nanos() as libc::c_long,
+    };
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            ptr,
+            libc::FUTEX_WAIT,
+            expected,
+            &ts as *const libc::timespec,
+        );
+    }
+}
+
+/// Futex wake: wake all threads/processes blocked on this address.
+pub fn futex_wake_all(atom: &AtomicU64) {
+    let ptr = atom as *const AtomicU64 as *const u32;
+    unsafe {
+        libc::syscall(libc::SYS_futex, ptr, libc::FUTEX_WAKE, i32::MAX);
+    }
+}
+
+/// Bump `gate_epoch` and wake all waiters. Call after any gate or phase change.
+pub fn bump_gate_epoch(region: &SharedRegion) {
+    region.gate_epoch.fetch_add(1, Ordering::Relaxed);
+    futex_wake_all(&region.gate_epoch);
+}
+
+/// Block until `gate_epoch` changes (or 100ms timeout). Zero scheduling overhead when gated off.
+pub fn gate_wait(epoch: &AtomicU64) {
+    let current = epoch.load(Ordering::Relaxed) as u32;
+    futex_wait(epoch, current, std::time::Duration::from_millis(100));
+}
+
 /// Read CLOCK_MONOTONIC and return nanoseconds. This is a vDSO call on Linux (~20ns).
 pub fn now_ns() -> u64 {
     unsafe {
@@ -46,7 +85,7 @@ pub struct TuningParams {
 impl TuningParams {
     pub fn run_dir(&self, base: &str) -> String {
         match &self.output_dir {
-            Some(dir) => format!("output/{}/{}", dir, base),
+            Some(dir) => format!("{}/{}", dir, base),
             None => base.to_string(),
         }
     }
@@ -253,6 +292,7 @@ fn calibrate_single_pass(buffer_size: usize, io_buffer_size: usize, random_acces
 fn work_loop(
     deadline_ns: &AtomicU64,
     gate: &AtomicU64,
+    gate_epoch: &AtomicU64,
     dynamic_io_perc: &AtomicU64,
     cpu_counter: &AtomicU64,
     io_counter: &AtomicU64,
@@ -280,7 +320,7 @@ fn work_loop(
         }
 
         if gate.load(Ordering::Relaxed) == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            gate_wait(gate_epoch);
             continue;
         }
 
@@ -337,6 +377,7 @@ fn work_loop(
 }
 
 static GATE_ALWAYS_ON: AtomicU64 = AtomicU64::new(1);
+static GATE_EPOCH_UNUSED: AtomicU64 = AtomicU64::new(0);
 static IO_PERC_DISABLED: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Thread work loop: sets up buffers and IO state, runs the shared work loop,
@@ -368,7 +409,7 @@ pub fn run_saturator(
     };
 
     work_loop(
-        &deadline_ns, &GATE_ALWAYS_ON, &IO_PERC_DISABLED,
+        &deadline_ns, &GATE_ALWAYS_ON, &GATE_EPOCH_UNUSED, &IO_PERC_DISABLED,
         &pt_cpu, &pt_io, &pt_sleep,
         &cpu_buffer, &mut io_state, io_buf,
         calibration.cpu_iterations, calibration.io_iterations,
@@ -526,6 +567,7 @@ pub struct SharedRegion {
     pub soi_gate: AtomicU64,     // 1 = SoI workers work, 0 = SoI workers sleep (square-wave gating)
     pub victim_gate: AtomicU64,  // 1 = victim workers work, 0 = victim workers sleep (square-wave gating)
     pub victim_io_perc: AtomicU64, // dynamic IO%, encoded as (io_perc * 1000) as u64; u64::MAX = use local
+    pub gate_epoch: AtomicU64,   // bumped on any gate/phase change; workers futex-wait on this
 }
 
 /// Compute shared memory size: header + per-worker counters, rounded up to page size.
@@ -570,6 +612,7 @@ pub fn create_shared_region(name: &str, max_workers: usize) -> (*mut SharedRegio
         std::ptr::write(&mut (*region).soi_gate, AtomicU64::new(1));
         std::ptr::write(&mut (*region).victim_gate, AtomicU64::new(1));
         std::ptr::write(&mut (*region).victim_io_perc, AtomicU64::new(u64::MAX));
+        std::ptr::write(&mut (*region).gate_epoch, AtomicU64::new(0));
 
         // Zero-init per-worker area
         let worker_area = (ptr as *mut u8).add(std::mem::size_of::<SharedRegion>());
@@ -618,6 +661,7 @@ pub fn destroy_shared_region(name: &str, ptr: *mut SharedRegion, fd: i32, max_wo
 /// Exits when `deadline_ns` is reached.
 pub fn spawn_soi_gate_coordinator(
     gate: &'static AtomicU64,
+    gate_epoch: &'static AtomicU64,
     deadline_ns: &'static AtomicU64,
     period_ms: u64,
     duty: f64,
@@ -628,12 +672,16 @@ pub fn spawn_soi_gate_coordinator(
     std::thread::spawn(move || {
         loop {
             gate.store(1, Ordering::Relaxed);
+            gate_epoch.fetch_add(1, Ordering::Relaxed);
+            futex_wake_all(gate_epoch);
             std::thread::sleep(std::time::Duration::from_millis(on_ms));
 
             let d = deadline_ns.load(Ordering::Relaxed);
             if d != 0 && now_ns() >= d { break; }
 
             gate.store(0, Ordering::Relaxed);
+            gate_epoch.fetch_add(1, Ordering::Relaxed);
+            futex_wake_all(gate_epoch);
             std::thread::sleep(std::time::Duration::from_millis(off_ms));
 
             let d = deadline_ns.load(Ordering::Relaxed);
@@ -646,6 +694,7 @@ pub fn spawn_soi_gate_coordinator(
 /// Each phase gets `period_ms / phases.len()` time. Exits when `deadline_ns` is reached.
 pub fn spawn_victim_phase_coordinator(
     io_perc_field: &'static AtomicU64,
+    gate_epoch: &'static AtomicU64,
     deadline_ns: &'static AtomicU64,
     period_ms: u64,
     phases: Vec<f64>,
@@ -657,6 +706,8 @@ pub fn spawn_victim_phase_coordinator(
         loop {
             for &enc in &encoded {
                 io_perc_field.store(enc, Ordering::Relaxed);
+                gate_epoch.fetch_add(1, Ordering::Relaxed);
+                futex_wake_all(gate_epoch);
                 std::thread::sleep(std::time::Duration::from_millis(phase_ms));
 
                 let d = deadline_ns.load(Ordering::Relaxed);
@@ -672,6 +723,7 @@ pub fn spawn_victim_phase_coordinator(
 pub fn spawn_antiphase_gate_coordinator(
     victim_gate: &'static AtomicU64,
     soi_gate: &'static AtomicU64,
+    gate_epoch: &'static AtomicU64,
     deadline_ns: &'static AtomicU64,
     period_ms: u64,
     duty: f64,
@@ -683,6 +735,8 @@ pub fn spawn_antiphase_gate_coordinator(
         loop {
             victim_gate.store(1, Ordering::Relaxed);
             soi_gate.store(0, Ordering::Relaxed);
+            gate_epoch.fetch_add(1, Ordering::Relaxed);
+            futex_wake_all(gate_epoch);
             std::thread::sleep(std::time::Duration::from_millis(victim_on_ms));
 
             let d = deadline_ns.load(Ordering::Relaxed);
@@ -690,6 +744,8 @@ pub fn spawn_antiphase_gate_coordinator(
 
             victim_gate.store(0, Ordering::Relaxed);
             soi_gate.store(1, Ordering::Relaxed);
+            gate_epoch.fetch_add(1, Ordering::Relaxed);
+            futex_wake_all(gate_epoch);
             std::thread::sleep(std::time::Duration::from_millis(soi_on_ms));
 
             let d = deadline_ns.load(Ordering::Relaxed);
@@ -754,7 +810,7 @@ pub fn run_worker_process(
     region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
 
     work_loop(
-        &region_ref.deadline_ns, &region_ref.victim_gate, &region_ref.victim_io_perc,
+        &region_ref.deadline_ns, &region_ref.victim_gate, &region_ref.gate_epoch, &region_ref.victim_io_perc,
         wk_cpu, wk_io, wk_sleep,
         &cpu_buffer, &mut io_state, io_buf,
         cpu_iterations, io_iterations,

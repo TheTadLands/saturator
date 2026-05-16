@@ -10,7 +10,7 @@ from matplotlib.ticker import MaxNLocator
 
 from .common import (
     C_BLUE, C_CYAN, C_GREEN, C_ORANGE, C_PURPLE, C_RED,
-    ext_subdir, format_number, save_fig,
+    ext_subdir, format_number, plot_perf_metrics, save_fig,
 )
 
 
@@ -203,24 +203,52 @@ def plot_ext_timeseries(csv_path: str):
         out_template='timeseries_per_soi_{:02d}.png',
     )
 
+    has_soi_cpu_ts = 'soi_cpu_ops_sec' in df.columns and df['soi_cpu_ops_sec'].max() > 0
+    has_soi_io_ts = 'soi_io_ops_sec' in df.columns and df['soi_io_ops_sec'].max() > 0
+    has_soi_both_ts = has_soi_cpu_ts and has_soi_io_ts
     if 'soi_ops_sec' in df.columns:
         soi_df = df[df['soi_workers'] > 0]
         if soi_df['soi_ops_sec'].max() > 0:
             soi_nonzero = sorted(soi_df['soi_workers'].unique())
-            fig, ax = plt.subplots(figsize=(10, 6))
-            cmap = plt.cm.plasma
-            for i, s in enumerate(soi_nonzero):
-                sub = soi_df[soi_df['soi_workers'] == s]
-                color = cmap(i / max(len(soi_nonzero) - 1, 1))
-                ax.plot(sub['elapsed_ms'] / 1000, sub['soi_ops_sec'], '-', color=color,
-                        linewidth=1.2, alpha=0.8, label=f'{int(s)} SoI')
-            ax.set_xlabel('Elapsed (seconds)')
-            ax.set_ylabel('SoI Throughput (ops/sec)')
-            ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput Time Series')
-            ax.set_ylim(bottom=0)
-            ax.legend(loc='best', fontsize=8, ncol=2)
-            ax.grid(True, alpha=0.3)
-            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+
+            if has_soi_both_ts:
+                fig, (ax_cpu, ax_io) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
+                                                     layout='constrained')
+                cmap = plt.cm.plasma
+                for i, s in enumerate(soi_nonzero):
+                    sub = soi_df[soi_df['soi_workers'] == s]
+                    color = cmap(i / max(len(soi_nonzero) - 1, 1))
+                    ax_cpu.plot(sub['elapsed_ms'] / 1000, sub['soi_cpu_ops_sec'], '-', color=color,
+                                linewidth=1.2, alpha=0.8, label=f'{int(s)} SoI')
+                    ax_io.plot(sub['elapsed_ms'] / 1000, sub['soi_io_ops_sec'], '-', color=color,
+                               linewidth=1.2, alpha=0.8, label=f'{int(s)} SoI')
+                ax_cpu.set_ylabel('SoI CPU ops/sec')
+                ax_cpu.set_ylim(bottom=0)
+                ax_cpu.legend(loc='best', fontsize=8, ncol=2)
+                ax_cpu.grid(True, alpha=0.3)
+                ax_cpu.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+                ax_io.set_xlabel('Elapsed (seconds)')
+                ax_io.set_ylabel('SoI IO ops/sec')
+                ax_io.set_ylim(bottom=0)
+                ax_io.legend(loc='best', fontsize=8, ncol=2)
+                ax_io.grid(True, alpha=0.3)
+                ax_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+                fig.suptitle(f'SoI Sweep ({soi_type}) — SoI Throughput Time Series')
+            else:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                cmap = plt.cm.plasma
+                for i, s in enumerate(soi_nonzero):
+                    sub = soi_df[soi_df['soi_workers'] == s]
+                    color = cmap(i / max(len(soi_nonzero) - 1, 1))
+                    ax.plot(sub['elapsed_ms'] / 1000, sub['soi_ops_sec'], '-', color=color,
+                            linewidth=1.2, alpha=0.8, label=f'{int(s)} SoI')
+                ax.set_xlabel('Elapsed (seconds)')
+                ax.set_ylabel('SoI Throughput (ops/sec)')
+                ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput Time Series')
+                ax.set_ylim(bottom=0)
+                ax.legend(loc='best', fontsize=8, ncol=2)
+                ax.grid(True, alpha=0.3)
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
             save_fig(fig, os.path.join(ext_subdir(folder, 'timeseries'), 'soi_throughput.png'))
 
             if len(soi_nonzero) > 1:
@@ -428,6 +456,11 @@ def plot_ext_saturation(csv_path: str):
         ax.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(ext_subdir(folder, 'utilization'), 'utilization.png'))
 
+    # Hardware perf counters (cache misses, IPC)
+    plot_perf_metrics(df, 'concurrency', 'Concurrency (N)',
+                      'External Saturation', folder,
+                      throughput_col='ext_ops_sec')
+
 
 def plot_ext_soi(csv_path: str):
     """Generate graphs for external workload SoI sweep CSV."""
@@ -479,19 +512,51 @@ def plot_ext_soi(csv_path: str):
     ax.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(folder, 'victim_degradation.png'))
 
+    has_soi_cpu_agg = 'soi_cpu_ops' in df.columns and df['soi_cpu_ops'].max() > 0
+    has_soi_io_agg = 'soi_io_ops' in df.columns and df['soi_io_ops'].max() > 0
     if df['soi_ops'].max() > 0:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(x[x > 0], df.loc[x > 0, 'soi_ops'], '-^', color=C_ORANGE,
-                linewidth=2, markersize=6, label='SoI ops/s')
-        ax.set_xlabel('SoI Workers')
-        ax.set_ylabel('SoI Throughput (ops/sec)')
-        ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput')
-        ax.set_ylim(bottom=0)
-        ax.set_xlim(left=0)
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-        ax.legend(loc='best', fontsize=9)
-        ax.grid(True, alpha=0.3)
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        mask = x > 0
+        if has_soi_cpu_agg and has_soi_io_agg:
+            fig, (ax_cpu, ax_io) = plt.subplots(2, 1, figsize=(8, 7), sharex=True,
+                                                 layout='constrained')
+            ax_cpu.plot(x[mask], df.loc[mask, 'soi_cpu_ops'], '-^', color=C_BLUE,
+                        linewidth=2, markersize=6, label='SoI CPU ops/s')
+            ax_cpu.set_ylabel('SoI CPU ops/sec')
+            ax_cpu.set_ylim(bottom=0)
+            ax_cpu.legend(loc='best', fontsize=9)
+            ax_cpu.grid(True, alpha=0.3)
+            ax_cpu.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            ax_cpu.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput')
+
+            ax_io.plot(x[mask], df.loc[mask, 'soi_io_ops'], '-s', color=C_GREEN,
+                       linewidth=2, markersize=6, label='SoI IO ops/s')
+            ax_io.set_xlabel('SoI Workers')
+            ax_io.set_ylabel('SoI IO ops/sec')
+            ax_io.set_ylim(bottom=0)
+            ax_io.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax_io.legend(loc='best', fontsize=9)
+            ax_io.grid(True, alpha=0.3)
+            ax_io.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        else:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            if has_soi_cpu_agg:
+                ax.plot(x[mask], df.loc[mask, 'soi_cpu_ops'], '-^', color=C_BLUE,
+                        linewidth=2, markersize=6, label='SoI CPU ops/s')
+            elif has_soi_io_agg:
+                ax.plot(x[mask], df.loc[mask, 'soi_io_ops'], '-s', color=C_GREEN,
+                        linewidth=2, markersize=6, label='SoI IO ops/s')
+            else:
+                ax.plot(x[mask], df.loc[mask, 'soi_ops'], '-^', color=C_ORANGE,
+                        linewidth=2, markersize=6, label='SoI ops/s')
+            ax.set_xlabel('SoI Workers')
+            ax.set_ylabel('SoI Throughput (ops/sec)')
+            ax.set_title(f'SoI Sweep ({soi_type}) — SoI Throughput')
+            ax.set_ylim(bottom=0)
+            ax.set_xlim(left=0)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.legend(loc='best', fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
         save_fig(fig, os.path.join(folder, 'soi_throughput.png'))
 
     fig, ax1 = plt.subplots(figsize=(8, 5))
@@ -535,6 +600,11 @@ def plot_ext_soi(csv_path: str):
         ax.legend()
         ax.grid(True, alpha=0.3)
         save_fig(fig, os.path.join(ext_subdir(folder, 'utilization'), 'utilization.png'))
+
+    # Hardware perf counters (cache misses, IPC)
+    plot_perf_metrics(df, 'soi_workers', 'SoI Workers',
+                      f'SoI Sweep ({soi_type})', folder,
+                      throughput_col='ext_ops_sec')
 
 
 SOI_COLORS = {

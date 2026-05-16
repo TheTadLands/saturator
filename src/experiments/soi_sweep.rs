@@ -67,7 +67,7 @@ pub fn run_soi_sweep_experiment(
 
     let csv_path = format!("{}/soi_{}_throughput.csv", run_dir, soi_type.name());
     let mut csv_file = std::fs::File::create(&csv_path).unwrap();
-    writeln!(csv_file, "soi_workers,total_workers,victim_workers,soi_type,victim_cpu_ops,victim_io_ops,victim_total_ops,victim_cpu_change_pct,victim_io_change_pct,victim_change_pct,soi_ops,victim_cpu_stddev,victim_io_stddev,{}",
+    writeln!(csv_file, "soi_workers,total_workers,victim_workers,soi_type,victim_cpu_ops,victim_io_ops,victim_total_ops,victim_cpu_change_pct,victim_io_change_pct,victim_change_pct,soi_ops,soi_cpu_ops,soi_io_ops,victim_cpu_stddev,victim_io_stddev,{}",
              proc_metrics::csv_header()).unwrap();
 
     let pw_csv_path = format!("{}/per_worker_soi_{}.csv", run_dir, soi_type.name());
@@ -82,7 +82,7 @@ pub fn run_soi_sweep_experiment(
     let mut ts_file = if params.sample_interval_ms.is_some() {
         let ts_path = format!("{}/timeseries_soi_{}.csv", run_dir, soi_type.name());
         let mut f = std::fs::File::create(&ts_path).unwrap();
-        writeln!(f, "soi_workers,sample_idx,elapsed_ms,victim_cpu_ops_sec,victim_io_ops_sec,soi_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
+        writeln!(f, "soi_workers,sample_idx,elapsed_ms,victim_cpu_ops_sec,victim_io_ops_sec,soi_ops_sec,soi_cpu_ops_sec,soi_io_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
                  proc_metrics::csv_header()).unwrap();
         Some(f)
     } else {
@@ -90,7 +90,7 @@ pub fn run_soi_sweep_experiment(
     };
 
     // Measure baseline (0 SoI workers)
-    let (base_cpu, base_io, base_cpu_sd, base_io_sd, _soi_ops, base_metrics, base_pw, base_ts) =
+    let (base_cpu, base_io, base_cpu_sd, base_io_sd, _soi_ops, _soi_cpu, _soi_io, base_metrics, base_pw, base_ts) =
         measure_soi_throughput(
             victim_workers, victim_io_perc, 0, soi_type, 0,
             &calibration, params,
@@ -103,9 +103,9 @@ pub fn run_soi_sweep_experiment(
              0, victim_workers, base_cpu, base_io, baseline_total, 0.0, "-",
              base_metrics.cpu_pct, base_metrics.io_util_pct, base_metrics.io_iops_util_pct, base_metrics.mem_usage_pct);
 
-    writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+    writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
              0, victim_workers, victim_workers, soi_type.name(),
-             base_cpu, base_io, baseline_total, 0.0, 0.0, 0.0, 0.0,
+             base_cpu, base_io, baseline_total, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
              base_cpu_sd, base_io_sd, base_metrics.to_csv_row()).unwrap();
 
     for (wid, &(wc, wi, ws, we)) in base_pw.iter().enumerate() {
@@ -120,7 +120,7 @@ pub fn run_soi_sweep_experiment(
         let buf_size = soi_buffer_size(soi_type, cache_sizes, soi_count);
         let total_workers = victim_workers + soi_count;
 
-        let (v_cpu, v_io, v_cpu_sd, v_io_sd, soi_ops, metrics, per_worker, ts_data) =
+        let (v_cpu, v_io, v_cpu_sd, v_io_sd, soi_ops, soi_cpu_ops, soi_io_ops, metrics, per_worker, ts_data) =
             measure_soi_throughput(
                 victim_workers, victim_io_perc, soi_count, soi_type, buf_size,
                 &calibration, params,
@@ -146,9 +146,9 @@ pub fn run_soi_sweep_experiment(
                  soi_count, total_workers, v_cpu, v_io, victim_total, change_pct, soi_ops,
                  metrics.cpu_pct, metrics.io_util_pct, metrics.io_iops_util_pct, metrics.mem_usage_pct);
 
-        writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+        writeln!(csv_file, "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
                  soi_count, total_workers, victim_workers, soi_type.name(),
-                 v_cpu, v_io, victim_total, cpu_change_pct, io_change_pct, change_pct, soi_ops,
+                 v_cpu, v_io, victim_total, cpu_change_pct, io_change_pct, change_pct, soi_ops, soi_cpu_ops, soi_io_ops,
                  v_cpu_sd, v_io_sd, metrics.to_csv_row()).unwrap();
 
         for (wid, &(wc, wi, ws, we)) in per_worker.iter().enumerate() {
@@ -178,9 +178,10 @@ fn write_timeseries(
         for (sample_idx, ts_data) in all_ts.iter().enumerate() {
             if let Some(samples) = ts_data {
                 for s in samples {
-                    writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{},{},{:.3},{}",
+                    writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{}",
                              soi_workers, sample_idx, s.elapsed_ms,
                              s.victim_cpu_ops_sec, s.victim_io_ops_sec, s.soi_ops_sec,
+                             s.soi_cpu_ops_sec, s.soi_io_ops_sec,
                              if s.soi_gate_on { 1 } else { 0 },
                              if s.victim_gate_on { 1 } else { 0 },
                              s.victim_io_phase,

@@ -8,11 +8,14 @@ pub use thread::*;
 pub use self::proc::*;
 
 /// A single time-series sample collected during a measurement window.
+#[derive(Clone)]
 pub struct TimeSeriesSample {
     pub elapsed_ms: u64,
     pub victim_cpu_ops_sec: f64,
     pub victim_io_ops_sec: f64,
     pub soi_ops_sec: f64,
+    pub soi_cpu_ops_sec: f64,
+    pub soi_io_ops_sec: f64,
     pub soi_gate_on: bool,
     pub victim_gate_on: bool,
     pub victim_io_phase: f64,

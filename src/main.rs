@@ -2,6 +2,7 @@ mod constants;
 mod saturator;
 mod visualize;
 mod proc_metrics;
+mod perf_counters;
 mod experiments;
 mod measure;
 mod soi;
@@ -15,6 +16,7 @@ use experiments::{
     run_saturation_experiment, run_slack_experiment,
     run_intensity_sweep_experiment, run_slack_proc_experiment,
     run_soi_experiments, run_soi_ext_experiments, run_ext_saturation_and_sweep,
+    run_soi_phase_sweep_experiment,
 };
 use measure::cleanup_scratch_files;
 
@@ -94,14 +96,16 @@ fn main() {
 
     // Hidden SoI worker subcommand — child process entry point
     if experiment == "__soi_worker" {
-        // Args: __soi_worker <shm_name> <worker_id> <max_workers> <soi_type> <buffer_size>
+        // Args: __soi_worker <shm_name> <worker_id> <max_workers> <soi_type> <buffer_size> [active_phase]
         let shm_name = &args[2];
         let worker_id: usize = args[3].parse().unwrap();
         let max_workers: usize = args[4].parse().unwrap();
         let soi_type = soi::SoiType::from_str(&args[5]).expect("Invalid SoI type");
         let buffer_size: usize = args[6].parse().unwrap();
+        let active_phase: Option<u64> = args.get(7)
+            .and_then(|s| if s == "none" { None } else { s.parse().ok() });
 
-        soi::run_soi_worker_process(shm_name, worker_id, max_workers, soi_type, buffer_size);
+        soi::run_soi_worker_process(shm_name, worker_id, max_workers, soi_type, buffer_size, active_phase);
         return;
     }
 
@@ -110,6 +114,10 @@ fn main() {
 
     // Parse tuning parameters from optional flags
     let params = parse_tuning_params(&args);
+
+    if !perf_counters::open() {
+        eprintln!("WARNING: hardware perf counters unavailable (need CAP_PERFMON or privileged), continuing without");
+    }
 
     // External workload experiments skip calibration (no synthetic victims)
     let needs_calibration = experiment != "find-soi-sweep-ext" && experiment != "find-saturation-ext";
@@ -273,6 +281,39 @@ fn main() {
 
             run_soi_experiments(&soi_types, victim_workers, victim_io_perc, &cache_sizes, calibration.unwrap(), &params);
         },
+        "find-soi-phase-sweep" => {
+            let victim_workers = args.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(|| {
+                eprintln!("Usage: saturator find-soi-phase-sweep <victim_workers> [victim_io%] --soi-phase-map 'cpu:100,l3:0' --victim-phases 0,100 --victim-period 4000 [OPTIONS]");
+                std::process::exit(1);
+            });
+            let victim_io_pct = args.get(3).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let victim_io_perc = victim_io_pct.clamp(0.0, 100.0) / 100.0;
+
+            let phase_map_str = find_flag_value(&args, "--soi-phase-map").unwrap_or_else(|| {
+                eprintln!("Error: --soi-phase-map is required for find-soi-phase-sweep");
+                eprintln!("  Format: 'type:victim_io%,...' e.g. 'cpu:100,l3:0'");
+                std::process::exit(1);
+            });
+            let phase_map = parse_soi_phase_map(&phase_map_str).unwrap_or_else(|e| {
+                eprintln!("Error parsing --soi-phase-map: {}", e);
+                std::process::exit(1);
+            });
+
+            if params.victim_phases.is_none() || params.victim_period_ms.is_none() {
+                eprintln!("Error: find-soi-phase-sweep requires --victim-phases and --victim-period");
+                std::process::exit(1);
+            }
+            if params.antiphase {
+                eprintln!("Error: --antiphase is incompatible with find-soi-phase-sweep");
+                std::process::exit(1);
+            }
+
+            let cache_sizes = soi::detect_cache_sizes();
+            println!("Detected cache sizes: L1d={}KB, L2={}KB, L3={}KB",
+                     cache_sizes.l1d / 1024, cache_sizes.l2 / 1024, cache_sizes.l3 / 1024);
+
+            run_soi_phase_sweep_experiment(&phase_map, victim_workers, victim_io_perc, &cache_sizes, calibration.unwrap(), &params);
+        },
         "find-soi-sweep-ext" => {
             let soi_str = args.get(2).unwrap_or_else(|| {
                 eprintln!("Usage: saturator find-soi-sweep-ext <soi|all> [OPTIONS]");
@@ -345,6 +386,7 @@ fn main() {
 
     // Clean up after run
     cleanup_scratch_files();
+    perf_counters::close();
 }
 
 fn parse_tuning_params(args: &[String]) -> TuningParams {
@@ -352,7 +394,7 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
     // For -proc variants, use higher default max_workers
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(4);
-    if args.len() >= 2 && (args[1].ends_with("-proc") || args[1] == "find-soi-sweep" || args[1].starts_with("find-soi-") && args[1].ends_with("-ext")) {
+    if args.len() >= 2 && (args[1].ends_with("-proc") || args[1].starts_with("find-soi-")) {
         params.max_workers = parallelism * 16;
     }
 
@@ -485,6 +527,9 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
             "--antiphase" => {
                 params.antiphase = true;
             }
+            "--soi-phase-map" => {
+                i += 1; // skip value, parsed by experiment dispatch
+            }
             "--victim-phases" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
@@ -513,4 +558,28 @@ fn parse_tuning_params(args: &[String]) -> TuningParams {
     }
 
     params
+}
+
+fn find_flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
+fn parse_soi_phase_map(s: &str) -> Result<Vec<(soi::SoiType, f64)>, String> {
+    let mut result = Vec::new();
+    for pair in s.split(',') {
+        let parts: Vec<&str> = pair.trim().splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid phase map entry '{}', expected 'type:io_pct'", pair));
+        }
+        let soi_type = soi::SoiType::from_str(parts[0])
+            .ok_or_else(|| format!("Unknown SoI type: '{}'. Valid: l1d, l2, l3, membw, memcap, cpu, iobw, iops", parts[0]))?;
+        let io_pct: f64 = parts[1].parse()
+            .map_err(|_| format!("Invalid IO percentage '{}' in phase map", parts[1]))?;
+        result.push((soi_type, io_pct.clamp(0.0, 100.0) / 100.0));
+    }
+    if result.is_empty() {
+        return Err("Empty phase map".into());
+    }
+    Ok(result)
 }

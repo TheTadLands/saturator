@@ -2,8 +2,9 @@ use crate::saturator::{CalibrationResult, TuningParams};
 use crate::visualize::ResultsWriter;
 use crate::measure::{
     measure_thread_throughput, measure_proc_throughput,
-    timestamp, write_params_file,
+    timestamp, write_params_file, TimeSeriesSample,
 };
+use crate::proc_metrics;
 use super::{SaturationExperiment, Mode};
 
 /// Run a saturation experiment: add workers until throughput plateaus (threads) or degrades (procs).
@@ -39,6 +40,7 @@ pub fn run_saturation_experiment(
     let mut best_throughput = 0.0;
     let mut saturation_point = params.step;
     let mut per_worker_rows: Vec<(usize, Vec<(f64, f64, f64, u64)>)> = Vec::new();
+    let mut all_timeseries: Vec<(usize, Vec<Option<Vec<TimeSeriesSample>>>)> = Vec::new();
 
     let use_step = matches!(exp.mode, Mode::Procs);
     let mut worker_count = if use_step { params.step } else { 1 };
@@ -50,18 +52,18 @@ pub fn run_saturation_experiment(
     println!("  {}", "-".repeat(96));
 
     while worker_count <= end {
-        let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_worker_data) = match exp.mode {
+        let (cpu_ops, io_ops, cpu_stddev, io_stddev, metrics, per_worker_data, ts_data) = match exp.mode {
             Mode::Threads => {
                 let (c, i, cs, is, m, pw) = measure_thread_throughput(
                     worker_count, exp.io_perc, &calibration, params,
                 );
-                (c, i, cs, is, m, Some(pw))
+                (c, i, cs, is, m, Some(pw), Vec::new())
             },
             Mode::Procs => {
-                let (c, i, cs, is, m, pw) = measure_proc_throughput(
+                let (c, i, cs, is, m, pw, ts) = measure_proc_throughput(
                     worker_count, exp.io_perc, &calibration, params,
                 );
-                (c, i, cs, is, m, Some(pw))
+                (c, i, cs, is, m, Some(pw), ts)
             },
         };
         let total_ops = cpu_ops + io_ops;
@@ -76,6 +78,9 @@ pub fn run_saturation_experiment(
 
         if let Some(pw) = per_worker_data {
             per_worker_rows.push((worker_count, pw));
+        }
+        if !ts_data.is_empty() {
+            all_timeseries.push((worker_count, ts_data));
         }
 
         if total_ops > best_throughput {
@@ -113,6 +118,31 @@ pub fn run_saturation_experiment(
                 writeln!(pw_file, "{},{},{:.2},{:.2},{:.2},{:.2},{}", workers, wid, wc, wi, ws, wc + wi, we).unwrap();
             }
         }
+    }
+
+    if !all_timeseries.is_empty() {
+        use std::io::Write as _;
+        let ts_path = format!("{}/timeseries_{}.csv", run_dir, exp.csv_base);
+        let mut ts_file = std::fs::File::create(&ts_path).unwrap();
+        writeln!(ts_file, "workers,sample_idx,elapsed_ms,victim_cpu_ops_sec,victim_io_ops_sec,soi_ops_sec,soi_cpu_ops_sec,soi_io_ops_sec,soi_gate_on,victim_gate_on,victim_io_phase,{}",
+                 proc_metrics::csv_header()).unwrap();
+        for (workers, ts_samples) in &all_timeseries {
+            for (sample_idx, ts_data) in ts_samples.iter().enumerate() {
+                if let Some(samples) = ts_data {
+                    for s in samples {
+                        writeln!(ts_file, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.3},{}",
+                                 workers, sample_idx, s.elapsed_ms,
+                                 s.victim_cpu_ops_sec, s.victim_io_ops_sec, s.soi_ops_sec,
+                                 s.soi_cpu_ops_sec, s.soi_io_ops_sec,
+                                 if s.soi_gate_on { 1 } else { 0 },
+                                 if s.victim_gate_on { 1 } else { 0 },
+                                 s.victim_io_phase,
+                                 s.metrics.to_csv_row()).unwrap();
+                    }
+                }
+            }
+        }
+        println!("Time-series written to: {}/timeseries_{}.csv", run_dir, exp.csv_base);
     }
 
     println!("\n=== RESULTS ===");

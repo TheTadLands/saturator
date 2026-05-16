@@ -29,6 +29,8 @@ pub struct ProcSnapshot {
     psi_io_some_us: u64,
     psi_io_full_us: u64,
     psi_mem_some_us: u64,
+    // Hardware performance counters (if --perf is enabled)
+    perf: Option<crate::perf_counters::PerfSnapshot>,
 }
 
 /// Computed system metrics for a measurement window (delta between two snapshots).
@@ -44,6 +46,7 @@ pub struct SystemMetrics {
     pub psi_io_some_us: u64,
     pub psi_io_full_us: u64,
     pub psi_mem_some_us: u64,
+    pub perf: Option<crate::perf_counters::PerfMetrics>,
 }
 
 /// Capture a snapshot of current cgroup CPU, IO, and PSI metrics.
@@ -74,12 +77,15 @@ pub fn take_snapshot() -> ProcSnapshot {
         .or_else(|| read_psi_total("/proc/pressure/memory", "some"))
         .unwrap_or(0);
 
+    let perf = crate::perf_counters::read_snapshot();
+
     ProcSnapshot {
         usage_usec, system_usec, num_cpus,
         io_rbytes, io_wbytes, io_rios, io_wios,
         io_max_bps, io_max_iops,
         mem_current, mem_max,
         psi_cpu_some_us, psi_io_some_us, psi_io_full_us, psi_mem_some_us,
+        perf,
     }
 }
 
@@ -308,6 +314,11 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
         0.0
     };
 
+    let perf = match (&before.perf, &after.perf) {
+        (Some(b), Some(a)) => Some(crate::perf_counters::compute_delta(b, a)),
+        _ => None,
+    };
+
     SystemMetrics {
         cpu_pct,
         system_pct,
@@ -319,20 +330,30 @@ pub fn compute_delta(before: &ProcSnapshot, after: &ProcSnapshot, duration_secs:
         psi_io_some_us: d_psi_io_some,
         psi_io_full_us: after.psi_io_full_us.saturating_sub(before.psi_io_full_us),
         psi_mem_some_us: d_psi_mem_some,
+        perf,
     }
 }
 
 /// Return the CSV column header string for system metrics.
-pub fn csv_header() -> &'static str {
-    "cpu_pct,system_pct,io_util_pct,io_iops_util_pct,mem_usage_pct,io_psi_pct,psi_cpu_some_us,psi_io_some_us,psi_io_full_us,psi_mem_some_us"
+pub fn csv_header() -> String {
+    let base = "cpu_pct,system_pct,io_util_pct,io_iops_util_pct,mem_usage_pct,io_psi_pct,psi_cpu_some_us,psi_io_some_us,psi_io_full_us,psi_mem_some_us";
+    if crate::perf_counters::is_open() {
+        format!("{},{}", base, crate::perf_counters::csv_header())
+    } else {
+        base.to_string()
+    }
 }
 
 impl SystemMetrics {
     pub fn to_csv_row(&self) -> String {
-        format!("{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{}",
+        let base = format!("{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{}",
             self.cpu_pct, self.system_pct, self.io_util_pct, self.io_iops_util_pct,
             self.mem_usage_pct, self.io_psi_pct,
-            self.psi_cpu_some_us, self.psi_io_some_us, self.psi_io_full_us, self.psi_mem_some_us)
+            self.psi_cpu_some_us, self.psi_io_some_us, self.psi_io_full_us, self.psi_mem_some_us);
+        match &self.perf {
+            Some(p) => format!("{},{}", base, p.to_csv_row()),
+            None => base,
+        }
     }
 }
 
@@ -365,6 +386,13 @@ pub fn median_metrics(samples: &[SystemMetrics]) -> SystemMetrics {
     let mut psi_io_full_us: Vec<u64> = samples.iter().map(|s| s.psi_io_full_us).collect();
     let mut psi_mem_some_us: Vec<u64> = samples.iter().map(|s| s.psi_mem_some_us).collect();
 
+    let perf_samples: Vec<_> = samples.iter().filter_map(|s| s.perf.as_ref()).cloned().collect();
+    let perf = if perf_samples.len() == samples.len() && !perf_samples.is_empty() {
+        Some(crate::perf_counters::median_perf_metrics(&perf_samples))
+    } else {
+        None
+    };
+
     SystemMetrics {
         cpu_pct: median_f64(&mut cpu_pct),
         system_pct: median_f64(&mut system_pct),
@@ -376,6 +404,7 @@ pub fn median_metrics(samples: &[SystemMetrics]) -> SystemMetrics {
         psi_io_some_us: median_u64(&mut psi_io_some_us),
         psi_io_full_us: median_u64(&mut psi_io_full_us),
         psi_mem_some_us: median_u64(&mut psi_mem_some_us),
+        perf,
     }
 }
 
@@ -392,5 +421,6 @@ pub fn empty() -> SystemMetrics {
         psi_io_some_us: 0,
         psi_io_full_us: 0,
         psi_mem_some_us: 0,
+        perf: None,
     }
 }

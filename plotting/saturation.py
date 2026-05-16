@@ -9,7 +9,7 @@ from matplotlib.ticker import MaxNLocator
 
 from .common import (
     C_BLUE, C_CYAN, C_GREEN, C_ORANGE, C_PURPLE, C_RED,
-    detect_experiment, format_number, save_fig,
+    detect_experiment, format_number, plot_perf_metrics, save_fig,
 )
 
 
@@ -298,6 +298,12 @@ def plot_saturation(csv_path: str):
             axes[-1].set_xlabel(x_label)
             axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
             save_fig(fig, os.path.join(folder, 'throughput_vs_utilization.png'))
+
+    # 8. Hardware perf counters (cache misses, IPC)
+    tp_col = primary_col if has_split else 'total_ops'
+    plot_perf_metrics(df, 'workers', x_label,
+                      f'{label} Saturation ({mode_plural})', folder,
+                      throughput_col=tp_col)
 
 
 def plot_per_worker_saturation(csv_path: str):

@@ -160,6 +160,41 @@ docker compose run --build --remove-orphans saturator find-soi-sweep all 4 0 --d
 
 **Output:** `soi_<type>_<N>_victims_<io%>pct_io_<timestamp>/soi_<type>_throughput.csv`, `per_worker_soi_<type>.csv`
 
+#### Phase-Matched SoI Sweep
+Runs multiple SoI types simultaneously, each gated to activate only during a specific victim phase. Demonstrates that interference impact depends on what resource the victim is currently using. Requires victim phase cycling (`--victim-phases` + `--victim-period`).
+
+```bash
+docker compose run --build --remove-orphans saturator find-soi-phase-sweep <victim_workers> [victim_io%] \
+    --soi-phase-map 'type:io%,...' --victim-phases <io%,...> --victim-period <ms> [OPTIONS]
+```
+
+Arguments:
+- `victim_workers` — Number of fixed victim workers
+- `victim_io%` — Base IO percentage for victim workers (default: 0)
+- `--soi-phase-map` — Comma-separated `type:victim_io%` pairs. Each SoI type activates only when the victim's current IO percentage matches. E.g. `cpu:100,l3:0` runs CPU SoI during victim IO phase and L3 SoI during victim CPU phase.
+- `--victim-phases` — IO percentages to cycle through (required)
+- `--victim-period` — Total cycle time in ms (required)
+
+Each sweep step adds `--step` workers of every mapped SoI type (e.g. step 2 with 2 types = 4 new SoI workers per step).
+
+Examples:
+```bash
+# CPU SoI during victim IO phase, L3 SoI during victim CPU phase
+# Victims cycle between pure CPU (0% IO) and pure IO (100% IO) every 2s
+docker compose run --build --remove-orphans saturator find-soi-phase-sweep 4 0 \
+    --soi-phase-map 'cpu:100,l3:0' \
+    --victim-phases 0,100 --victim-period 4000 \
+    --sample-interval 200 --duration 30 --samples 3
+
+# Three SoI types phase-matched: L3 during CPU, IoBw during IO, MemBw during mixed
+docker compose run --build --remove-orphans saturator find-soi-phase-sweep 4 0 \
+    --soi-phase-map 'l3:0,iobw:100,membw:50' \
+    --victim-phases 0,50,100 --victim-period 6000 \
+    --sample-interval 200 --duration 60 --samples 3
+```
+
+**Output:** `soi_phase_<map>_<N>v_<io%>pct_<timestamp>/soi_phase_throughput.csv`, `per_worker_soi_phase.csv`, optional `timeseries_soi_phase.csv`
+
 ### External Workload
 
 #### Find SoI Slack with External Victim
@@ -259,6 +294,34 @@ All experiments accept optional flags to control workload parameters.
 | `--soi-duty <F>` | 0.5 | SoI square-wave duty cycle (0.0–1.0), fraction of the period that is "on". Only meaningful with `--soi-period`. |
 | `--victim-period <ms>` | off | Victim period in ms. Without `--victim-phases`: on/off square-wave gating. With `--victim-phases`: total cycle time divided equally among phases. Minimum 10ms. Works with all process-based experiments. |
 | `--victim-phases <io%,...>` | off | Comma-separated IO percentages (0–100) to cycle through. Each phase gets `victim-period / N` time. Requires `--victim-period`. E.g. `--victim-phases 0,100` alternates pure CPU and pure IO. |
+| `--soi-phase-map <map>` | — | Map SoI types to victim phases for `find-soi-phase-sweep`. Format: `type:io%,...` (e.g. `cpu:100,l3:0`). Each SoI type activates only when the victim's IO% matches. |
+
+### Hardware Performance Counters
+
+Saturator automatically collects hardware performance counter data via `perf_event_open` when available. Counters are opened cgroup-scoped across all CPUs in the container's cpuset, so they capture all worker activity with zero measurement overhead (hardware registers count autonomously; only read at measurement boundaries).
+
+When counters are available, 8 additional columns are appended to all CSV files:
+
+| Column | Description |
+|--------|-------------|
+| `l1d_load_misses` | L1 data cache load misses |
+| `llc_load_misses` | Last-level cache load misses |
+| `cache_misses` | Total cache misses |
+| `instructions` | Total instructions retired |
+| `cycles` | Total CPU cycles |
+| `ipc` | Instructions per cycle (`instructions / cycles`) |
+| `l1d_miss_per_kinsn` | L1d load misses per 1000 instructions |
+| `llc_miss_per_kinsn` | LLC load misses per 1000 instructions |
+
+Perf counters require `CAP_PERFMON` (or `privileged: true` in Docker, which is already the default). If counters are unavailable, Saturator prints a warning and continues without perf data — no extra CSV columns are produced.
+
+The plotting script generates three additional plots when perf columns are present:
+
+| File | Description |
+|------|-------------|
+| `cache_misses.png` | L1d, LLC, and total cache misses vs worker count |
+| `ipc_and_miss_rate.png` | IPC (left axis) + miss rates per kilo-instruction (right axis) |
+| `throughput_vs_ipc.png` | Throughput (left axis) vs IPC (right axis) |
 
 Examples:
 ```bash

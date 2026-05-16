@@ -38,6 +38,7 @@ There are no tests or lints configured.
 
 **SoI (Source of Interference)** sweep with synthetic victims:
 - `find-soi-sweep <soi|all> <victim_workers> [victim_io%]` — hold fixed victim workers running a synthetic workload, sweep SoI workers that stress a specific shared resource (l1d, l2, l3, membw, memcap, cpu, iobw, ioops, or all). Measures victim throughput degradation as interference increases.
+- `find-soi-phase-sweep <victim_workers> [victim_io%] --soi-phase-map 'type:io%,...'` — phase-matched SoI sweep. Multiple SoI types run simultaneously, each gated to activate only during a specific victim phase (requires `--victim-phases` and `--victim-period`). Each sweep step adds `--step` workers of every mapped type. Example: `--soi-phase-map 'cpu:100,l3:0'` activates CPU SoI during victim IO phase and L3 SoI during victim CPU phase.
 
 **External workload** (real application as victim, SoI workers apply interference):
 - `find-soi-sweep-ext <soi|all> --cmd '<command>' [OPTIONS]` — run an external workload (e.g. RocksDB's db_bench) as the victim, sweep SoI workers to measure interference. The external workload reports throughput via a cumulative file-based protocol (`<timestamp_ms> <cumulative_ops>\n`). Saturator computes rates from deltas between consecutive reports. Wrapper scripts adapt specific workloads to this protocol (see `scripts/run_db_bench.sh` for RocksDB).
@@ -66,6 +67,7 @@ There are no tests or lints configured.
 - `--soi-duty <F>` — SoI square-wave duty cycle 0.0–1.0, fraction of the period that is "on" (default: 0.5). Clamped to [0.01, 0.99]. Only meaningful when `--soi-period` is set.
 - `--victim-period <ms>` — victim square-wave period in ms (default: off = continuous). When set without `--victim-phases`, victim workers alternate between active and sleeping phases (on/off gating). When set with `--victim-phases`, controls the total cycle time for phase cycling. Minimum 10ms. Works with all process-based experiments.
 - `--victim-phases <io%,io%,...>` — comma-separated list of IO percentages (0–100) to cycle through (e.g., `0,100` for alternating pure CPU/IO). Each phase gets `period / N` time. Requires `--victim-period`.
+- `--soi-phase-map <type:io%,...>` — map SoI types to victim phases for `find-soi-phase-sweep`. Each entry is `soi_type:victim_io_pct` (e.g., `cpu:100,l3:0`). SoI workers self-gate by reading `victim_io_perc` from shared memory and sleeping when the current phase doesn't match.
 
 ### Plotting
 
@@ -92,21 +94,24 @@ Source files in `src/`:
   - `intensity.rs` — `run_intensity_sweep_experiment()`: sweep probe worker intensity 0.0–1.0.
   - `slack_proc.rs` — `run_slack_proc_experiment()`: process-based slack with baseline + extra workers.
   - `soi_sweep.rs` — `run_soi_sweep_experiment()`, `run_soi_experiments()`: SoI sweep with synthetic victim workers.
+  - `soi_phase_sweep.rs` — `run_soi_phase_sweep_experiment()`: phase-matched SoI sweep with multiple SoI types gated to specific victim phases.
   - `soi_sweep_ext.rs` — `run_soi_sweep_ext_experiment()`, `run_soi_ext_experiments()`, `run_ext_saturation_and_sweep()`: SoI sweep with an external workload as the victim instead of synthetic workers.
 
 - **`measure/`** — Measurement infrastructure:
   - `mod.rs` — Shared utilities: `median()`, `stddev()`, `timestamp()`, `write_params_file()`, `cleanup_scratch_files()`, `aggregate_samples()`, `TimeSeriesSample` struct.
   - `thread.rs` — Thread-based measurements: `measure_single_run()`, `measure_thread_throughput()`, `measure_baseline()`, `measure_total_throughput()`, `run_saturator_split()`.
-  - `proc.rs` — Process-based measurements: `measure_single_run_proc()`, `measure_proc_throughput()`, `measure_single_run_proc_mixed_intensity()`, `measure_proc_slack()`, `spawn_soi_worker()`. When `sample_interval_ms` is set, `run_mixed_proc_measurement()` replaces its single sleep with a polling loop that reads per-worker atomics and cgroup snapshots at each interval.
+  - `proc.rs` — Process-based measurements: `measure_single_run_proc()`, `measure_proc_throughput()`, `measure_single_run_proc_mixed_intensity()`, `measure_proc_slack()`, `spawn_soi_worker()`, `measure_single_run_soi_phased()`, `measure_soi_phased_throughput()`. When `sample_interval_ms` is set, `run_mixed_proc_measurement()` replaces its single sleep with a polling loop that reads per-worker atomics and cgroup snapshots at each interval.
   - `ext.rs` — External workload measurements: `run_ext_measurement()`, `measure_ext_throughput()`, `run_prefill_blocking()`. Launches an external command as the victim alongside SoI workers. SoI workers use shared memory; external workload reports throughput via file protocol.
   - `ext_throughput.rs` — `ThroughputReader`: reads the external workload cumulative throughput protocol file and computes instantaneous rates from deltas. Tracks cumulative state across calls; `reset()` seeds state from the last warmup line. Designed to be swappable for different throughput reporting mechanisms.
   - `ext_stats.rs` — `StatsRow` struct and helpers (`truncate()`, `read_all()`) for reading workload-specific stats emitted by external wrapper scripts via the stats protocol file.
 
 - **`visualize.rs`** — CSV writer for saturation result types. Saturation CSV includes `throughput_stddev` column; slack CSV includes `cpu_ops_stddev` and `io_ops_stddev` columns.
 
-- **`soi.rs`** — SoI (Source of Interference) worker types and infrastructure. Defines `SoiType` enum (L1d, L2, L3, MemBw, MemCap, Cpu, IoBw, IoOps), `SoiBackend` enum (Builtin/Fio), `CacheSizes` struct, `parse_soi_list()`, `detect_cache_sizes()`, `soi_buffer_size()`, and `run_soi_worker_process()` (child process entry point for SoI workers).
+- **`soi.rs`** — SoI (Source of Interference) worker types and infrastructure. Defines `SoiType` enum (L1d, L2, L3, MemBw, MemCap, Cpu, IoBw, IoOps), `SoiBackend` enum (Builtin/Fio), `CacheSizes` struct, `parse_soi_list()`, `detect_cache_sizes()`, `soi_buffer_size()`, and `run_soi_worker_process()` (child process entry point for SoI workers). SoI work functions support phase-gating via `PhaseGate` — when set, workers self-gate by comparing the current `victim_io_perc` from shared memory against their assigned active phase.
 
-- **`proc_metrics.rs`** — System metrics collector. Reads cgroup CPU/IO stats and PSI pressure to compute CPU utilization, IO bandwidth utilization, and pressure stall percentages during measurement windows. Provides `SystemMetrics` struct and CSV output helpers.
+- **`proc_metrics.rs`** — System metrics collector. Reads cgroup CPU/IO stats and PSI pressure to compute CPU utilization, IO bandwidth utilization, and pressure stall percentages during measurement windows. Provides `SystemMetrics` struct and CSV output helpers. When `--perf` is enabled, `SystemMetrics` carries an `Option<PerfMetrics>` that flows through all CSV output automatically.
+
+- **`perf_counters.rs`** — Hardware performance counter collection via `perf_event_open` syscall. Always enabled; gracefully degrades to no-op if counters are unavailable (e.g. no `CAP_PERFMON`). Opens counters cgroup-scoped across all CPUs in the cpuset. Global singleton pattern: `open()` initializes once, `read_snapshot()` reads current counts (called from `proc_metrics::take_snapshot()`), `close()` releases fds. Zero overhead during measurement — hardware registers count autonomously, only two `read()` syscalls per counter per measurement boundary. When available, adds 8 columns to CSV: `l1d_load_misses`, `llc_load_misses`, `cache_misses`, `instructions`, `cycles`, `ipc`, `l1d_miss_per_kinsn`, `llc_miss_per_kinsn`.
 
 ## External Submodules
 

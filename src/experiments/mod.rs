@@ -4,6 +4,7 @@ pub mod intensity;
 pub mod slack_proc;
 pub mod soi_sweep;
 pub mod soi_sweep_ext;
+pub mod soi_phase_sweep;
 
 pub use saturation::run_saturation_experiment;
 pub use slack::run_slack_experiment;
@@ -11,6 +12,7 @@ pub use intensity::run_intensity_sweep_experiment;
 pub use slack_proc::run_slack_proc_experiment;
 pub use soi_sweep::run_soi_experiments;
 pub use soi_sweep_ext::{run_soi_ext_experiments, run_ext_saturation_and_sweep};
+pub use soi_phase_sweep::run_soi_phase_sweep_experiment;
 
 /// Whether the experiment uses threads or child processes.
 #[derive(Clone, Copy)]

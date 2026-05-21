@@ -493,6 +493,64 @@ def plot_soi_comparison(soi_csvs: list):
     ax.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(out_dir, 'soi_comparison_normalized.png'))
 
+    # Merged: victim degradation (top) + SoI throughput (bottom)
+    any_soi_data = any(df['soi_ops'].max() > 0 for _, df, _ in entries)
+    if any_soi_data:
+        if is_mixed:
+            fig, (ax_deg_cpu, ax_deg_io, ax_soi) = plt.subplots(
+                3, 1, figsize=(10, 10), sharex=True, layout='constrained')
+            for soi_type, df, _ in entries:
+                color = SOI_COLORS.get(soi_type, 'gray')
+                marker = SOI_MARKERS.get(soi_type, 'o')
+                ax_deg_cpu.plot(df['soi_workers'], df['victim_cpu_change_pct'], f'-{marker}',
+                                color=color, linewidth=2, markersize=6, label=soi_type)
+                ax_deg_io.plot(df['soi_workers'], df['victim_io_change_pct'], f'-{marker}',
+                               color=color, linewidth=2, markersize=6, label=soi_type)
+                mask = df['soi_ops'] > 0
+                if mask.any():
+                    ax_soi.plot(df.loc[mask, 'soi_workers'], df.loc[mask, 'soi_ops'], f'-{marker}',
+                                color=color, linewidth=2, markersize=6, label=soi_type)
+            ax_deg_cpu.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+            ax_deg_cpu.set_ylabel('CPU Throughput Change (%)')
+            ax_deg_cpu.legend(loc='best', ncol=2, fontsize=9)
+            ax_deg_cpu.grid(True, alpha=0.3)
+            ax_deg_io.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+            ax_deg_io.set_ylabel('IO Throughput Change (%)')
+            ax_deg_io.grid(True, alpha=0.3)
+            ax_soi.set_xlabel('SoI Workers')
+            ax_soi.set_ylabel('SoI Throughput (ops/sec)')
+            ax_soi.set_ylim(bottom=0)
+            ax_soi.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax_soi.legend(loc='best', ncol=2, fontsize=9)
+            ax_soi.grid(True, alpha=0.3)
+            ax_soi.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            fig.suptitle(f'SoI Comparison — Victim Degradation & SoI Throughput ({victim_workers} victims)')
+        else:
+            fig, (ax_deg, ax_soi) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
+                                                  layout='constrained')
+            for soi_type, df, _ in entries:
+                color = SOI_COLORS.get(soi_type, 'gray')
+                marker = SOI_MARKERS.get(soi_type, 'o')
+                ax_deg.plot(df['soi_workers'], df['victim_change_pct'], f'-{marker}',
+                            color=color, linewidth=2, markersize=6, label=soi_type)
+                mask = df['soi_ops'] > 0
+                if mask.any():
+                    ax_soi.plot(df.loc[mask, 'soi_workers'], df.loc[mask, 'soi_ops'], f'-{marker}',
+                                color=color, linewidth=2, markersize=6, label=soi_type)
+            ax_deg.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+            ax_deg.set_ylabel('Victim Throughput Change (%)')
+            ax_deg.legend(loc='best', ncol=2, fontsize=9)
+            ax_deg.grid(True, alpha=0.3)
+            ax_soi.set_xlabel('SoI Workers')
+            ax_soi.set_ylabel('SoI Throughput (ops/sec)')
+            ax_soi.set_ylim(bottom=0)
+            ax_soi.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax_soi.legend(loc='best', ncol=2, fontsize=9)
+            ax_soi.grid(True, alpha=0.3)
+            ax_soi.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+            fig.suptitle(f'SoI Comparison — Victim Degradation & SoI Throughput ({victim_workers} victims)')
+        save_fig(fig, os.path.join(out_dir, 'soi_comparison_degradation_and_throughput.png'))
+
 
 def _shade_gate(ax, t, gate_col, sub, color, label, alpha=0.08):
     """Shade background regions where a gate is off (value == 0)."""

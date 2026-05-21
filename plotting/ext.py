@@ -694,3 +694,32 @@ def plot_ext_soi_comparison(ext_soi_csvs: list):
     ax.legend(loc='best', ncol=2, fontsize=9)
     ax.grid(True, alpha=0.3)
     save_fig(fig, os.path.join(out_dir, 'soi_comparison_normalized.png'))
+
+    # Merged: victim degradation (top) + SoI throughput (bottom)
+    any_soi_data = any(df['soi_ops'].max() > 0 for _, df, _ in entries)
+    if any_soi_data:
+        fig, (ax_deg, ax_soi) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
+                                              layout='constrained')
+        for soi_type, df, _ in entries:
+            color = SOI_COLORS.get(soi_type, 'gray')
+            marker = SOI_MARKERS.get(soi_type, 'o')
+            ax_deg.plot(df['soi_workers'], df['ext_change_pct'], f'-{marker}',
+                        color=color, linewidth=2, markersize=6, label=soi_type)
+            mask = df['soi_ops'] > 0
+            if mask.any():
+                soi_col = 'soi_cpu_ops' if 'soi_cpu_ops' in df.columns and df['soi_cpu_ops'].max() > 0 else 'soi_ops'
+                ax_soi.plot(df.loc[mask, 'soi_workers'], df.loc[mask, soi_col], f'-{marker}',
+                            color=color, linewidth=2, markersize=6, label=soi_type)
+        ax_deg.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+        ax_deg.set_ylabel('External Throughput Change (%)')
+        ax_deg.legend(loc='best', ncol=2, fontsize=9)
+        ax_deg.grid(True, alpha=0.3)
+        ax_soi.set_xlabel('SoI Workers')
+        ax_soi.set_ylabel('SoI Throughput (ops/sec)')
+        ax_soi.set_ylim(bottom=0)
+        ax_soi.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax_soi.legend(loc='best', ncol=2, fontsize=9)
+        ax_soi.grid(True, alpha=0.3)
+        ax_soi.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: format_number(v)))
+        fig.suptitle('SoI Comparison — External Degradation & SoI Throughput')
+        save_fig(fig, os.path.join(out_dir, 'soi_comparison_degradation_and_throughput.png'))

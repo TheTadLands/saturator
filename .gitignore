@@ -28,6 +28,6 @@ target
 /io_scratch
 /completed_output
 /2013.iiswc.ibench.pdf
-/__pycache__
+__pycache__/
 /scripts/db_bench
 /scripts/lib/**

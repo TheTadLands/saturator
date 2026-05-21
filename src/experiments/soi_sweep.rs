@@ -24,6 +24,7 @@ pub fn run_soi_sweep_experiment(
     println!("{} victim workers ({}% IO), sweeping {} SoI workers 0..{} by {}",
              victim_workers, victim_io_pct_int, soi_type.name(),
              params.max_workers, params.step);
+    println!("Overhead equalization: {} total SoI slots per step (active + idle)", params.max_workers);
 
     if let Some(period_ms) = params.soi_period_ms {
         println!("SoI square-wave: period={}ms, duty={:.0}%", period_ms, params.soi_duty * 100.0);

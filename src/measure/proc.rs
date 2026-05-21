@@ -10,6 +10,7 @@ use crate::soi::SoiType;
 use super::{aggregate_samples, TimeSeriesSample};
 
 /// Spawn a single SoI worker process that uses the given shared memory region.
+/// If `idle` is true, the worker signals ready but never performs work (sleeps until deadline).
 pub fn spawn_soi_worker(
     shm_name: &str,
     worker_id: usize,
@@ -18,6 +19,7 @@ pub fn spawn_soi_worker(
     buffer_size: usize,
     nice: Option<i32>,
     active_phase: Option<u64>,
+    idle: bool,
 ) -> std::process::Child {
     let exe = std::env::current_exe().unwrap();
     let mut cmd = Command::new(&exe);
@@ -27,7 +29,8 @@ pub fn spawn_soi_worker(
         .arg(max_workers.to_string())
         .arg(soi_type.name())
         .arg(buffer_size.to_string())
-        .arg(match active_phase { Some(p) => p.to_string(), None => "none".to_string() });
+        .arg(match active_phase { Some(p) => p.to_string(), None => "none".to_string() })
+        .arg(if idle { "idle" } else { "active" });
     if let Some(n) = nice {
         unsafe {
             cmd.pre_exec(move || {
@@ -62,6 +65,14 @@ fn run_proc_measurement(
     let shm_name = format!("/saturator_{}_{}", std::process::id(), worker_count);
     let (region_ptr, shm_fd) = create_shared_region(&shm_name, worker_count);
     let region = unsafe { &*region_ptr };
+
+    let gate_timeout = if let Some(period_ms) = params.victim_period_ms {
+        let n_phases = params.victim_phases.as_ref().map_or(2, |p| p.len() as u64);
+        period_ms / n_phases
+    } else {
+        0
+    };
+    region.gate_timeout_ms.store(gate_timeout, Ordering::Relaxed);
 
     let exe = std::env::current_exe().unwrap();
     let sleep_us = calibration.cpu_us as u64;
@@ -319,6 +330,7 @@ pub fn measure_single_run_proc_slack(
 pub enum WorkerKind {
     Standard(WorkerConfig),
     Soi { soi_type: SoiType, buffer_size: usize, active_phase: Option<u64> },
+    IdleSoi { soi_type: SoiType, buffer_size: usize },
 }
 
 /// Core lifecycle for mixed measurements: victims + SoI workers sharing the same shm region.
@@ -336,6 +348,17 @@ fn run_mixed_proc_measurement(
     let shm_name = format!("/saturator_soi_{}_{}", std::process::id(), worker_count);
     let (region_ptr, shm_fd) = create_shared_region(&shm_name, worker_count);
     let region = unsafe { &*region_ptr };
+
+    // Set gate timeout to match phase duration so workers only wake on real transitions
+    let gate_timeout = if let Some(period_ms) = params.victim_period_ms {
+        let n_phases = params.victim_phases.as_ref().map_or(2, |p| p.len() as u64);
+        period_ms / n_phases
+    } else if let Some(period_ms) = params.soi_period_ms {
+        period_ms
+    } else {
+        0
+    };
+    region.gate_timeout_ms.store(gate_timeout, Ordering::Relaxed);
 
     let exe = std::env::current_exe().unwrap();
     let sleep_us = calibration.cpu_us as u64;
@@ -365,7 +388,10 @@ fn run_mixed_proc_measurement(
                     .expect("Failed to spawn worker process")
             }
             WorkerKind::Soi { soi_type, buffer_size, active_phase } => {
-                spawn_soi_worker(&shm_name, i, worker_count, *soi_type, *buffer_size, params.nice, *active_phase)
+                spawn_soi_worker(&shm_name, i, worker_count, *soi_type, *buffer_size, params.nice, *active_phase, false)
+            }
+            WorkerKind::IdleSoi { soi_type, buffer_size } => {
+                spawn_soi_worker(&shm_name, i, worker_count, *soi_type, *buffer_size, params.nice, None, true)
             }
         };
         children.push(child);
@@ -544,8 +570,16 @@ pub fn measure_single_run_soi(
     for _ in 0..soi_count {
         workers.push(WorkerKind::Soi { soi_type, buffer_size: soi_buffer_size, active_phase: None });
     }
+    let idle_count = params.max_workers.saturating_sub(soi_count);
+    for _ in 0..idle_count {
+        workers.push(WorkerKind::IdleSoi { soi_type, buffer_size: soi_buffer_size });
+    }
 
-    let (metrics, per_worker, timeseries) = run_mixed_proc_measurement(&workers, victim_count, calibration, params);
+    let (metrics, mut per_worker, timeseries) = run_mixed_proc_measurement(&workers, victim_count, calibration, params);
+
+    // Trim idle workers from results — only keep victim + active SoI entries
+    let active_count = victim_count + soi_count;
+    per_worker.truncate(active_count);
 
     // Split results: first victim_count are victims, rest are SoI
     let (mut victim_cpu, mut victim_io) = (0.0, 0.0);
@@ -618,23 +652,34 @@ pub fn measure_soi_throughput(
 
 /// Single run with multiple SoI groups, each optionally phase-gated.
 /// `soi_groups`: (soi_type, buffer_size, count, active_phase_encoded)
+/// `max_soi_total`: total SoI slots (active + idle) to spawn for overhead equalization.
 pub fn measure_single_run_soi_phased(
     victim_count: usize,
     victim_io_perc: f64,
     soi_groups: &[(SoiType, usize, usize, Option<u64>)],
+    max_soi_total: usize,
     calibration: &CalibrationResult,
     params: &TuningParams,
 ) -> (f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Option<Vec<TimeSeriesSample>>) {
     let mut workers: Vec<WorkerKind> = (0..victim_count)
         .map(|_| WorkerKind::Standard(WorkerConfig { io_perc: victim_io_perc, intensity: params.intensity }))
         .collect();
+    let mut active_soi_count = 0;
     for &(soi_type, buffer_size, count, active_phase) in soi_groups {
         for _ in 0..count {
             workers.push(WorkerKind::Soi { soi_type, buffer_size, active_phase });
         }
+        active_soi_count += count;
+    }
+    let idle_count = max_soi_total.saturating_sub(active_soi_count);
+    for _ in 0..idle_count {
+        workers.push(WorkerKind::IdleSoi { soi_type: SoiType::Cpu, buffer_size: 0 });
     }
 
-    let (metrics, per_worker, timeseries) = run_mixed_proc_measurement(&workers, victim_count, calibration, params);
+    let (metrics, mut per_worker, timeseries) = run_mixed_proc_measurement(&workers, victim_count, calibration, params);
+
+    // Trim idle workers from results
+    per_worker.truncate(victim_count + active_soi_count);
 
     let (mut victim_cpu, mut victim_io) = (0.0, 0.0);
     let (mut soi_cpu_ops, mut soi_io_ops) = (0.0, 0.0);
@@ -656,12 +701,13 @@ pub fn measure_soi_phased_throughput(
     victim_count: usize,
     victim_io_perc: f64,
     soi_groups: &[(SoiType, usize, usize, Option<u64>)],
+    max_soi_total: usize,
     calibration: &CalibrationResult,
     params: &TuningParams,
 ) -> (f64, f64, f64, f64, f64, f64, f64, proc_metrics::SystemMetrics, Vec<(f64, f64, f64, u64)>, Vec<Option<Vec<TimeSeriesSample>>>) {
     let samples: Vec<_> = (0..params.samples).map(|_| {
         measure_single_run_soi_phased(
-            victim_count, victim_io_perc, soi_groups,
+            victim_count, victim_io_perc, soi_groups, max_soi_total,
             calibration, params,
         )
     }).collect();

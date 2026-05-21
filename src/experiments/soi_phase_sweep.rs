@@ -27,6 +27,7 @@ pub fn run_soi_phase_sweep_experiment(
 
     println!("=== SoI PHASE-MATCHED SWEEP ===");
     println!("{} victim workers ({}% IO base), phase map: {}", victim_workers, victim_io_pct_int, map_label);
+    println!("Overhead equalization: {} total SoI slots per step (active + idle)", params.max_workers * phase_map.len());
 
     if let Some(period_ms) = params.victim_period_ms {
         if let Some(ref phases) = params.victim_phases {
@@ -79,11 +80,13 @@ pub fn run_soi_phase_sweep_experiment(
         None
     };
 
-    // Baseline: 0 SoI workers
+    // Baseline: 0 SoI workers (all slots are idle for overhead equalization)
+    let n_groups = phase_map.len();
+    let max_soi_total = params.max_workers * n_groups;
     let empty_groups: Vec<(SoiType, usize, usize, Option<u64>)> = Vec::new();
     let (base_cpu, base_io, base_cpu_sd, base_io_sd, _soi_ops, _soi_cpu, _soi_io, base_metrics, base_pw, base_ts) =
         measure_soi_phased_throughput(
-            victim_workers, victim_io_perc, &empty_groups, &calibration, params,
+            victim_workers, victim_io_perc, &empty_groups, max_soi_total, &calibration, params,
         );
     let baseline_total = base_cpu + base_io;
 
@@ -104,7 +107,6 @@ pub fn run_soi_phase_sweep_experiment(
     }
 
     // Sweep: add `step` workers of each SoI type per step
-    let n_groups = phase_map.len();
     let mut soi_per_type = params.step;
     while soi_per_type <= params.max_workers {
         let total_soi = soi_per_type * n_groups;
@@ -120,7 +122,7 @@ pub fn run_soi_phase_sweep_experiment(
 
         let (v_cpu, v_io, v_cpu_sd, v_io_sd, soi_ops, soi_cpu_ops, soi_io_ops, metrics, per_worker, ts_data) =
             measure_soi_phased_throughput(
-                victim_workers, victim_io_perc, &soi_groups, &calibration, params,
+                victim_workers, victim_io_perc, &soi_groups, max_soi_total, &calibration, params,
             );
         let victim_total = v_cpu + v_io;
         let cpu_change_pct = if base_cpu > 0.0 { (v_cpu - base_cpu) / base_cpu * 100.0 } else { 0.0 };

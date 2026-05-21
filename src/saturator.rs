@@ -37,10 +37,12 @@ pub fn bump_gate_epoch(region: &SharedRegion) {
     futex_wake_all(&region.gate_epoch);
 }
 
-/// Block until `gate_epoch` changes (or 100ms timeout). Zero scheduling overhead when gated off.
-pub fn gate_wait(epoch: &AtomicU64) {
+/// Block until `gate_epoch` changes (or timeout). Timeout matches phase duration
+/// so workers wake at most once per phase transition, not on spurious timeouts.
+pub fn gate_wait(epoch: &AtomicU64, timeout_ms: u64) {
     let current = epoch.load(Ordering::Relaxed) as u32;
-    futex_wait(epoch, current, std::time::Duration::from_millis(100));
+    let timeout = if timeout_ms > 0 { timeout_ms } else { 100 };
+    futex_wait(epoch, current, std::time::Duration::from_millis(timeout));
 }
 
 /// Read CLOCK_MONOTONIC and return nanoseconds. This is a vDSO call on Linux (~20ns).
@@ -293,6 +295,7 @@ fn work_loop(
     deadline_ns: &AtomicU64,
     gate: &AtomicU64,
     gate_epoch: &AtomicU64,
+    gate_timeout_ms: &AtomicU64,
     dynamic_io_perc: &AtomicU64,
     cpu_counter: &AtomicU64,
     io_counter: &AtomicU64,
@@ -320,7 +323,7 @@ fn work_loop(
         }
 
         if gate.load(Ordering::Relaxed) == 0 {
-            gate_wait(gate_epoch);
+            gate_wait(gate_epoch, gate_timeout_ms.load(Ordering::Relaxed));
             continue;
         }
 
@@ -378,6 +381,7 @@ fn work_loop(
 
 static GATE_ALWAYS_ON: AtomicU64 = AtomicU64::new(1);
 static GATE_EPOCH_UNUSED: AtomicU64 = AtomicU64::new(0);
+static GATE_TIMEOUT_DEFAULT: AtomicU64 = AtomicU64::new(0);
 static IO_PERC_DISABLED: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Thread work loop: sets up buffers and IO state, runs the shared work loop,
@@ -409,7 +413,8 @@ pub fn run_saturator(
     };
 
     work_loop(
-        &deadline_ns, &GATE_ALWAYS_ON, &GATE_EPOCH_UNUSED, &IO_PERC_DISABLED,
+        &deadline_ns, &GATE_ALWAYS_ON, &GATE_EPOCH_UNUSED,
+        &GATE_TIMEOUT_DEFAULT, &IO_PERC_DISABLED,
         &pt_cpu, &pt_io, &pt_sleep,
         &cpu_buffer, &mut io_state, io_buf,
         calibration.cpu_iterations, calibration.io_iterations,
@@ -568,6 +573,7 @@ pub struct SharedRegion {
     pub victim_gate: AtomicU64,  // 1 = victim workers work, 0 = victim workers sleep (square-wave gating)
     pub victim_io_perc: AtomicU64, // dynamic IO%, encoded as (io_perc * 1000) as u64; u64::MAX = use local
     pub gate_epoch: AtomicU64,   // bumped on any gate/phase change; workers futex-wait on this
+    pub gate_timeout_ms: AtomicU64, // futex timeout for gate_wait (0 = use default 100ms)
 }
 
 /// Compute shared memory size: header + per-worker counters, rounded up to page size.
@@ -810,7 +816,8 @@ pub fn run_worker_process(
     region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
 
     work_loop(
-        &region_ref.deadline_ns, &region_ref.victim_gate, &region_ref.gate_epoch, &region_ref.victim_io_perc,
+        &region_ref.deadline_ns, &region_ref.victim_gate, &region_ref.gate_epoch,
+        &region_ref.gate_timeout_ms, &region_ref.victim_io_perc,
         wk_cpu, wk_io, wk_sleep,
         &cpu_buffer, &mut io_state, io_buf,
         cpu_iterations, io_iterations,

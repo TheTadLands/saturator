@@ -137,21 +137,37 @@ pub fn run_ext_measurement(
     let mut ext_child = cmd.spawn()
         .expect("Failed to spawn external workload");
 
-    // Set up SoI workers (if any)
-    let soi_state: Option<SoiState> = if soi_count > 0 {
+    // Set up SoI workers — always spawn max_workers total (active + idle) to
+    // equalize process overhead across sweep steps.
+    let total_internal_slots = if matches!(soi_type.backend(), SoiBackend::Internal) {
+        params.max_workers.max(soi_count)
+    } else {
+        0
+    };
+    let soi_state: Option<SoiState> = if soi_count > 0 || total_internal_slots > 0 {
         Some(match soi_type.backend() {
             SoiBackend::Internal => {
-                let shm_name = format!("/saturator_ext_{}_{}", std::process::id(), soi_count);
-                let (region_ptr, shm_fd) = create_shared_region(&shm_name, soi_count);
+                let shm_name = format!("/saturator_ext_{}_{}", std::process::id(), total_internal_slots);
+                let (region_ptr, shm_fd) = create_shared_region(&shm_name, total_internal_slots);
                 let region = unsafe { &*region_ptr };
 
-                let mut children = Vec::with_capacity(soi_count);
+                let gate_timeout = if let Some(period_ms) = params.soi_period_ms {
+                    period_ms
+                } else {
+                    0
+                };
+                region.gate_timeout_ms.store(gate_timeout, Ordering::Relaxed);
+
+                let mut children = Vec::with_capacity(total_internal_slots);
                 for i in 0..soi_count {
-                    children.push(spawn_soi_worker(&shm_name, i, soi_count, soi_type, soi_buffer_size, params.nice, None));
+                    children.push(spawn_soi_worker(&shm_name, i, total_internal_slots, soi_type, soi_buffer_size, params.nice, None, false));
+                }
+                for i in soi_count..total_internal_slots {
+                    children.push(spawn_soi_worker(&shm_name, i, total_internal_slots, SoiType::Cpu, 0, params.nice, None, true));
                 }
 
-                // Wait for all SoI workers to signal ready
-                while region.ready_count.load(Ordering::Relaxed) < soi_count as u64 {
+                // Wait for all workers (active + idle) to signal ready
+                while region.ready_count.load(Ordering::Relaxed) < total_internal_slots as u64 {
                     std::thread::sleep(Duration::from_millis(10));
                 }
 
@@ -333,6 +349,7 @@ pub fn run_ext_measurement(
     let (mut soi_cpu_total, mut soi_io_total) = (0.0, 0.0);
     match soi_state {
         Some(SoiState::Internal { shm_name, region_ptr, shm_fd, mut children }) => {
+            let total_slots = children.len();
             for mut child in children.drain(..) {
                 let _ = child.wait();
             }
@@ -343,7 +360,7 @@ pub fn run_ext_measurement(
                 soi_cpu_total += wc;
                 soi_io_total += wi;
             }
-            destroy_shared_region(&shm_name, region_ptr, shm_fd, soi_count);
+            destroy_shared_region(&shm_name, region_ptr, shm_fd, total_slots);
         }
         Some(SoiState::External { mut child, scratch_dir }) => {
             // Mirror the victim teardown: SIGTERM the whole process group

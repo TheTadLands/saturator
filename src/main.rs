@@ -96,7 +96,7 @@ fn main() {
 
     // Hidden SoI worker subcommand — child process entry point
     if experiment == "__soi_worker" {
-        // Args: __soi_worker <shm_name> <worker_id> <max_workers> <soi_type> <buffer_size> [active_phase]
+        // Args: __soi_worker <shm_name> <worker_id> <max_workers> <soi_type> <buffer_size> <active_phase> <idle|active>
         let shm_name = &args[2];
         let worker_id: usize = args[3].parse().unwrap();
         let max_workers: usize = args[4].parse().unwrap();
@@ -104,8 +104,9 @@ fn main() {
         let buffer_size: usize = args[6].parse().unwrap();
         let active_phase: Option<u64> = args.get(7)
             .and_then(|s| if s == "none" { None } else { s.parse().ok() });
+        let idle = args.get(8).is_some_and(|s| s == "idle");
 
-        soi::run_soi_worker_process(shm_name, worker_id, max_workers, soi_type, buffer_size, active_phase);
+        soi::run_soi_worker_process(shm_name, worker_id, max_workers, soi_type, buffer_size, active_phase, idle);
         return;
     }
 

@@ -246,7 +246,7 @@ fn should_sleep(gate: &AtomicU64, phase_gate: PhaseGate) -> bool {
     false
 }
 
-fn soi_cache_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, phase_gate: PhaseGate, counter: &AtomicU64, buffer: &mut [u8]) {
+fn soi_cache_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, gate_timeout_ms: u64, phase_gate: PhaseGate, counter: &AtomicU64, buffer: &mut [u8]) {
     let len = buffer.len();
     if len < 2 { return; }
     let half = len / 2;
@@ -259,7 +259,7 @@ fn soi_cache_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &Atomic
         }
 
         if should_sleep(gate, phase_gate) {
-            gate_wait(gate_epoch);
+            gate_wait(gate_epoch, gate_timeout_ms);
             continue;
         }
 
@@ -280,7 +280,7 @@ fn soi_cache_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &Atomic
     }
 }
 
-fn soi_membw_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, phase_gate: PhaseGate, counter: &AtomicU64, buffer: &mut [u8]) {
+fn soi_membw_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, gate_timeout_ms: u64, phase_gate: PhaseGate, counter: &AtomicU64, buffer: &mut [u8]) {
     let f64_count = buffer.len() / 8;
     if f64_count < 2 { return; }
     let data = unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut f64, f64_count) };
@@ -299,7 +299,7 @@ fn soi_membw_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &Atomic
         }
 
         if should_sleep(gate, phase_gate) {
-            gate_wait(gate_epoch);
+            gate_wait(gate_epoch, gate_timeout_ms);
             continue;
         }
 
@@ -323,11 +323,11 @@ fn soi_membw_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &Atomic
     }
 }
 
-fn soi_memcap_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, phase_gate: PhaseGate, counter: &AtomicU64, buffer: &mut [u8]) {
-    soi_cache_work(deadline_ns, gate, gate_epoch, phase_gate, counter, buffer);
+fn soi_memcap_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, gate_timeout_ms: u64, phase_gate: PhaseGate, counter: &AtomicU64, buffer: &mut [u8]) {
+    soi_cache_work(deadline_ns, gate, gate_epoch, gate_timeout_ms, phase_gate, counter, buffer);
 }
 
-fn soi_cpu_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, phase_gate: PhaseGate, counter: &AtomicU64) {
+fn soi_cpu_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, gate_timeout_ms: u64, phase_gate: PhaseGate, counter: &AtomicU64) {
     let mut local_ops = 0u64;
     let mut hash = 0u64;
 
@@ -338,7 +338,7 @@ fn soi_cpu_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU6
         }
 
         if should_sleep(gate, phase_gate) {
-            gate_wait(gate_epoch);
+            gate_wait(gate_epoch, gate_timeout_ms);
             continue;
         }
 
@@ -360,7 +360,7 @@ fn soi_cpu_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU6
     }
 }
 
-fn soi_io_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, phase_gate: PhaseGate, counter: &AtomicU64, worker_id: usize, block_size: usize, random: bool) {
+fn soi_io_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64, gate_timeout_ms: u64, phase_gate: PhaseGate, counter: &AtomicU64, worker_id: usize, block_size: usize, random: bool) {
     let path = format!("/tmp/saturator_soi_{}", worker_id);
     let file_size = SOI_IO_FILE_SIZE_BYTES.max(256 * block_size);
 
@@ -392,7 +392,7 @@ fn soi_io_work(deadline_ns: &AtomicU64, gate: &AtomicU64, gate_epoch: &AtomicU64
         }
 
         if should_sleep(gate, phase_gate) {
-            gate_wait(gate_epoch);
+            gate_wait(gate_epoch, gate_timeout_ms);
             continue;
         }
 
@@ -436,46 +436,73 @@ pub fn run_soi_worker_process(
     soi_type: SoiType,
     buffer_size: usize,
     active_phase: Option<u64>,
+    idle: bool,
 ) {
     let region = open_shared_region(shm_name, max_workers);
     let region_ref = unsafe { &*region };
+
+    if idle {
+        region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
+        // Wait for deadline to be set (warmup phase — not measured)
+        loop {
+            let d = region_ref.deadline_ns.load(Ordering::Relaxed);
+            if d != 0 {
+                // Sleep for the entire measurement window in one shot — zero wakeups
+                let now = now_ns();
+                if now < d {
+                    let remaining_ns = d - now;
+                    unsafe {
+                        let ts = libc::timespec {
+                            tv_sec: (remaining_ns / 1_000_000_000) as i64,
+                            tv_nsec: (remaining_ns % 1_000_000_000) as i64,
+                        };
+                        libc::nanosleep(&ts, std::ptr::null_mut());
+                    }
+                }
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        return;
+    }
 
     let (wk_cpu, wk_io, _wk_sleep, _wk_errors) = unsafe { worker_counters(region, worker_id) };
 
     let gate = &region_ref.soi_gate;
     let gate_epoch = &region_ref.gate_epoch;
+    let gate_timeout_ms = region_ref.gate_timeout_ms.load(Ordering::Relaxed);
     let phase_gate: PhaseGate = active_phase.map(|p| (&region_ref.victim_io_perc, p));
 
     match soi_type {
         SoiType::L1d | SoiType::L2 | SoiType::L3 => {
             let mut buffer = alloc_mmap_buffer(buffer_size);
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_cache_work(&region_ref.deadline_ns, gate, gate_epoch, phase_gate, wk_cpu, &mut buffer);
+            soi_cache_work(&region_ref.deadline_ns, gate, gate_epoch, gate_timeout_ms, phase_gate, wk_cpu, &mut buffer);
             free_mmap_buffer(&mut buffer);
         }
         SoiType::MemBw => {
             let mut buffer = alloc_mmap_buffer(buffer_size);
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_membw_work(&region_ref.deadline_ns, gate, gate_epoch, phase_gate, wk_cpu, &mut buffer);
+            soi_membw_work(&region_ref.deadline_ns, gate, gate_epoch, gate_timeout_ms, phase_gate, wk_cpu, &mut buffer);
             free_mmap_buffer(&mut buffer);
         }
         SoiType::MemCap => {
             let mut buffer = alloc_mmap_buffer(buffer_size);
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_memcap_work(&region_ref.deadline_ns, gate, gate_epoch, phase_gate, wk_cpu, &mut buffer);
+            soi_memcap_work(&region_ref.deadline_ns, gate, gate_epoch, gate_timeout_ms, phase_gate, wk_cpu, &mut buffer);
             free_mmap_buffer(&mut buffer);
         }
         SoiType::Cpu => {
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_cpu_work(&region_ref.deadline_ns, gate, gate_epoch, phase_gate, wk_cpu);
+            soi_cpu_work(&region_ref.deadline_ns, gate, gate_epoch, gate_timeout_ms, phase_gate, wk_cpu);
         }
         SoiType::IoBw => {
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_io_work(&region_ref.deadline_ns, gate, gate_epoch, phase_gate, wk_io, worker_id, SOI_IOBW_BLOCK_BYTES, false);
+            soi_io_work(&region_ref.deadline_ns, gate, gate_epoch, gate_timeout_ms, phase_gate, wk_io, worker_id, SOI_IOBW_BLOCK_BYTES, false);
         }
         SoiType::IoOps => {
             region_ref.ready_count.fetch_add(1, Ordering::Relaxed);
-            soi_io_work(&region_ref.deadline_ns, gate, gate_epoch, phase_gate, wk_io, worker_id, SOI_IOOPS_BLOCK_BYTES, true);
+            soi_io_work(&region_ref.deadline_ns, gate, gate_epoch, gate_timeout_ms, phase_gate, wk_io, worker_id, SOI_IOOPS_BLOCK_BYTES, true);
         }
     }
 }
